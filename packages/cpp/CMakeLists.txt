@@ -104,17 +104,21 @@ endif()
 set(
   OPENSKP_SOURCES
   src/core.cpp
+  src/dxf_export.cpp
   src/earcut.cpp
   src/errors.cpp
   src/geometry.cpp
   src/glb.cpp
+  src/ifc_export.cpp
   src/json_export.cpp
   src/legacy.cpp
   src/model.cpp
   src/obj_export.cpp
   src/observability.cpp
   src/parser.cpp
+  src/ply_export.cpp
   src/scene.cpp
+  src/stl_export.cpp
   src/tlv.cpp
   src/transforms.cpp
   src/triangulator.cpp

@@ -1300,12 +1300,48 @@ class TestSectionPlaneTextDimension:
 
 
 class TestObjExporter:
-    """Wavefront OBJ text exporter."""
+    """Wavefront OBJ and MTL text exporter."""
 
     def test_to_obj_exports_primitives(self) -> None:
         from array import array
         from openskp.scene import Scene, GlbPrimitive
-        from openskp.export.obj import to_obj
+        from openskp.export.obj import to_obj, to_mtl
+
+        prim = GlbPrimitive(
+            geom_name="Box",
+            material_index=0,
+            positions=array("f", [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
+            normals=array("f", [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0]),
+            uvs=array("f", [0.0, 0.0, 1.0, 0.0, 0.0, 1.0]),
+            indices=array("I", [0, 1, 2]),
+        )
+        scene = Scene(
+            glb_primitives=[prim],
+            gltf_materials=[{"name": "Red_Material", "pbrMetallicRoughness": {"baseColorFactor": [1.0, 0.0, 0.0, 1.0]}}]
+        )
+        obj_text = to_obj(scene, "materials.mtl")
+        assert "# OpenSKP OBJ Export" in obj_text
+        assert "mtllib materials.mtl" in obj_text
+        assert "o Box" in obj_text
+        assert "v 0.000000 0.000000 0.000000" in obj_text
+        assert "vt 0.000000 0.000000" in obj_text
+        assert "vn 0.000000 0.000000 1.000000" in obj_text
+        assert "usemtl Red_Material" in obj_text
+        assert "f 1/1/1 2/2/2 3/3/3" in obj_text
+
+        mtl_text = to_mtl(scene)
+        assert "# OpenSKP MTL Material Library Export" in mtl_text
+        assert "newmtl Red_Material" in mtl_text
+        assert "Kd 1.000000 0.000000 0.000000" in mtl_text
+
+
+class TestStlExporter:
+    """STL exporter tests (ASCII & Binary)."""
+
+    def test_to_stl_ascii(self) -> None:
+        from array import array
+        from openskp.scene import Scene, GlbPrimitive
+        from openskp.export.stl import to_stl_ascii
 
         prim = GlbPrimitive(
             geom_name="Box",
@@ -1316,11 +1352,104 @@ class TestObjExporter:
             indices=array("I", [0, 1, 2]),
         )
         scene = Scene(glb_primitives=[prim])
-        obj_text = to_obj(scene)
-        assert "# OpenSKP OBJ Export" in obj_text
-        assert "o Box" in obj_text
-        assert "v 0.000000 0.000000 0.000000" in obj_text
-        assert "f 1 2 3" in obj_text
+        stl_text = to_stl_ascii(scene, scale=1.0)
+        assert "solid OpenSKP_Model" in stl_text
+        assert "facet normal 0.000000 0.000000 1.000000" in stl_text
+        assert "vertex 0.000000 0.000000 0.000000" in stl_text
+        assert "endsolid OpenSKP_Model" in stl_text
+
+    def test_to_stl_binary(self) -> None:
+        from array import array
+        from openskp.scene import Scene, GlbPrimitive
+        from openskp.export.stl import to_stl_binary
+
+        prim = GlbPrimitive(
+            geom_name="Box",
+            material_index=0,
+            positions=array("f", [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
+            normals=array("f", [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0]),
+            uvs=array("f", [0.0, 0.0, 1.0, 0.0, 0.0, 1.0]),
+            indices=array("I", [0, 1, 2]),
+        )
+        scene = Scene(glb_primitives=[prim])
+        data = to_stl_binary(scene, scale=1.0)
+        assert len(data) == 80 + 4 + 50  # Header + uint32 count + 1 triangle
+        assert data.startswith(b"# OpenSKP Binary STL Export")
+
+
+class TestPlyExporter:
+    """PLY exporter tests (ASCII & Binary)."""
+
+    def test_to_ply_ascii(self) -> None:
+        from array import array
+        from openskp.scene import Scene, GlbPrimitive
+        from openskp.export.ply import to_ply_ascii
+
+        prim = GlbPrimitive(
+            geom_name="Box",
+            material_index=0,
+            positions=array("f", [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
+            normals=array("f", [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0]),
+            uvs=array("f", [0.0, 0.0, 1.0, 0.0, 0.0, 1.0]),
+            indices=array("I", [0, 1, 2]),
+        )
+        scene = Scene(glb_primitives=[prim])
+        ply_text = to_ply_ascii(scene)
+        assert "format ascii 1.0" in ply_text
+        assert "element vertex 3" in ply_text
+        assert "element face 1" in ply_text
+        assert "3 0 1 2" in ply_text
+
+    def test_to_ply_binary(self) -> None:
+        from array import array
+        from openskp.scene import Scene, GlbPrimitive
+        from openskp.export.ply import to_ply_binary
+
+        prim = GlbPrimitive(
+            geom_name="Box",
+            material_index=0,
+            positions=array("f", [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
+            normals=array("f", [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0]),
+            uvs=array("f", [0.0, 0.0, 1.0, 0.0, 0.0, 1.0]),
+            indices=array("I", [0, 1, 2]),
+        )
+        scene = Scene(glb_primitives=[prim])
+        data = to_ply_binary(scene)
+        assert b"format binary_little_endian 1.0" in data
+        assert b"element vertex 3" in data
+        assert b"element face 1" in data
+
+
+class TestDxfExporter:
+    """DXF 3D exporter tests."""
+
+    def test_to_dxf(self) -> None:
+        from array import array
+        from openskp.scene import Scene, GlbPrimitive
+        from openskp.export.dxf import to_dxf
+
+        prim = GlbPrimitive(
+            geom_name="Walls",
+            material_index=0,
+            positions=array("f", [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
+            normals=array("f", [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0]),
+            uvs=array("f", [0.0, 0.0, 1.0, 0.0, 0.0, 1.0]),
+            indices=array("I", [0, 1, 2]),
+        )
+        scene = Scene(glb_primitives=[prim])
+        dxf_text = to_dxf(scene)
+        assert "$ACADVER" in dxf_text
+        assert "AC1015" in dxf_text
+        assert "POLYLINE" in dxf_text or "3DFACE" in dxf_text
+        assert "Walls" in dxf_text
+        assert "EOF" in dxf_text
+
+        dxf_poly = to_dxf(scene, mode="polyface")
+        assert "POLYLINE" in dxf_poly or "AcDbPolyFaceMesh" in dxf_poly
+
+        dxf_3d = to_dxf(scene, mode="3dface")
+        assert "3DFACE" in dxf_3d
+        assert "AcDbFace" in dxf_3d
 
 
 # ── Image entity tests ───────────────────────────────────────────────────

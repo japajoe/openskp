@@ -2,16 +2,21 @@ include(GoogleTest)
 
 add_executable(
   openskp_tests
+  dxf_export_test.cpp
   face_instance_hidden_test.cpp
   geometry_test.cpp
   glb_test.cpp
+  ifc_export_test.cpp
   json_export_test.cpp
   layer_hidden_test.cpp
   lowlevel_test.cpp
+  meta_units_test.cpp
   obj_export_test.cpp
   observability_test.cpp
   parser_test.cpp
+  ply_export_test.cpp
   scene_test.cpp
+  stl_export_test.cpp
   texture_test.cpp
   triangulator_test.cpp
   zip_entry_size_cap_test.cpp
