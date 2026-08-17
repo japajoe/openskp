@@ -30,6 +30,53 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
   return true;
 }
 
+/**
+ * SketchUp 2020 (v20) writes an extra, undocumented record ahead of some
+ * counts that v17 does not have, which leaves the reader a few bytes early and
+ * makes it read garbage as the count. The filler is an empty UTF-16 string
+ * record followed by zero padding:
+ *
+ *   <ff fe ff> <u8 0>        empty string
+ *   <zero padding>           runs up to the real count
+ *
+ * Rather than hard-code an offset (the number of bytes before the marker
+ * differs per call site), locate the marker in the short window ahead, then
+ * take the first non-zero u32 that follows the padding. Only the EMPTY-string
+ * form counts as filler: a real string here would mean genuine data, and
+ * moving the cursor past it would corrupt the parse.
+ *
+ * This only ever runs after a count came back implausible, so files that were
+ * already parsing (v17, and the VFF path) never reach it.
+ *
+ * `countPos` is the offset the count was read FROM (i.e. r.pos - 4).
+ * Returns the corrected count, or null when this is not the v20 layout.
+ */
+function retryCountAfterV20Filler(r: R, countPos: number): number | null {
+  const data = r.data;
+  // the marker sits within a handful of bytes of the bad read; the window is
+  // deliberately tight so a coincidental ff-fe-ff further out cannot match
+  let markerAt = -1;
+  for (let i = countPos; i < countPos + 12 && i + 4 <= data.length; i++) {
+    if (data[i] === 0xff && data[i + 1] === 0xfe && data[i + 2] === 0xff) {
+      markerAt = i;
+      break;
+    }
+  }
+  if (markerAt < 0) return null;
+  if (data[markerAt + 3] !== 0) return null; // non-empty string: real data
+
+  // Skip the zero padding that follows the empty string. The count is
+  // little-endian and non-zero, so the first non-zero byte after the padding
+  // IS its low byte — the run ends exactly on the count.
+  let at = markerAt + 4;
+  while (at < data.length && data[at] === 0) at++;
+  if (at + 4 > data.length) return null;
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const count = view.getUint32(at, true);
+  r.pos = at + 4;
+  return count;
+}
+
 /** Search for `needle` (exact bytes) within [start, end). Returns -1 if absent. */
 function findBytes(data: Uint8Array, needle: Uint8Array, start = 0, end = data.length): number {
   const nlen = needle.length;
@@ -682,7 +729,7 @@ function readText(ar: Archive, r: R): any {
   // variable-length variant middle, delimited by an 11-byte block
   // `01 00 00 00 ?? 00 03 00 00 00 01` right before the text string
   let p = r.pos;
-  let idx = -1;
+  let idx: number;
   while (true) {
     idx = findBytes(r.data, STR_MARKER, p, r.pos + 512);
     if (idx < 0) {
@@ -710,11 +757,10 @@ function readEntityList(ar: Archive, r: R, count: number, owner: string): [numbe
     const p = r.pos;
     const prevFlag = ar.inEntityList;
     ar.inEntityList = true;
-    let s: number | null = null;
-    let n: string | null = null;
-    let v: any = null;
     try {
-      [s, n, v] = ar.readObject(r);
+      const [s, n, v] = ar.readObject(r);
+      ar.inEntityList = prevFlag;
+      ents.push([s as number, n, v]);
     } catch (e) {
       ar.inEntityList = prevFlag;
       if (!(e instanceof LegacyParseError) || owner !== 'root') {
@@ -723,8 +769,6 @@ function readEntityList(ar: Archive, r: R, count: number, owner: string): [numbe
       r.pos = p;
       break;
     }
-    ar.inEntityList = prevFlag;
-    ents.push([s as number, n, v]);
   }
   return ents;
 }
@@ -739,17 +783,29 @@ function readDefinition(ar: Archive, r: R): any {
   for (let i = 0; i < nlayers; i++) {
     ar.readObject(r, 'CLayer');
   }
-  let decl = r.u16();
+  const decl = r.u16();
   if (decl === 0x7fff) {
-    decl = r.u32();
+    r.u32();
   }
   r.u32();
-  const count = r.u32();
+  let count = r.u32();
+  // A zero count is as much a symptom of the v20 filler as an implausibly
+  // large one: the reader lands on the leading zero bytes of the filler
+  // instead of the count. A genuinely empty definition reads zero with no
+  // filler ahead, and retryCountAfterV20Filler leaves those alone.
+  if (count > 5_000_000 || count === 0) {
+    const retry = retryCountAfterV20Filler(r, r.pos - 4);
+    if (retry !== null) count = retry;
+  }
   if (count > 5_000_000) {
     throw new LegacyParseError(`implausible def entity count ${r.ctx()}`);
   }
   const ents = readEntityList(ar, r, count, 'def');
-  const nrel = r.u32();
+  let nrel = r.u32();
+  if (nrel > 100000) {
+    const retry = retryCountAfterV20Filler(r, r.pos - 4);
+    if (retry !== null) nrel = retry;
+  }
   if (nrel > 100000) {
     throw new LegacyParseError(`definition list misaligned ${r.ctx()}`);
   }
@@ -757,6 +813,19 @@ function readDefinition(ar: Archive, r: R): any {
     ar.readObject(r, 'CRelationship');
   }
   r.u16();
+  // The GUID is followed immediately by the name string. Some files (SketchUp
+  // 2020) carry two extra bytes ahead of the GUID, which would shift this read
+  // and leave the cursor mid-record. Anchor on the string marker that must
+  // follow the 16 GUID bytes instead of trusting the fixed prefix width.
+  if (!bytesEqual(r.peek(19).subarray(16, 19), STR_MARKER)) {
+    for (let skip = 1; skip <= 4; skip++) {
+      const at = r.pos + skip;
+      if (bytesEqual(r.data.subarray(at + 16, at + 19), STR_MARKER)) {
+        r.pos = at;
+        break;
+      }
+    }
+  }
   const guid = r.raw(16);
   const name = r.utf16();
   r.utf16();
@@ -868,6 +937,11 @@ const CMATERIAL_PATTERN: (number | null)[] = [
   ...asciiBytes('CMaterial'),
 ];
 
+const CLAYER_PATTERN: (number | null)[] = [
+  0xff, 0xff, null, null, 0x06, 0x00,
+  ...asciiBytes('CLayer'),
+];
+
 function findVersionMajor(data: Uint8Array): number | null {
   const head = data.subarray(0, Math.min(0x60, data.length));
   // strip all 0x00 bytes (UTF-16LE ASCII text becomes plain ASCII-like)
@@ -888,47 +962,118 @@ interface WalkResult {
   materials: [number, any][];
 }
 
-function walk(data: Uint8Array): WalkResult {
-  const ver = findVersionMajor(data);
-  if (ver === null) {
-    throw new LegacyParseError('no version string in header');
-  }
-  const ar = new Archive(data, ver);
-  Object.assign(ar.readers, READERS);
-  const r = ar.r;
-
-  // anchor: the material manager (u32 count right before the first
-  // CMaterial new-class record)
-  const matHdr = findPattern(data, CMATERIAL_PATTERN);
-  if (matHdr < 0) {
-    throw new LegacyParseError('no CMaterial class record found');
-  }
-  const headerView = new DataView(data.buffer, data.byteOffset, data.byteLength);
-  const matCount = headerView.getUint32(matHdr - 4, true);
-  if (matCount > 100000) {
-    throw new LegacyParseError('implausible material count');
-  }
-
-  // bootstrap the absolute slot base: parse material 1 with a throwaway
-  // archive; material 2's class-ref tag names CMaterial's true slot
-  if (matCount < 2) {
-    throw new LegacyParseError('single-material bootstrap not implemented for this file');
-  }
+/** Bootstrap the absolute slot base: parse material 1 with a throwaway
+ * archive; material 2's class-ref tag names CMaterial's true slot. */
+function bootstrapTwoMaterials(data: Uint8Array, ver: number, matHdr: number): number {
   const boot = new Archive(data, ver);
   Object.assign(boot.readers, READERS);
   boot.nextSlot = 1 << 20;
   boot.walkBase = 1 << 20;
   boot.r.pos = matHdr;
   boot.readObject(boot.r, 'CMaterial');
-  const bootTag = boot.r.peekU16();
-  if (bootTag === 0xffff || !(bootTag & 0x8000)) {
+  const tag = boot.r.peekU16();
+  if (tag === 0xffff || !(tag & 0x8000)) {
     throw new LegacyParseError('cannot bootstrap the slot base');
   }
-  ar.nextSlot = bootTag & 0x7fff;
-  ar.walkBase = ar.nextSlot;
+  return tag & 0x7fff;
+}
+
+/** Slot-base candidates for files where the two-material trick is
+ * unavailable (0 or 1 materials).
+ *
+ * Parse the model prefix (materials, layer list) with a throwaway base;
+ * the object right after the layer list is the definition-list anchor - an
+ * ABSOLUTE back-ref to the active layer, an object we just allocated
+ * relatively. Each walked layer yields one candidate base; with a single
+ * layer (the common case) the answer is exact. */
+function probeLayerAnchorBases(data: Uint8Array, ver: number, start: number, matCount: number): number[] {
+  const boot = new Archive(data, ver);
+  Object.assign(boot.readers, READERS);
+  const b0 = 1 << 20;
+  boot.nextSlot = b0;
+  boot.walkBase = b0;
+  boot.r.pos = start;
+  for (let i = 0; i < matCount; i++) {
+    boot.readObject(boot.r, 'CMaterial');
+  }
+  boot.r.u32();
+  if (ver >= 17) {
+    boot.r.u8();
+  }
+  const layerCount = boot.r.u32();
+  if (!(layerCount >= 1 && layerCount <= 100000)) {
+    throw new LegacyParseError('implausible layer count in base probe');
+  }
+  const layerSlots: number[] = [];
+  for (let i = 0; i < layerCount; i++) {
+    const [s] = boot.readObject(boot.r, 'CLayer');
+    layerSlots.push(s as number);
+  }
+  const [s, n] = boot.readObject(boot.r);
+  if (n !== 'premodel') {
+    // under the throwaway base every absolute back-ref classifies as
+    // premodel; anything else means the prefix did not parse
+    throw new LegacyParseError(`base probe: anchor resolved to ${n}`);
+  }
+  return layerSlots
+    .map((rel) => (s as number) - (rel - b0))
+    .filter((cand) => cand > 0 && cand < b0);
+}
+
+function walk(data: Uint8Array): WalkResult {
+  const ver = findVersionMajor(data);
+  if (ver === null) {
+    throw new LegacyParseError('no version string in header');
+  }
+
+  // anchor: the material manager (u32 count right before the first
+  // CMaterial new-class record); zero-material files have no CMaterial
+  // record anywhere, so fall back to the first CLayer class record and
+  // start at the layer-list marker just before it
+  const headerView = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const matHdr = findPattern(data, CMATERIAL_PATTERN);
+  let start: number;
+  let matCount: number;
+  if (matHdr >= 0) {
+    start = matHdr;
+    matCount = headerView.getUint32(matHdr - 4, true);
+    if (matCount > 100000) {
+      throw new LegacyParseError('implausible material count');
+    }
+  } else {
+    const layerHdr = findPattern(data, CLAYER_PATTERN);
+    if (layerHdr < 0) {
+      throw new LegacyParseError('no CMaterial or CLayer class record found');
+    }
+    matCount = 0;
+    start = layerHdr - (ver >= 17 ? 9 : 8);
+  }
+
+  const bases =
+    matCount >= 2 ? [bootstrapTwoMaterials(data, ver, start)] : probeLayerAnchorBases(data, ver, start, matCount);
+
+  let lastExc: unknown = null;
+  for (const base of bases) {
+    try {
+      return walkModel(data, ver, start, matCount, base);
+    } catch (exc) {
+      if (!(exc instanceof LegacyParseError)) throw exc;
+      lastExc = exc;
+    }
+  }
+  if (lastExc !== null) throw lastExc;
+  throw new LegacyParseError('no viable slot base candidate');
+}
+
+function walkModel(data: Uint8Array, ver: number, start: number, matCount: number, base: number): WalkResult {
+  const ar = new Archive(data, ver);
+  Object.assign(ar.readers, READERS);
+  ar.nextSlot = base;
+  ar.walkBase = base;
+  const r = ar.r;
 
   // material manager
-  r.pos = matHdr;
+  r.pos = start;
   const materials: [number, any][] = [];
   for (let i = 0; i < matCount; i++) {
     const [s, , v] = ar.readObject(r, 'CMaterial');
@@ -947,6 +1092,11 @@ function walk(data: Uint8Array): WalkResult {
   const layers: [number, any][] = [];
   for (let i = 0; i < layerCount; i++) {
     const [s, , v] = ar.readObject(r, 'CLayer');
+    // A null object-ref occupies a slot in the list without carrying a layer
+    // record (seen in SketchUp 2020 files, where layerCount includes it).
+    // Keeping it would push a null into the list and blow up downstream on
+    // v.rgba; readObject has still consumed the ref from the stream.
+    if (v === null) continue;
     layers.push([s as number, v]);
   }
 
@@ -955,7 +1105,11 @@ function walk(data: Uint8Array): WalkResult {
   if (dn !== 'CLayer') {
     throw new LegacyParseError(`definition-list anchor is ${dn}, not a layer`);
   }
-  const defCount = r.u32();
+  let defCount = r.u32();
+  if (defCount > 1_000_000) {
+    const retry = retryCountAfterV20Filler(r, r.pos - 4);
+    if (retry !== null) defCount = retry;
+  }
   if (defCount > 1_000_000) {
     throw new LegacyParseError('implausible definition count');
   }
@@ -976,7 +1130,11 @@ function walk(data: Uint8Array): WalkResult {
   }
 
   // root entity list
-  const rootCount = r.u32();
+  let rootCount = r.u32();
+  if (rootCount > 5_000_000) {
+    const retry = retryCountAfterV20Filler(r, r.pos - 4);
+    if (retry !== null) rootCount = retry;
+  }
   if (rootCount > 5_000_000) {
     throw new LegacyParseError('implausible root entity count');
   }
