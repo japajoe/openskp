@@ -25,6 +25,10 @@ first-class packages for TypeScript, .NET, Dart, and C++ — see the
 [project README](https://github.com/iamahsanmehmood/openskp) for the full
 cross-language picture.
 
+🧪 This Python package can also *write* new `.skp` files from scratch, and
+edit existing ones — Python-only for the moment, validated feature-by-feature
+against the real SketchUp SDK (see [Writing](#writing) below).
+
 ## Features
 
 - **Full-fidelity parsing** — vertices, edges, faces, normals, UV
@@ -43,6 +47,14 @@ cross-language picture.
   largest single definition, not the whole file.
 - **Structured observability** — opt-in progress reporting and
   location-carrying parse errors for debugging malformed or unusual files.
+- **Write support (Python-only)** — build new legacy-format `.skp` files
+  from scratch: geometry (including true, editable circular/arc curves,
+  freeform polylines, faces with holes cut out, and non-planar
+  auto-triangulation), materials (solid + PNG/JPEG textures), layers,
+  nested component definitions and groups, instance rotation/visibility,
+  and custom attribute dictionaries — or load and extend an existing file
+  with `open_existing()`. No SDK involved; every feature validated
+  against the real SketchUp SDK. See [Writing](#writing) below.
 
 ## Installation
 
@@ -109,6 +121,127 @@ meta = json_export.to_dict(model, scene=scene)
 json_export.export(model, "output.json", scene=scene)
 ```
 
+## Writing
+
+OpenSKP can also *create* new `.skp` files from scratch — a genuine,
+from-scratch binary writer for the legacy MFC `CArchive` format (SketchUp
+2013–2020), with no SketchUp SDK involved at any point. Python-only for
+now, but feature-complete for common modeling needs and validated
+feature-by-feature against the real SketchUp SDK: geometry, materials
+(solid + PNG/JPEG textures), layers (with color and default visibility),
+component definitions with multiple instances, groups, nested
+definitions and nested group instances (an assembly containing instances
+or groups of its own sub-parts, to any depth), per-instance rotation and
+visibility, explicit per-side texture positioning (on a face of any
+orientation), custom key/value attribute dictionaries on
+definitions/instances/faces (the same mechanism SketchUp's own "dynamic
+component" attributes use), and circular faces and partial arcs (genuine,
+editable-by-radius arc/circle entities, not disconnected straight edges
+that merely trace that shape), and freeform polyline curves (an arbitrary
+chain of edges grouped into one genuine `CCurve` entity) are all
+supported, along with faces with one or more holes cut out (a window
+opening in a wall, say) and an `add_face(..., auto_triangulate=True)`
+fallback for non-planar input. `openskp.open_existing()` can also load an
+*existing* legacy-format file and rebuild it as a new builder, so more
+geometry can be added to it before saving (see
+[Editing an existing file](#editing-an-existing-file) below). See
+[`openskp/create.py`](src/openskp/create.py) for the full scope notes.
+
+This is Python-only today — porting the writer to the other four
+languages (TypeScript, .NET, Dart, C++) is a planned future direction,
+not yet under way. Contributions toward that are very welcome.
+
+```python
+from openskp import create
+
+builder = create()
+
+# Materials and layers
+red = builder.add_material("Red", (255, 0, 0))
+brick = builder.add_texture_material("Brick", "brick.png")
+roof_layer = builder.add_layer("Roof", color=(180, 60, 40))
+
+# All add_component_definition/add_group calls must come before any
+# add_instance/add_face call - placing anything locks in the file's
+# slot numbering for what comes after.
+with builder.add_component_definition("Chair") as chair:
+    chair.add_face(
+        [(0, 0, 0), (20, 0, 0), (20, 20, 0), (0, 20, 0)],
+        material=brick,
+        # Explicit texture positioning: 3 (world point, uv) pairs pin the
+        # texture's scale/rotation/offset instead of the default projection.
+        front_uv=[((0, 0, 0), (0.0, 0.0)), ((10, 0, 0), (1.0, 0.0)), ((0, 10, 0), (0.0, 1.0))],
+    )
+
+# A one-off group (placed automatically when its `with` block exits)
+with builder.add_group("Table", translation=(100, 0, 0)) as table:
+    table.add_face([(0, 0, 0), (60, 0, 0), (60, 40, 0), (0, 40, 0)])
+
+# Now place instances of the reusable component
+builder.add_instance(chair, translation=(0, 0, 0))
+# rotation=(axis, angle_radians) is a shortcut for a hand-derived matrix3x3
+import math
+builder.add_instance(chair, translation=(50, 0, 0), rotation=((0, 0, 1), math.radians(180)))
+# hidden=True hides this specific placement (its contents still exist)
+builder.add_instance(chair, translation=(100, 0, 0), hidden=True)
+
+# Root-level geometry
+builder.add_face(
+    [(0, 0, 0), (200, 0, 0), (200, 150, 0), (0, 150, 0)],
+    material=red, layer=roof_layer,
+)
+
+# A true, editable circular face - not disconnected straight edges
+builder.add_circle((100, 75, 0), normal=(0, 0, 1), radius=30, num_segments=24)
+
+# A partial (open) arc - same real curve entity, but edges only, no face
+builder.add_arc((100, 75, 0), normal=(0, 0, 1), radius=30, start_angle=0, end_angle=math.pi / 2)
+
+# A freeform polyline - an arbitrary edge chain grouped into one curve
+builder.add_polyline([(0, 0, 0), (10, 10, 0), (20, 0, 0), (30, 10, 0)])
+
+# A non-planar "quad" - auto_triangulate fans it into 2 real triangular
+# faces instead of raising, the same thing SketchUp's own UI does
+warped_quad = [(0, 0, 0), (10, 0, 0), (10, 10, 0), (0, 10, 5)]
+builder.add_face(warped_quad, auto_triangulate=True)
+
+# A face with a hole cut out - a window opening in a wall
+wall = [(0, 0, 0), (200, 0, 0), (200, 100, 0), (0, 100, 0)]
+window = [(80, 30, 0), (120, 30, 0), (120, 70, 0), (80, 70, 0)]
+builder.add_face(wall, holes=[window])
+
+builder.save("output.skp")
+```
+
+### Editing an existing file
+
+`create()` only ever starts from a blank scaffold. To load an *existing*
+legacy-format `.skp` file and add to it, use `open_existing()` instead —
+it fully parses the file with OpenSKP's own reader and replays
+everything it understood (materials, layers, every component definition,
+all root-level geometry/instances) back through the writer's own API,
+producing a brand-new file with equivalent content:
+
+```python
+from openskp import open_existing
+
+builder, warnings, definitions = open_existing("building.skp")
+for w in warnings:
+    print("not fully reproduced:", w)
+
+# Every material/layer the source had is already reusable, no separate lookup:
+builder.add_circle((0, 0, 100), (0, 0, 1), radius=50, material=builder.materials_by_name.get("Roofing"))
+# definitions maps each replayed component's own name to its builder:
+builder.add_instance(definitions["Window"], translation=(0, 300, 0))
+builder.save("building_edited.skp")
+```
+
+`warnings` lists anything the source file had that couldn't be
+faithfully reproduced (a projected texture, a material's texture scale,
+and several others) — see
+[`openskp/edit.py`](src/openskp/edit.py) for the complete, itemized
+scope.
+
 ## Package Structure
 
 | Module | Purpose |
@@ -122,6 +255,8 @@ json_export.export(model, "output.json", scene=scene)
 | `openskp.metadata` | Dynamic properties and scene hierarchy |
 | `openskp.transforms` | 3D matrix transforms and coordinate conversion |
 | `openskp.export` | GLB, OBJ/MTL, STL, PLY, DXF, IFC4, and JSON exporters |
+| `openskp.create` | Writer — build new `.skp` files from scratch |
+| `openskp.edit` | Load an existing legacy `.skp` file and rebuild it as a new writer |
 
 ## Requirements
 

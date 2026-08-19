@@ -25,6 +25,7 @@ others, that's stated plainly rather than smoothed over.
 - [Observability: progress and errors](#observability)
 - [Error handling](#error-handling)
 - [Export capabilities](#export-capabilities)
+- [Write capabilities](#write-capabilities)
 - [The web viewer](#the-web-viewer)
 - [Known cross-language differences](#known-cross-language-differences)
 - [Troubleshooting](#troubleshooting)
@@ -429,6 +430,280 @@ for (const auto& prim : scene.glb_primitives) {
 }
 ```
 
+## Write capabilities
+
+Everything above this section is about reading `.skp` files. As of this
+writing, one language — Python — can also go the other direction: create a
+new `.skp` file from nothing, or load and extend a file that already
+exists. Python-only today, but the write path itself has matured well
+past a proof of concept — every feature below has been validated
+feature-by-feature against the real SketchUp SDK, and it holds up
+rebuilding complex, real architectural models, not just synthetic test
+fixtures. Porting it to the other four languages is a planned future
+direction, not yet under way — contributions toward that are very
+welcome.
+
+| Language | Write new `.skp` files |
+|---|---|
+| Python | 🧪 `openskp.create()` / `openskp.open_existing()` — legacy-format (2013–2020) only |
+| TypeScript | ❌ not yet |
+| .NET | ❌ not yet |
+| Dart | ❌ not yet |
+| C++ | ❌ not yet |
+
+`openskp.create()` returns an `SkpBuilder` that assembles a legacy MFC
+`CArchive`-format `.skp` file byte-for-byte — geometry, materials
+(solid-color and PNG/JPEG-textured), named layers, reusable component
+definitions with multiple positioned instances, and groups — then
+`.save(path)` writes it to disk. No SketchUp SDK is involved at import,
+build, or save time; the writer works by inverting this project's own
+reader logic (the same class-ref/back-ref object-graph protocol and entity
+encodings documented in [BINARY_FORMAT.md](BINARY_FORMAT.md)), against a
+small bundled blank-document scaffold it splices new entities into.
+
+```python
+from openskp import create
+
+builder = create()
+red = builder.add_material("Red", (255, 0, 0))
+with builder.add_component_definition("Chair") as chair:
+    chair.add_face([(0, 0, 0), (20, 0, 0), (20, 20, 0), (0, 20, 0)])
+builder.add_instance(chair, translation=(50, 0, 0))
+builder.add_face([(0, 0, 0), (100, 0, 0), (100, 100, 0), (0, 100, 0)], material=red)
+builder.save("output.skp")
+```
+
+One ordering rule falls out of how the format's internal slot numbering
+works: every `add_component_definition`/`add_group` call must happen
+before any `add_face`/`add_instance` call on the builder itself — placing
+root-level geometry locks in the numbering for everything that comes
+after it. `ComponentDefinitionBuilder` (the object yielded by the `with`
+block) is exported alongside `SkpBuilder` from the top-level `openskp`
+package.
+
+A definition can also nest instances of another, already-closed
+definition inside its own body, to any depth (an assembly containing its
+own sub-parts) - `ComponentDefinitionBuilder.add_instance` has the same
+signature as `SkpBuilder.add_instance`:
+
+```python
+with builder.add_component_definition("Wheel") as wheel:
+    wheel.add_face([(0, 0, 0), (10, 0, 0), (10, 10, 0), (0, 10, 0)])
+with builder.add_component_definition("Car") as car:
+    car.add_instance(wheel, translation=(0, 0, 0))
+    car.add_instance(wheel, translation=(100, 0, 0))
+builder.add_instance(car)
+```
+
+A nested placement can also be a *group* rather than a component
+instance (`add_group_instance`, same signature as `add_instance` again).
+Unlike root-level `add_group`, a nested group can't be declared inline -
+this format has no way to embed one definition's declaration inside
+another's, so its geometry still needs a normal `add_component_definition`
+first:
+
+```python
+with builder.add_component_definition("Engine") as engine:
+    engine.add_face([(0, 0, 0), (30, 0, 0), (30, 30, 0), (0, 30, 0)])
+with builder.add_component_definition("Car") as car:
+    car.add_face([(0, 0, 0), (150, 0, 0), (150, 60, 0), (0, 60, 0)])
+    car.add_group_instance(engine, translation=(50, 0, 10))
+builder.add_instance(car)
+```
+
+`add_instance`/`add_group`/`add_group_instance` all also accept
+`rotation=(axis, angle_radians)` as a convenience alternative to
+hand-deriving a `matrix3x3` rotation matrix yourself - pass at most one
+of the two:
+
+```python
+import math
+builder.add_instance(wheel, translation=(0, 0, 0), rotation=((0, 0, 1), math.radians(90)))
+```
+
+`add_instance`/`add_group`/`add_group_instance` also all take
+`hidden=True` to hide that specific placement (its contents still exist
+in the file, just not shown by default), and `add_layer` takes
+`color=(r, g, b)`/`hidden=True` for the layer's own color and default
+visibility:
+
+```python
+roof = builder.add_layer("Roof", color=(180, 60, 40), hidden=True)
+builder.add_instance(chair, hidden=True)
+```
+
+A face's texture can also be explicitly positioned (scaled, rotated,
+sheared, offset - independently per side) instead of the default planar
+projection, given 3 world-point/UV correspondences - on a face of any
+orientation, tilted or not:
+
+```python
+brick = builder.add_texture_material("Brick", "brick.png")
+builder.add_face(
+    [(0, 0, 0), (100, 0, 0), (100, 100, 0), (0, 100, 0)],
+    material=brick,
+    front_uv=[
+        ((0, 0, 0), (0.0, 0.0)),
+        ((50, 0, 0), (1.0, 0.0)),
+        ((0, 50, 0), (0.0, 1.0)),
+    ],
+)
+```
+
+The in-plane 2D basis this uses for a tilted face - the face's own first
+edge direction as one axis, the plane normal crossed with that as the
+other - was found by comparing an SDK-authored file's own computed
+matrix against several candidate formulas, then confirmed exactly (all
+6 matrix values matching) against a correspondence deliberately chosen
+not to align with the face's own edges.
+
+`add_face` only stores true planar faces (all it can represent), so
+non-coplanar points raise by default - pass `auto_triangulate=True` to
+fan-triangulate instead, the same silent fallback real SketchUp's own UI
+applies to a not-quite-flat quad you draw by hand:
+
+```python
+warped_quad = [(0, 0, 0), (10, 0, 0), (10, 10, 0), (0, 10, 5)]
+builder.add_face(warped_quad, auto_triangulate=True)  # -> 2 triangular faces
+```
+
+A face can also have one or more holes cut out of it - `holes=` takes
+a list of independent closed polygons, each on the same plane as the
+face itself; winding direction doesn't matter:
+
+```python
+wall = [(0, 0, 0), (200, 0, 0), (200, 100, 0), (0, 100, 0)]
+window = [(80, 30, 0), (120, 30, 0), (120, 70, 0), (80, 70, 0)]
+builder.add_face(wall, holes=[window])
+```
+
+Ground-truth-derived from an SDK-authored window-in-a-wall face: a hole
+is a real additional loop in the same `CFace` record - structurally
+identical to the boundary loop, differing only in one flag byte.
+Confirmed against the real SDK that the hole's area is genuinely
+subtracted (`SUFaceGetArea`), not just structurally present.
+
+Component definitions, instances, and faces can also carry custom
+key/value metadata - the same mechanism SketchUp's own "dynamic
+component" attributes use - via each of their `attributes` parameters
+(values may be `str`, `int`, or `float`):
+
+```python
+with builder.add_component_definition("Chair", attributes={"sku": "CH-100", "price": 49.99}) as chair:
+    chair.add_face([(0, 0, 0), (20, 0, 0), (20, 20, 0), (0, 20, 0)])
+builder.add_instance(chair, attributes={"serial": "A1"})
+```
+
+Not yet supported on groups - ground truth shows a group's own attribute
+pointer is always null, unlike a component instance's (real) one.
+
+A circular face (`add_circle`) is a genuine, editable-by-radius
+SketchUp arc/circle entity (`CArcCurve`), not `num_segments`
+disconnected straight edges that merely trace that shape - every edge in
+the tessellation shares one real curve backref, the same object graph
+real SketchUp's own Circle tool produces:
+
+```python
+builder.add_circle((50, 50, 0), normal=(0, 0, 1), radius=40, num_segments=24)
+```
+
+Confirmed against the real SDK: every edge's `SUEdgeGetCurve` resolves to
+the exact same curve object, typed as a genuine arc (`SUCurveGetType`)
+with the requested edge count.
+
+A partial (open) arc (`add_arc`) is the same underlying `CArcCurve`
+entity, but a chain of edges with no face - given `start_angle`/
+`end_angle` (radians), swept from an arbitrary but fixed reference
+direction in the arc's own plane:
+
+```python
+import math
+builder.add_arc((50, 50, 0), normal=(0, 0, 1), radius=40, start_angle=0, end_angle=math.pi / 2)
+```
+
+Confirmed against the real SDK that the written endpoint coordinates
+land exactly where the requested sweep says they should - not just that
+some curve object exists with the right edge count.
+
+A freeform polyline (`add_polyline`) groups an arbitrary chain of
+straight edges into one genuine `CCurve` entity - distinct from
+`CArcCurve`: no geometric frame of its own, just a type tag and an edge
+count, the same grouping real SketchUp's own Freehand tool produces.
+`closed=True` also connects the last point back to the first:
+
+```python
+builder.add_polyline([(0, 0, 0), (10, 10, 0), (20, 0, 0), (30, 10, 0)])
+```
+
+Confirmed against the real SDK that every edge shares the same curve
+object, typed as `SUCurveType_Simple` (distinct from the arc/circle
+tests' `SUCurveType_ArcCurve`), with the correct edge count.
+
+Explicitly out of scope for this first pass: declaring a group's
+geometry inline nested inside another definition (as opposed to placing
+an already-built one via `add_group_instance`), and attributes on
+groups. See [`openskp/create.py`](../packages/python/src/openskp/create.py)
+for the full, current scope notes, and the [Python package README](../packages/python/README.md#writing)
+for a longer worked example.
+
+### Editing an existing file
+
+`openskp.create` only ever builds a brand-new file from its own blank
+scaffold - real SketchUp never patches a file in place either (it fully
+re-serializes the whole document on every save), so there's no stable
+byte region to append to for an arbitrary existing file the way there is
+for that blank scaffold. `openskp.open_existing()` takes the other
+viable approach: fully parse the existing file with this project's own
+reader, then replay everything it understood - materials, layers, every
+component definition, all root-level geometry and instances - back
+through the writer's own API, producing a brand-new file with equivalent
+content that more geometry can still be added to before saving:
+
+```python
+from openskp import open_existing
+
+builder, warnings, definitions = open_existing("building.skp")
+for w in warnings:
+    print("not fully reproduced:", w)
+
+builder.add_circle((0, 0, 100), (0, 0, 1), radius=50)
+builder.save("building_edited.skp")
+```
+
+Only a legacy-format (SketchUp 2013-2020) source file is accepted, for
+the same reason `openskp.create` only ever writes that format. The
+returned `warnings` list is the honest account of what couldn't be
+faithfully reproduced for that specific file - per-edge flags collapsed
+to a per-face approximation, a projected/distorted texture falling back
+to the default projection, a material's texture scale or colorized tint,
+section planes/text/dimensions (no writer support at all), and an
+original circle/arc's curve grouping (this project's reader doesn't
+preserve it, so it round-trips as a plain straight-edged face) - see
+[`openskp/edit.py`](../packages/python/src/openskp/edit.py)'s own
+module docstring for the complete, itemized list and the reasoning
+behind each one. Round-trip-validated against real, non-writer-authored
+architectural models, not just files this project's own writer produced.
+
+Every material/layer the source had is already reachable on the
+returned `builder` without a separate lookup - `builder.materials_by_name
+["Walnut"]`/`builder.layers_by_name["Roof"]` - and `definitions` maps
+each replayed component definition's own name to its builder, for
+placing more instances of something the source already defined:
+
+```python
+builder.add_face(points, material=builder.materials_by_name["Walnut"])
+builder.add_instance(definitions["Wheel"], translation=(50, 0, 0))
+```
+
+What the returned `builder` can no longer do is register a genuinely
+NEW material, layer, or component definition/group - by the time
+replay finishes writing the source's own root-level geometry, this
+writer's usual file-format ordering requirement (materials/layers/
+definitions must be finalized before any geometry) is already
+satisfied, so `add_material`/`add_layer`/`add_component_definition`/
+`add_group` all raise on this particular builder. Build anything new
+into a separate `create()` call instead.
+
 ## The web viewer
 
 [`examples/web-viewer/`](../examples/web-viewer/) is a full drag-and-drop
@@ -492,6 +767,14 @@ The .NET port exposes `SkpFile` as a static class with factory methods
 (`SkpFile.Parse`, `SkpFile.BuildScene`, `SkpFile.Open`), rather than requiring an
 instantiated file handle object before invoking `.Parse()`. This is a deliberate
 C# idiom choice that matches standard .NET framework library designs (e.g. `System.IO.File`).
+
+### Write support — Python only
+
+Covered above under [Write capabilities](#write-capabilities): Python is
+currently the only port that can create new `.skp` files (`openskp.create()`).
+This is a genuine capability gap, not a shape difference — TypeScript,
+.NET, Dart, and C++ remain read/export-only until a writer is ported to
+each. Contributions bringing the other four ports to parity are welcome.
 
 ### C++ `materials_by_id()` helper
 

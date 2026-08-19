@@ -19,6 +19,8 @@ from __future__ import annotations
 
 from importlib.metadata import PackageNotFoundError, version as _version
 
+from .create import ComponentDefinitionBuilder, SkpBuilder, SkpWriteError, create
+from .edit import open_existing
 from .errors import SkpParseError
 from .model import SkpFile, SkpModel
 from .scene import Scene, InstanceNode, MeshMetadata, GlbPrimitive
@@ -35,6 +37,11 @@ __all__: list[str] = [
     "MeshMetadata",
     "GlbPrimitive",
     "SkpParseError",
+    "create",
+    "SkpBuilder",
+    "ComponentDefinitionBuilder",
+    "SkpWriteError",
+    "open_existing",
     "__version__",
 ]
 

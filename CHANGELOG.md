@@ -5,6 +5,189 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — Python only
+
+**Initial write support.** OpenSKP can now *create* new `.skp` files from
+scratch, not just parse existing ones — a genuine, from-scratch binary
+writer for the legacy MFC `CArchive` format (SketchUp 2013–2020), built by
+inverting the existing reader's own decoding logic rather than wrapping
+any SDK. Early-stage and Python-only for now; the other four language
+ports do not yet have this capability. See
+[`packages/python/src/openskp/create.py`](packages/python/src/openskp/create.py)
+for the full scope notes.
+
+### Added
+
+- `openskp.create()` / `SkpBuilder` — build faces (planar, including
+  concave polygons and non-manifold shared edges) directly from vertex
+  coordinates, with automatic vertex/edge sharing wherever coordinates
+  coincide exactly.
+- Solid-color and image-textured materials (`add_material`,
+  `add_texture_material` — PNG and JPEG, detected from the file's own
+  magic bytes), assignable independently to a face's front and back side.
+- Named layers (`add_layer`).
+- Reusable component definitions with multiple independently-positioned
+  instances (`add_component_definition`, `add_instance`), and groups
+  (`add_group`, which place themselves automatically on close rather than
+  needing a separate placement call).
+- Nested definitions — a component definition can contain instances of
+  another, already-built definition inside its own body
+  (`ComponentDefinitionBuilder.add_instance`), the same assembly-of-parts
+  nesting real SketchUp supports, to any depth. A nested placement can
+  also be a *group* rather than a component instance
+  (`ComponentDefinitionBuilder.add_group_instance`) — this format has no
+  way to declare one definition's body inside another's, so the group's
+  own geometry still has to be built with a normal
+  `add_component_definition` first, then placed here.
+- Explicit texture positioning (`add_face`'s `front_uv`/`back_uv`) —
+  scale, rotate, shear, and offset a face's texture independently per
+  side instead of the default planar projection, given 3 world-point/UV
+  correspondences. Works on a face of any orientation, tilted or not.
+- Per-face/per-edge hidden, soft, and smooth flags.
+- Custom key/value attribute dictionaries (`attributes` on
+  `add_component_definition`, `add_instance`, and `add_face`) — the same
+  mechanism SketchUp's own "dynamic component" attributes use. Values may
+  be `str`, `int`, or `float`; not yet supported on groups, since ground
+  truth shows a group's own attribute pointer is always null unlike a
+  component instance's.
+- Circular faces (`add_circle` on `SkpBuilder`/`ComponentDefinitionBuilder`)
+  — a genuine, editable-by-radius SketchUp arc/circle entity (`CArcCurve`),
+  not `num_segments` disconnected straight edges that merely trace that
+  shape. Every edge in the tessellation shares one real curve backref,
+  confirmed via the SDK's own `SUEdgeGetCurve`/`SUCurveGetType` to resolve
+  to a single, correctly-typed arc entity.
+- Partial (open) arcs (`add_arc`) — the same genuine `CArcCurve` entity as
+  `add_circle`, but a chain of edges with no face, swept between
+  caller-given `start_angle`/`end_angle` (radians). Confirmed via the SDK
+  that the written endpoint coordinates land exactly where the requested
+  sweep says they should, not just that "some curve object" exists.
+- Freeform polyline curves (`add_polyline`) — an arbitrary chain of
+  straight edges (open or `closed`) grouped into one genuine `CCurve`
+  entity, distinct from `CArcCurve`'s own geometric frame: just a type
+  tag and an edge count, ground-truth-derived from SDK-authored open and
+  closed polylines of several edge counts. Confirmed via the SDK that
+  every edge shares the same curve object, typed as `SUCurveType_Simple`
+  (not `ArcCurve`), with the correct edge count.
+- Every file now opens to the standard "Iso" view (parallel projection,
+  looking at the origin) instead of the blank scaffold's own arbitrary
+  default camera.
+- No SketchUp SDK dependency at import, write, or any other runtime path.
+  The bundled blank-document scaffold this module splices geometry into
+  is disclosed plainly as SDK-authored boilerplate (Trimble's own
+  built-in empty-document bytes, not anyone's creative work) in the
+  module's own docstring — the writer logic itself (the entity encoding,
+  the object-graph protocol, the tail-reference renumbering) is 100%
+  independently reverse-engineered.
+- `openskp.open_existing()` (`openskp.edit` module) — load an *existing*
+  legacy-format `.skp` file and rebuild it as a new `SkpBuilder`, so more
+  geometry can be added before saving. Real SketchUp itself never patches
+  a file in place (it fully re-serializes on every save), so this works
+  by fully parsing the source with this project's own reader and
+  replaying everything it understood — materials, layers, every
+  component definition, all root-level geometry/instances — back through
+  the writer's own API, rather than touching the original bytes at all.
+  Round-trip-validated against real, non-writer-authored architectural
+  models (not just files this project's own writer produced), confirming
+  face/instance/definition counts and the real SDK's own acceptance of
+  the rebuilt file. Returns a list of warnings for anything the source
+  file had that couldn't be faithfully reproduced (a projected texture,
+  a colorized material's tint, and several others — see the module's
+  own docstring for the complete, itemized list) rather than silently
+  dropping it.
+- `rotation=(axis, angle_radians)` on `add_instance`/`add_group`/
+  `add_group_instance` — a convenience alternative to hand-deriving a
+  `matrix3x3` rotation matrix for the common case of a pure rotation
+  (Rodrigues' rotation formula). Confirmed against the real SDK's own
+  `SUComponentInstanceGetTransform` to match SketchUp's transform
+  convention exactly, not just "some rotation was applied."
+- `add_face(..., auto_triangulate=True)` — a non-coplanar polygon (a
+  tessellated curved surface's warped "quad," the case that previously
+  had to be hand-split into triangles before calling `add_face` at all)
+  is now fan-triangulated into real, always-planar faces automatically
+  instead of raising, the same silent fallback real SketchUp's own UI
+  applies when you draw a not-quite-flat face. Off by default — existing
+  strict-planarity behavior is unchanged unless opted into.
+- `add_face(..., holes=[...])` — cut one or more independent closed
+  polygons out of a face (a window opening in a wall, say) as real
+  additional loops in the same `CFace` record, not a separate,
+  unconnected geometry hack. Ground-truth-derived from an SDK-authored
+  window-in-a-wall face: a hole loop is structurally identical to the
+  boundary loop except one flag byte, and its winding direction doesn't
+  matter (confirmed via the SDK's own geometry-input API accepting
+  either, and independently by writing raw bytes both ways). Confirmed
+  against the real SDK that the hole's area is genuinely subtracted
+  (`SUFaceGetArea`), not just structurally present.
+  `openskp.open_existing()` now replays a multi-loop face faithfully
+  instead of skipping it.
+- `SkpBuilder.materials_by_name`/`layers_by_name` — every material/layer
+  registered so far, by name, always kept up to date as a side effect of
+  `add_material`/`add_texture_material`/`add_layer` (previously a private,
+  undocumented implementation detail). `openskp.open_existing()` now
+  also returns a third value, `definitions` (component definition name →
+  its builder), so a caller can reuse the source file's own materials,
+  layers, and component definitions on new geometry — e.g.
+  `builder.add_face(pts, material=builder.materials_by_name["Walnut"])`
+  or `builder.add_instance(definitions["Wheel"], translation=...)` —
+  without reaching into a private attribute. Registering a genuinely NEW
+  material/layer/definition/group on the returned builder still isn't
+  possible (the file format's own ordering requirement is already
+  satisfied by the time replay finishes writing root-level geometry);
+  that limitation is now documented and tested rather than just
+  discovered by trial and error.
+- `hidden=True` on `add_instance`/`add_group`/`add_group_instance` — hides
+  that specific placement (its contents still exist in the file), the
+  same drawbase bit `add_face`'s own `hidden` already used. `color=`/
+  `hidden=` on `add_layer` — the layer's own color and default
+  visibility, both already exposed on the read side as `Layer.color_r/g/
+  b`/`Layer.hidden` but previously fixed at a hardcoded default on write.
+  All three confirmed against the real SDK (`SUDrawingElementGetHidden`,
+  `SULayerGetVisibility`). `openskp.open_existing()` now replays both
+  faithfully instead of warning that they were dropped.
+
+### Fixed
+
+- Calling `add_face`/`add_instance` on the root builder while a component
+  definition was still open (its `with` block not yet exited) silently
+  produced a corrupted file instead of raising — found while testing
+  group nesting, unrelated to it otherwise. Now raises immediately.
+- `write_face` validated texture-positioning correspondences and
+  attribute values only partway through writing a face's bytes - a
+  caller that caught the resulting `SkpWriteError` and kept building
+  (exactly what `open_existing()`'s replay does when skipping one
+  unsupported face) was left with orphaned, uncounted edges silently
+  corrupting everything written afterward, with no error surfaced until
+  the file failed to fully parse. Both checks now run before any bytes
+  are written.
+- `write_textured_material`'s placeholder average-color always had a
+  fully-opaque alpha byte, which `legacy.py`'s reader treats as one of
+  its two signals that a material is a colorized (tinted) variant - every
+  plain (non-colorized) texture this writer created was silently
+  misreported as colorized when read back. Found via `open_existing()`
+  round-tripping the writer's own output.
+
+### Validation
+
+Every capability above is verified against the real SketchUp SDK
+(`SketchUpAPI.dll` used strictly as a local, offline validation oracle —
+never a runtime dependency), not just against OpenSKP's own reader —
+several silent-failure fields (drawbase padding, loop flags, attribute
+container requirements) only show up as `SU_ERROR_MODEL_INVALID` in real
+SketchUp despite parsing cleanly through this project's own code. A
+combined "kitchen sink" test exercises every feature together in one
+file (materials, layers, textures, definitions, instances, groups,
+concave/non-manifold geometry) and is checked at scale (hundreds of
+entities) as a regression guard.
+
+### Explicitly out of scope for this first pass
+
+- Declaring a group's geometry inline nested inside another definition's
+  own body, the way `add_group` self-places at the root level - this
+  format has no mechanism for one definition's declaration to live inside
+  another's, so a nested group's geometry has to be built separately
+  first (see `add_group_instance` above).
+- The other four language ports (TypeScript, .NET, Dart, C++) do not
+  have write support yet.
+
 ## [1.0.0] — 2026-08-13
 
 First stable release. All five language ports (Python, TypeScript, Dart,
