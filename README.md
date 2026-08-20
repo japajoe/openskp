@@ -1,10 +1,10 @@
 <div align="center">
 
-<img src="assets/logo.png" width="500" Height="400" alt="OpenSKP logo"/>
+<img src="assets/logo.png" width="400" Height="400" alt="OpenSKP logo"/>
 
 ### The Open-Source SketchUp File Toolkit
 
-**Parse `.skp` files in five languages — and write them natively in Python. No SDK. No license. Just code.**
+**Parse, write, and convert `.skp` files natively in five languages. No SDK. No license. Just code.**
 
 ### 🏠 [openskp.com](https://openskp.com) · 🌐 [Try the Live Web Viewer (Drag-and-Drop)](https://iamahsanmehmood.github.io/openskp/) · 📖 [Browse the Docs Site](https://iamahsanmehmood.github.io/openskp/docs/)
 
@@ -18,9 +18,9 @@
 
 ---
 
-*Open-source SketchUp binary file parser for Python, TypeScript, .NET, Dart, and C++ — plus a native `.skp` writer and editor in Python*
+*Open-source SketchUp binary file parser, writer, and converter for Python, TypeScript, .NET, Dart, and C++*
 
-[Quick Start](#-quick-start) · [Features](#-features) · [Used in Production](#-used-in-production) · [Documentation](#-documentation) · [Contributing](#-contributing)
+[Quick Start](#-quick-start) · [Features](#-features) · [Built by AI](#-built-by-ai-too) · [Used in Production](#-used-in-production) · [Documentation](#-documentation) · [Contributing](#-contributing)
 
 </div>
 
@@ -32,7 +32,9 @@ OpenSKP is the **first and only** open-source, cross-platform toolkit for Sketch
 
 **Reading** is available in **five languages** — Python, TypeScript, .NET, Dart, and C++ — parsing both the modern **VFF container** (2021+) and the classic **MFC `CArchive`** container (2013–2020) into full programmatic access: geometry, materials, components, layers, and more.
 
-**Writing** is available in **Python**: a from-scratch legacy-format writer ([`openskp.create`](packages/python/src/openskp/create.py)) that produces real, editable geometry — materials and textures, layers, nested component definitions and groups, circular/arc curves, freeform polylines, faces with holes cut out — plus an editor ([`openskp.open_existing`](packages/python/src/openskp/edit.py)) that loads a file that already exists and extends it. Every writer feature is validated against the real SketchUp SDK, not just against this project's own reader, and it holds up rebuilding complex, real architectural models — not only synthetic test fixtures. Writing is Python-only today; porting it to the other four languages is a planned future direction, not yet under way — contributions toward that are very welcome.
+**Writing** is available in **all five languages**: a from-scratch legacy-format writer (`openskp.create()` / `create()` / `SkpCreate.NewFile()` / `openskp::create()` — see the [Quick Start](#-quick-start) below for the exact call per language) that produces real, editable geometry — materials and textures, layers, nested component definitions and groups, circular/arc curves, freeform polylines, faces with holes cut out — plus an editor (`openskp.open_existing()` / `openExisting()` / `SkpEdit.OpenExisting()` / `openskp::open_existing()`) that loads a file that already exists and extends it. Every writer feature is validated against the real SketchUp SDK, not just against this project's own reader, and it holds up rebuilding complex, real architectural models — not only synthetic test fixtures. Landed in Python first; TypeScript, .NET, Dart, and C++ now match it feature-for-feature, each verified against the same SDK oracle. See [Write capabilities](docs/DEVELOPER_GUIDE.md#write-capabilities) in the Developer Guide for the full picture, including the naming convention each language follows.
+
+**Converting** puts reading and writing together: OpenSKP is a genuine **SketchUp file converter**, not just a parser with an export bolt-on. Every one of the five languages natively converts a `.skp` file to **7 formats** — glTF (GLB), Wavefront OBJ/MTL, STL, PLY, DXF 3D (AutoCAD), IFC4 (BIM), and JSON — with no third-party CAD/BIM SDK involved, and the DXF converter specifically verified against real desktop AutoCAD, not just lenient readers. Converting `.skp` *into* other formats is fully shipped today; converting *other* formats into `.skp` (glTF/IFC/OBJ → SketchUp) is a planned future direction built on the now-mature writer, not yet under way.
 
 > [!IMPORTANT]
 > This project was built by reverse engineering a proprietary binary format. It is not affiliated with or endorsed by Trimble Inc. or SketchUp.
@@ -53,9 +55,10 @@ OpenSKP is the **first and only** open-source, cross-platform toolkit for Sketch
 | **Styles** | ✅ | Front/back face colors for unpainted faces |
 | **Dynamic Components** | ✅ | Extracts dynamic component attribute key-value pairs for both modern (2021+) and legacy (2013–2020) files, in all five languages |
 | **Observability** | ✅ | Opt-in progress reporting + structured, location-carrying parse errors — see [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) |
-| **Export to GLB / OBJ / STL / PLY / DXF 3D / IFC4 / JSON** | ✅ | GLB, Wavefront OBJ, STL, PLY, DXF 3D (AutoCAD Polyface Mesh), IFC4 (BIM), and JSON metadata export are available natively across all five languages — see [Export capabilities](docs/DEVELOPER_GUIDE.md#export-capabilities) |
-| **Write native `.skp` files** | 🧪 Python only | Build new `.skp` files from scratch — geometry (including genuine circular/arc curves, freeform polylines, faces with holes cut out, and non-planar auto-triangulation), solid/textured materials, layers, nested component definitions and groups, instance rotation/visibility, and custom attribute dictionaries. No SDK involved — every feature validated against the real SketchUp SDK. See [`openskp.create`](packages/python/src/openskp/create.py) |
-| **Edit existing `.skp` files** | 🧪 Python only | Load an existing legacy-format file and extend it — reuses its materials, layers, and component definitions, adds new geometry or instances, and saves a new file. See [`openskp.open_existing`](packages/python/src/openskp/edit.py) |
+| **Convert to GLB / OBJ / STL / PLY / DXF 3D / IFC4 / JSON** | ✅ | Native, from-scratch conversion to glTF (GLB), Wavefront OBJ, STL, PLY, DXF 3D (AutoCAD Polyface Mesh), IFC4 (BIM), and JSON metadata — available in all five languages, no third-party CAD/BIM SDK involved — see [Export capabilities](docs/DEVELOPER_GUIDE.md#export-capabilities) |
+| **Write native `.skp` files** | ✅ | Build new `.skp` files from scratch — geometry (including genuine circular/arc curves, freeform polylines, faces with holes cut out, and non-planar auto-triangulation), solid/textured materials, layers, nested component definitions and groups, instance rotation/visibility, and custom attribute dictionaries. No SDK involved — every feature validated against the real SketchUp SDK, in all five languages. See [Write capabilities](docs/DEVELOPER_GUIDE.md#write-capabilities) |
+| **Edit existing `.skp` files** | ✅ | Load an existing legacy-format file and extend it — reuses its materials, layers, and component definitions, adds new geometry or instances, and saves a new file. All five languages. See [Editing an existing file](docs/DEVELOPER_GUIDE.md#editing-an-existing-file) |
+| **AI coding-agent ready** | ✅ | A generic, well-documented writer API (no object-specific helpers needed) that AI coding agents can compose freely — proven on real generated models (furniture, a house, an executive desk, a smartphone modeled from a photo) across two independent AI agents, each built from a natural-language prompt with no primitives library involved. See [AI-Generated Models](docs/AI_MODELING.md) |
 | **Streaming / low-memory parsing** | ✅ | Peak memory bounded by the largest single definition, not the whole file — see [Memory architecture](docs/ARCHITECTURE.md#memory-architecture) |
 | **Pure Implementation** | ✅ | No SketchUp SDK, no native dependencies, no license required |
 | **Cross-Platform** | ✅ | Works on Linux, macOS, and Windows |
@@ -127,7 +130,7 @@ scene = SkpFile.open("my_model.skp").build_scene()
 print(f"{len(scene.glb_primitives)} renderable mesh primitives")
 ```
 
-🧪 **Writing** (Python-only):
+**Writing:**
 
 ```python
 from openskp import create
@@ -170,6 +173,22 @@ const scene = SkpFile.open('my_model.skp').buildScene();
 const glb = toGLB(scene);   // ready to write to a .glb file
 ```
 
+**Writing:**
+
+```typescript
+import { create } from 'openskp';
+
+const builder = create();
+const red = builder.addMaterial('Red', [255, 0, 0]);
+const chair = builder.addComponentDefinition('Chair', (def) => {
+  def.addFace([[0, 0, 0], [20, 0, 0], [20, 20, 0], [0, 20, 0]]);
+});
+builder.addInstance(chair, { translation: [50, 0, 0] });
+builder.addInstance(chair, { translation: [100, 0, 0], hidden: true });
+builder.addFace([[0, 0, 0], [100, 0, 0], [100, 100, 0], [0, 100, 0]], { material: red });
+builder.save('output.skp');   // Node.js; use builder.toBytes() in the browser
+```
+
 ### 🚀 .NET / C#
 
 ```bash
@@ -189,6 +208,22 @@ Console.WriteLine($"{scene.GlbPrimitives.Count} renderable mesh primitives");
 var glb = GlbExport.ToGlb(scene);       // ready to write to a .glb file
 GlbExport.ExportGlb(scene, "my_model.glb");
 IfcExport.ExportIfc(scene, "my_model.ifc");
+```
+
+**Writing:**
+
+```csharp
+var builder = SkpCreate.NewFile();
+int red = builder.AddMaterial("Red", (255, 0, 0));
+var chair = builder.AddComponentDefinition("Chair");
+using (chair)
+{
+    chair.AddFace(new (double, double, double)[] { (0, 0, 0), (20, 0, 0), (20, 20, 0), (0, 20, 0) });
+}
+builder.AddInstance(chair, translation: (50, 0, 0));
+builder.AddInstance(chair, translation: (100, 0, 0), hidden: true);
+builder.AddFace(new (double, double, double)[] { (0, 0, 0), (100, 0, 0), (100, 100, 0), (0, 100, 0) }, material: red);
+builder.Save("output.skp");
 ```
 
 ### 🎯 Dart / Flutter
@@ -212,6 +247,20 @@ exportGlb(scene, 'my_model.glb');
 exportIfc(scene, 'my_model.ifc');
 ```
 
+**Writing:**
+
+```dart
+final builder = create();
+final red = builder.addMaterial('Red', [255, 0, 0]);
+final chair = builder.addComponentDefinition('Chair', (def) {
+  def.addFace([(0.0, 0.0, 0.0), (20.0, 0.0, 0.0), (20.0, 20.0, 0.0), (0.0, 20.0, 0.0)]);
+});
+builder.addInstance(chair, translation: (50.0, 0.0, 0.0));
+builder.addInstance(chair, translation: (100.0, 0.0, 0.0), hidden: true);
+builder.addFace([(0.0, 0.0, 0.0), (100.0, 0.0, 0.0), (100.0, 100.0, 0.0), (0.0, 100.0, 0.0)], material: red);
+builder.save('output.skp');
+```
+
 ### ⚙️ C++17 / CMake
 
 ```cmake
@@ -230,38 +279,115 @@ openskp::export_glb(scene, "my_model.glb");
 openskp::export_ifc(scene, "my_model.ifc");
 ```
 
+**Writing:**
+
+```cpp
+using namespace openskp;
+
+auto builder = create();
+int red = builder->add_material("Red", Color3{255, 0, 0});
+auto& chair = builder->add_component_definition("Chair");
+chair.add_face({{0, 0, 0}, {20, 0, 0}, {20, 20, 0}, {0, 20, 0}});
+chair.close();
+builder->add_instance(chair, {.translation = {50, 0, 0}});
+builder->add_instance(chair, {.translation = {100, 0, 0}, .hidden = true});
+builder->add_face({{0, 0, 0}, {100, 0, 0}, {100, 100, 0}, {0, 100, 0}}, {.material = red});
+builder->save("output.skp");
+```
+
+---
+
+## 🤖 Built by AI, Too
+
+The writer above is a generic, well-documented API on purpose — no
+`add_chair()` or `add_staircase()` helpers, just materials, faces,
+components, and instances. That turns out to make it an unusually good
+target for AI coding agents: every model below was generated from a
+natural-language (or reference-photo) prompt, by two *independent* AI
+agents, using nothing but the raw API documented above.
+
+<table>
+<tr>
+<td width="33%" align="center">
+<img src="docs/assets/ai-modeling/chair-table-armchair.png" alt="AI-generated armchair and side table" width="100%"><br>
+<sub>Armchair + side table — tapered legs, curved tessellated backrest</sub>
+</td>
+<td width="33%" align="center">
+<img src="docs/assets/ai-modeling/executive-desk.png" alt="AI-generated executive desk with drawers" width="100%"><br>
+<sub>Executive desk — 8 nested component definitions</sub>
+</td>
+<td width="33%" align="center">
+<img src="docs/assets/ai-modeling/phone-front-back.png" alt="AI-generated smartphone modeled from a reference photo" width="100%"><br>
+<sub>Smartphone — modeled directly from a product reference photo</sub>
+</td>
+</tr>
+</table>
+
+See [AI-Generated Models](docs/AI_MODELING.md) for the full write-up —
+why this works, more examples (including real code excerpts and exact
+component/material counts), how to point your own AI coding agent at
+OpenSKP today, and open directions for contributors (a render/validate
+feedback loop, evaluating an MCP server, more showcase models).
+
 ---
 
 ## 🏛️ Architecture
 
-OpenSKP splits into a light parse and an opt-in, heavier scene bake — kept
-separate so the common case (just reading geometry/metadata) never pays for
-scene-graph resolution it doesn't need:
+Two independent flows, both native in all five languages: **reading and
+converting** an existing `.skp` file, and **writing** a new one (or
+editing an existing one) from nothing but the same public API.
 
 ```mermaid
 graph TB
-    SKP[".skp file<br/>(VFF 2021+ or legacy MFC 2013-2020)"] --> HDR["Header + container<br/>detection"]
-    HDR --> WALK["Streaming TLV walk<br/>(one top-level record<br/>at a time)"]
-    WALK --> RAW["Raw parsed data<br/>defs · layers · materials · styles"]
-    RAW --> PARSE["parse() -> SkpModel<br/>per-definition geometry,<br/>no scene resolution"]
-    RAW --> SCENE["buildScene() -> Scene<br/>full placed instance tree,<br/>triangulated, world-space"]
-    SCENE --> GLB["GLB export<br/>(all five languages)"]
+    subgraph read[" Reading and converting "]
+        direction LR
+        SKP1[".skp file<br/>VFF 2021+ or<br/>legacy MFC 2013-2020"] --> WALK["Streaming TLV walk<br/>one top-level record<br/>at a time"]
+        WALK --> RAW["Raw parsed data<br/>defs · layers ·<br/>materials · styles"]
+        RAW --> PARSE["parse()<br/>-> SkpModel<br/>no scene resolution"]
+        RAW --> SCENE["buildScene()<br/>-> Scene<br/>triangulated, world-space"]
+        SCENE --> CONVERT["Convert to 7 formats<br/>GLB · OBJ · STL · PLY<br/>DXF · IFC4 · JSON"]
+    end
 
-    style SKP fill:#f59e0b,color:#000,stroke:#d97706
+    subgraph write[" Writing and editing "]
+        direction LR
+        NEW["create()"] --> SPLICE["Splice new entities into<br/>the blank-document scaffold"]
+        SKP2[".skp file<br/>to extend"] --> EDIT["open_existing()<br/>parse -> replay -> extend"]
+        EDIT --> SPLICE
+        SPLICE --> OUT["New .skp file"]
+    end
+
+    style SKP1 fill:#f59e0b,color:#000,stroke:#d97706
+    style SKP2 fill:#f59e0b,color:#000,stroke:#d97706
     style RAW fill:#8b5cf6,color:#fff,stroke:#7c3aed
+    style SPLICE fill:#8b5cf6,color:#fff,stroke:#7c3aed
     style PARSE fill:#3b82f6,color:#fff,stroke:#2563eb
     style SCENE fill:#3b82f6,color:#fff,stroke:#2563eb
-    style GLB fill:#10b981,color:#fff,stroke:#059669
+    style NEW fill:#3b82f6,color:#fff,stroke:#2563eb
+    style EDIT fill:#3b82f6,color:#fff,stroke:#2563eb
+    style CONVERT fill:#10b981,color:#fff,stroke:#059669
+    style OUT fill:#10b981,color:#fff,stroke:#059669
 ```
 
-The streaming TLV walk is what lets OpenSKP handle real production files
-with 100,000+ component definitions without materializing the whole file's
-parse tree in memory at once — peak memory is bounded by the single
-largest top-level record, not the file's total size.
+**Reading** streams the TLV tree one top-level record at a time rather
+than materializing the whole thing in memory — the reason OpenSKP
+handles real production files with 100,000+ component definitions;
+peak memory is bounded by the single largest top-level record, not the
+file's total size. `parse()` (light, per-definition) and `buildScene()`
+(opt-in, full placed scene graph) are deliberately separate so the
+common case never pays for scene-graph resolution it doesn't need.
+
+**Writing** takes the opposite shape: rather than streaming a large
+input, it splices new class-ref/back-ref entities into a small,
+disclosed, SDK-authored blank-document scaffold — the same protocol
+[docs/BINARY_FORMAT.md](docs/BINARY_FORMAT.md) documents for reading,
+inverted. `open_existing()` reuses this by fully parsing a source file
+first, then replaying everything it understood back through the same
+writer API before any new geometry is added.
 
 > 📖 For the full architecture breakdown — including the memory model,
-> why .NET needed a genuinely different fix, and where the five languages'
-> internals map to each other — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+> the writer's scaffold-splicing design, why .NET needed a genuinely
+> different memory fix, and where the five languages' internals map to
+> each other — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ---
 
@@ -279,18 +405,18 @@ openskp/
 │   ├── python/                # 🐍 Python implementation — parse + write
 │   │   ├── src/openskp/       # _core.py, legacy.py, model.py, scene.py, create.py, edit.py, ...
 │   │   └── tests/
-│   ├── typescript/            # 📘 TypeScript / JavaScript implementation
-│   │   ├── src/                # index.ts, model.ts, legacy.ts, observability.ts, ...
+│   ├── typescript/            # 📘 TypeScript / JavaScript implementation — parse + write
+│   │   ├── src/                # index.ts, model.ts, legacy.ts, create.ts, edit.ts, observability.ts, ...
 │   │   └── tests/
-│   ├── dotnet/                # 🚀 .NET / C# implementation
-│   │   ├── OpenSkp/            # Core.cs, Legacy.cs, Model.cs, Scene.cs, ...
+│   ├── dotnet/                # 🚀 .NET / C# implementation — parse + write
+│   │   ├── OpenSkp/            # Core.cs, Legacy.cs, Model.cs, Scene.cs, Create.cs, Edit.cs, ...
 │   │   └── OpenSkp.Tests/
-│   ├── dart/                  # 🎯 Dart / Flutter implementation
-│   │   ├── lib/src/            # core.dart, legacy.dart, model.dart, scene.dart, ...
+│   ├── dart/                  # 🎯 Dart / Flutter implementation — parse + write
+│   │   ├── lib/src/            # core.dart, legacy.dart, model.dart, scene.dart, create.dart, edit.dart, ...
 │   │   └── test/
-│   └── cpp/                   # ⚙️ C++17 / CMake implementation
-│       ├── include/openskp/    # Public API
-│       ├── src/                # Parser and scene implementation
+│   └── cpp/                   # ⚙️ C++17 / CMake implementation — parse + write
+│       ├── include/openskp/    # Public API (create.hpp, edit.hpp, ...)
+│       ├── src/                # Parser, scene, and writer implementation
 │       └── tests/
 │
 ├── examples/
@@ -300,10 +426,12 @@ openskp/
 │
 ├── docs/                       # 📖 Documentation
 │   ├── DEVELOPER_GUIDE.md      # Start here — the detailed cross-language guide
+│   ├── AI_MODELING.md          # AI coding agents as a writer target, with real examples
 │   ├── OBSERVABILITY.md        # Progress reporting + structured errors, in depth
-│   ├── ARCHITECTURE.md         # Library architecture, memory model
+│   ├── ARCHITECTURE.md         # Library architecture, memory model, writer design
 │   ├── API_DESIGN.md           # Cross-platform API quick reference
-│   └── BINARY_FORMAT.md        # Reverse-engineered SKP format spec
+│   ├── BINARY_FORMAT.md        # Reverse-engineered SKP format spec
+│   └── assets/                 # Images referenced by the docs above
 │
 ├── research/                   # 🔬 Research notes
 │   └── METHODOLOGY.md          # Reverse engineering methodology
@@ -363,6 +491,34 @@ metadata for placement/inspection rather than renderer-facing vertex data.
 > for details, and [docs/BINARY_FORMAT.md](docs/BINARY_FORMAT.md) for the
 > full VFF/TLV specification.
 
+### Writing
+
+Every writer only ever produces the **legacy MFC** container above, never
+VFF — real SketchUp itself still writes MFC-format files when saving as an
+older version, and it's the format this project's writer/editor logic was
+reverse-engineered against first. Rather than synthesizing a file from
+nothing, each language's writer bundles a small, disclosed
+[SDK-authored blank-document scaffold](packages/python/src/openskp/create.py)
+and splices new class-ref/back-ref object-graph entities into it — the
+same encoding [docs/BINARY_FORMAT.md](docs/BINARY_FORMAT.md) documents for
+reading, just inverted. See
+[Write capabilities](docs/DEVELOPER_GUIDE.md#write-capabilities) in the
+Developer Guide for the full API and behavior.
+
+### Converting
+
+`parse()` and `buildScene()` are also the front half of a converter, not
+just a reader: `buildScene()`'s output (triangulated, world-space,
+grouped by material) is exactly the shape every format's exporter needs,
+so converting `.skp` → GLB/OBJ/STL/PLY/DXF/IFC4/JSON is a from-scratch
+serializer per format on top of that same data, in every language — no
+intermediate CAD/BIM SDK, no shelling out to another tool. Converting the
+other direction (glTF/IFC/OBJ → `.skp`) reuses the writer above the same
+way: build a `SkpBuilder` from the other format's geometry instead of
+from a fresh sketch, a planned future direction not yet under way. See
+[Export capabilities](docs/DEVELOPER_GUIDE.md#export-capabilities) in the
+Developer Guide for the full per-language API.
+
 ---
 
 ## 📖 Documentation
@@ -376,6 +532,7 @@ The full source for each topic also lives here as plain Markdown:
 | Document | Description |
 |:---------|:------------|
 | [Developer Guide](docs/DEVELOPER_GUIDE.md) | **Start here.** The detailed, verified cross-language guide — API, memory/performance, legacy format, error handling, and known differences between the five ports |
+| [AI-Generated Models](docs/AI_MODELING.md) | Why OpenSKP's writer works well as an AI coding-agent target, real generated examples, and open directions for contributors |
 | [Observability Guide](docs/OBSERVABILITY.md) | Progress reporting + structured errors, in depth |
 | [Binary Format Spec](docs/BINARY_FORMAT.md) | Reverse-engineered VFF / TLV format documentation |
 | [Architecture](docs/ARCHITECTURE.md) | Library design, memory model, and module structure |

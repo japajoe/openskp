@@ -1,8 +1,8 @@
 # OpenSKP
 
-**The open-source SketchUp (`.skp`) file parser — Python edition.**
+**The open-source SketchUp (`.skp`) file parser, writer, and converter — Python edition.**
 
-Parse `.skp` files without SketchUp. No SDK. No license. Just code.
+Parse, write, and convert `.skp` files without SketchUp. No SDK. No license. Just code.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![PyPI](https://img.shields.io/pypi/v/openskp.svg?logo=pypi&logoColor=white&label=pypi)](https://pypi.org/project/openskp/)
@@ -25,9 +25,10 @@ first-class packages for TypeScript, .NET, Dart, and C++ — see the
 [project README](https://github.com/iamahsanmehmood/openskp) for the full
 cross-language picture.
 
-🧪 This Python package can also *write* new `.skp` files from scratch, and
-edit existing ones — Python-only for the moment, validated feature-by-feature
-against the real SketchUp SDK (see [Writing](#writing) below).
+This Python package can also *write* new `.skp` files from scratch, and
+edit existing ones, validated feature-by-feature against the real
+SketchUp SDK (see [Writing](#writing) below) — the same writer is also
+available in TypeScript, .NET, Dart, and C++.
 
 ## Features
 
@@ -38,7 +39,7 @@ against the real SketchUp SDK (see [Writing](#writing) below).
   (2013–2020) containers, transparently, behind one `parse()` call.
 - **Scene baking** — an opt-in `build_scene()` pass resolves the full placed
   scene graph to world-space, triangulated, export-ready geometry.
-- **Native multi-format export** — glTF (GLB), Wavefront OBJ/MTL, STL,
+- **Native multi-format conversion** — glTF (GLB), Wavefront OBJ/MTL, STL,
   PLY, AutoCAD DXF (3DFACE and Polyface Mesh), IFC4 (BIM/ISO 10303-21 STEP),
   and JSON — all written from scratch, no third-party CAD/BIM SDK involved.
   The DXF writer is verified against real desktop AutoCAD, not just lenient
@@ -47,14 +48,15 @@ against the real SketchUp SDK (see [Writing](#writing) below).
   largest single definition, not the whole file.
 - **Structured observability** — opt-in progress reporting and
   location-carrying parse errors for debugging malformed or unusual files.
-- **Write support (Python-only)** — build new legacy-format `.skp` files
-  from scratch: geometry (including true, editable circular/arc curves,
-  freeform polylines, faces with holes cut out, and non-planar
-  auto-triangulation), materials (solid + PNG/JPEG textures), layers,
-  nested component definitions and groups, instance rotation/visibility,
-  and custom attribute dictionaries — or load and extend an existing file
-  with `open_existing()`. No SDK involved; every feature validated
-  against the real SketchUp SDK. See [Writing](#writing) below.
+- **Write support** — build new legacy-format `.skp` files from scratch:
+  geometry (including true, editable circular/arc curves, freeform
+  polylines, faces with holes cut out, and non-planar auto-triangulation),
+  materials (solid + PNG/JPEG textures), layers, nested component
+  definitions and groups, instance rotation/visibility, and custom
+  attribute dictionaries — or load and extend an existing file with
+  `open_existing()`. No SDK involved; every feature validated against
+  the real SketchUp SDK. Also available in TypeScript, .NET, Dart, and
+  C++. See [Writing](#writing) below.
 
 ## Installation
 
@@ -125,9 +127,9 @@ json_export.export(model, "output.json", scene=scene)
 
 OpenSKP can also *create* new `.skp` files from scratch — a genuine,
 from-scratch binary writer for the legacy MFC `CArchive` format (SketchUp
-2013–2020), with no SketchUp SDK involved at any point. Python-only for
-now, but feature-complete for common modeling needs and validated
-feature-by-feature against the real SketchUp SDK: geometry, materials
+2013–2020), with no SketchUp SDK involved at any point. Feature-complete
+for common modeling needs and validated feature-by-feature against the
+real SketchUp SDK: geometry, materials
 (solid + PNG/JPEG textures), layers (with color and default visibility),
 component definitions with multiple instances, groups, nested
 definitions and nested group instances (an assembly containing instances
@@ -147,9 +149,10 @@ geometry can be added to it before saving (see
 [Editing an existing file](#editing-an-existing-file) below). See
 [`openskp/create.py`](src/openskp/create.py) for the full scope notes.
 
-This is Python-only today — porting the writer to the other four
-languages (TypeScript, .NET, Dart, C++) is a planned future direction,
-not yet under way. Contributions toward that are very welcome.
+The same writer is also available in TypeScript, .NET, Dart, and C++ —
+see each package's own README, or
+[Write capabilities](https://github.com/iamahsanmehmood/openskp/blob/main/docs/DEVELOPER_GUIDE.md#write-capabilities)
+in the Developer Guide for the naming convention each one follows.
 
 ```python
 from openskp import create

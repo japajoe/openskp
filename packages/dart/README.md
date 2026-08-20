@@ -1,8 +1,8 @@
 # OpenSKP
 
-**The open-source SketchUp (`.skp`) file parser — Dart / Flutter edition.**
+**The open-source SketchUp (`.skp`) file parser, writer, and converter — Dart / Flutter edition.**
 
-Parse `.skp` files without SketchUp. No SDK. No license. Just code.
+Parse, write, and convert `.skp` files without SketchUp. No SDK. No license. Just code.
 
 [![Pub Version](https://img.shields.io/pub/v/openskp.svg?logo=dart&logoColor=white)](https://pub.dev/packages/openskp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/iamahsanmehmood/openskp/blob/main/LICENSE)
@@ -26,6 +26,10 @@ The same parser and export API also ship as first-class packages for
 Python, TypeScript, .NET, and C++ — see the
 [project README](https://github.com/iamahsanmehmood/openskp) for the full
 cross-language picture.
+
+This package can also *write* new `.skp` files from scratch, and edit
+existing ones, validated feature-by-feature against the real SketchUp
+SDK (see [Writing](#-writing) below).
 
 ---
 
@@ -52,11 +56,19 @@ Enable mobile (iOS/Android), desktop, and web developers to parse and build 3D S
   (2013–2020) containers, transparently, behind one `parse()` call.
 - **Scene baking**: an opt-in `buildScene()` pass resolves the full placed
   scene graph to world-space, triangulated, export-ready geometry.
-- **Native multi-format export**: glTF (GLB), Wavefront OBJ/MTL, STL,
+- **Native multi-format conversion**: glTF (GLB), Wavefront OBJ/MTL, STL,
   PLY, AutoCAD DXF (3DFACE and Polyface Mesh), IFC4 (BIM/ISO 10303-21
   STEP) — all written from scratch, no third-party CAD/BIM SDK involved.
   The DXF writer is verified against real desktop AutoCAD, not just
   lenient DXF readers.
+- **Write support**: build new legacy-format `.skp` files from scratch:
+  geometry (including true, editable circular/arc curves, freeform
+  polylines, faces with holes cut out, and non-planar auto-triangulation),
+  materials (solid + PNG/JPEG textures), layers, nested component
+  definitions and groups, instance rotation/visibility, and custom
+  attribute dictionaries — or load and extend an existing file with
+  `openExisting()`. No SDK involved; every feature validated against the
+  real SketchUp SDK. See [Writing](#-writing) below.
 
 ---
 
@@ -163,6 +175,71 @@ void main() async {
   exportIfc(scene, 'my_model.ifc');
 }
 ```
+
+---
+
+## ✏️ Writing
+
+OpenSKP can also *create* new `.skp` files from scratch — a genuine,
+from-scratch binary writer for the legacy MFC `CArchive` format (SketchUp
+2013–2020), with no SketchUp SDK involved at any point. Ports the same
+feature set as the Python package's writer, verified byte-identical to
+Python's own output on the same input: geometry, materials (solid +
+PNG/JPEG textures), layers (with color and default visibility),
+component definitions with multiple instances, groups, nested
+definitions and nested group instances, per-instance rotation and
+visibility, explicit per-side texture positioning, custom key/value
+attribute dictionaries, circular faces and partial arcs, freeform
+polyline curves, faces with holes cut out, and non-planar
+auto-triangulation. `openExisting()` loads an *existing* legacy-format
+file and rebuilds it as a new builder, so more geometry can be added
+before saving. See [`lib/src/create.dart`](lib/src/create.dart) for the
+full scope notes.
+
+```dart
+import 'package:openskp/openskp.dart';
+
+void main() {
+  final builder = create();
+
+  // Materials and layers
+  final red = builder.addMaterial('Red', [255, 0, 0]);
+  final roof = builder.addLayer('Roof', color: [180, 60, 40]);
+
+  // All addComponentDefinition/addGroup calls must come before any
+  // addInstance/addFace call - placing anything locks in the file's
+  // internal slot numbering for everything after it
+  final chair = builder.addComponentDefinition('Chair', (def) {
+    def.addFace([(0.0, 0.0, 0.0), (20.0, 0.0, 0.0), (20.0, 20.0, 0.0), (0.0, 20.0, 0.0)]);
+  });
+  builder.addInstance(chair, translation: (50.0, 0.0, 0.0));
+  builder.addInstance(chair, translation: (100.0, 0.0, 0.0), hidden: true);
+
+  builder.addFace(
+    [(0.0, 0.0, 0.0), (100.0, 0.0, 0.0), (100.0, 100.0, 0.0), (0.0, 100.0, 0.0)],
+    material: red, layer: roof,
+  );
+
+  builder.save('output.skp');
+}
+```
+
+### Editing an existing file
+
+```dart
+final result = openExisting('building.skp');
+for (final w in result.warnings) print('not fully reproduced: $w');
+
+result.builder.addCircle((0.0, 0.0, 100.0), (0.0, 0.0, 1.0), 50.0);
+result.builder.save('building_edited.skp');
+```
+
+`result.warnings` is the honest account of what couldn't be faithfully
+reproduced from that specific source file. Every material/layer the
+source had is reachable on `result.builder.materialsByName`/
+`layersByName` without a separate lookup, and `result.definitions` maps
+each replayed component definition's own name to its builder for placing
+more instances of something the source already defined.
 
 ---
 

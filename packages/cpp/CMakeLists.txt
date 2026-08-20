@@ -2,8 +2,8 @@ cmake_minimum_required(VERSION 3.21)
 
 project(
   OpenSkp
-  VERSION 1.0.0
-  DESCRIPTION "Open-source SketchUp (.skp) binary file parser - extract geometry, metadata, layers, and materials; export to GLB, OBJ, STL, PLY, DXF, and IFC4"
+  VERSION 1.1.0
+  DESCRIPTION "Open-source SketchUp (.skp) binary file parser, writer, and converter - extract geometry, metadata, layers, and materials; create and edit .skp files; convert to GLB, OBJ, STL, PLY, DXF, and IFC4"
   HOMEPAGE_URL "https://openskp.com"
   LANGUAGES C CXX
 )
@@ -106,8 +106,10 @@ endif()
 set(
   OPENSKP_SOURCES
   src/core.cpp
+  src/create.cpp
   src/dxf_export.cpp
   src/earcut.cpp
+  src/edit.cpp
   src/errors.cpp
   src/geometry.cpp
   src/glb.cpp
