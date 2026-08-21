@@ -133,6 +133,19 @@ class _Archive:
         self.current_loop: Optional[int] = None
         self.in_entity_list = False
         self._as_item = False
+        # Burned store-map indices (see _read_edgeuse): the writer maps an
+        # annotation's connection points into the store map WITHOUT writing
+        # bytes, so file back-references beyond each burn run ahead of the
+        # walker's numbering. Registrations always stay at WALKER indices —
+        # no captured slot ever goes stale — and _backref translates file
+        # references through the burn bands instead. ``burns`` holds
+        # (file_band_start, width) per event; ``cum_delta`` their total;
+        # ``annot_watermark`` the walker slot right after the last
+        # annotation record — the only place a band can start.
+        self.burns: list = []
+        self.cum_delta = 0
+        self.annot_watermark: Optional[int] = None
+        self.burn_stack: list = []    # per-entity-list burned-item credits
 
     def alloc(self, entry) -> int:
         s = self.next_slot
@@ -192,9 +205,31 @@ class _Archive:
         finally:
             self.current_class = prev_class
         self.slots[slot] = ('obj', name, value)
+        if name in ('CDimensionLinear', 'CText'):
+            self.annot_watermark = self.next_slot
         return slot, name, value
 
+    def _translate_ref(self, slot):
+        """Map a FILE store-map index to the walker's numbering through the
+        burn bands. Returns the walker slot, or ``None`` when the reference
+        points INTO a band (a phantom, never-serialized connection point)."""
+        offset = 0
+        for start, width in self.burns:
+            if slot < start:
+                break
+            if slot < start + width:
+                return None
+            offset += width
+        return slot - offset
+
     def _backref(self, slot, r):
+        if self.burns and slot >= self.burns[0][0]:
+            walker = self._translate_ref(slot)
+            if walker is None:
+                # a phantom (burned) connection-point index — annotation
+                # metadata only; nothing was ever serialized for it
+                return slot, 'reserved', None
+            slot = walker
         ent = self.slots.get(slot)
         if ent is None:
             if slot < self.walk_base:
@@ -207,7 +242,22 @@ class _Archive:
         return slot, ent[1], ent[2]
 
 
-def _retry_count_after_v20_filler(r: _R, count_pos: int) -> Optional[int]:
+def _plausible_list_tag(ar, data, at) -> bool:
+    """True when the u16 at ``at`` can legally start an object read: a
+    null, an escape, a class definition, a class-ref to a KNOWN class, or
+    an object back-ref within the allocated range."""
+    if at + 2 > len(data):
+        return False
+    t = struct.unpack_from('<H', data, at)[0]
+    if t in (0x0000, 0x7FFF, 0xFFFF):
+        return True
+    if t & 0x8000:
+        ent = ar.slots.get(t & 0x7FFF)
+        return ent is not None and ent[0] == 'class'
+    return t < ar.next_slot
+
+
+def _retry_count_after_v20_filler(r: _R, count_pos: int, ar=None) -> Optional[int]:
     """SketchUp 2020 (v20) writes an extra, undocumented record ahead of some
     counts that v17 does not have, which leaves the reader a few bytes early
     and makes it read garbage as the count. The filler is an empty UTF-16
@@ -239,17 +289,27 @@ def _retry_count_after_v20_filler(r: _R, count_pos: int) -> Optional[int]:
     if data[marker_at + 3] != 0:          # non-empty string: real data
         return None
 
-    # Skip the zero padding that follows the empty string. The count is
-    # little-endian and non-zero, so the first non-zero byte after the
-    # padding IS its low byte - the run ends exactly on the count.
+    # Skip the zero padding that follows the empty string. The count's
+    # LOW byte is usually the first non-zero byte after the padding — but
+    # a count divisible by 256 (e.g. 4608 entities) has a zero low byte,
+    # which the padding run swallows. Try the first non-zero byte and up
+    # to three positions before it, taking the first candidate that is
+    # plausible AND is followed by a legitimate list tag.
     at = marker_at + 4
     while at < len(data) and data[at] == 0:
         at += 1
-    if at + 4 > len(data):
-        return None
-    count = struct.unpack_from('<I', data, at)[0]
-    r.pos = at + 4
-    return count
+    for back in range(0, 4):
+        at2 = at - back
+        if at2 < marker_at + 4 or at2 + 4 > len(data):
+            continue
+        count = struct.unpack_from('<I', data, at2)[0]
+        if not (0 < count <= 5_000_000):
+            continue
+        if ar is not None and not _plausible_list_tag(ar, data, at2 + 4):
+            continue
+        r.pos = at2 + 4
+        return count
+    return None
 
 
 # ── shared record blocks ─────────────────────────────────────────────────
@@ -288,10 +348,31 @@ def _preamble(ar, r):
 
 
 def _drawbase(ar, r):
-    b = r.raw(10)
+    b = r.raw(8)
+    # The layer field is normally a u16 id, but an entity can carry the
+    # layer BY OBJECT instead (seen on real 2018 instances): a full
+    # inline CLayer record on first use, an escaped back-ref to it on
+    # later siblings. Layer ids never have the 0x8000 bit and never
+    # equal 0x7FFF, so both object forms are unambiguous. (A 2-byte
+    # back-ref would collide with the id space — not seen in any file;
+    # by-object layers have only appeared in >32k-object archives where
+    # refs escape anyway.)
+    lay_cls = ar.class_slot.get('CLayer')
+    tag = r.peek_u16()
+    if lay_cls is not None and tag == (0x8000 | lay_cls):
+        ar.read_object(r, expect='CLayer')
+        layer = 0                    # by-object layer: keep the default id
+    elif tag == 0x7FFF:
+        r.u16()
+        big = r.u32()
+        if big & 0x80000000:
+            raise LegacyParseError(f"drawbase layer: unexpected class {r.ctx()}")
+        layer = 0                    # by-object layer (back-ref)
+    else:
+        layer = r.u16()
     return {'mat': struct.unpack_from('<H', b, 0)[0],
             'hidden': b[2], 'soft': b[5], 'smooth': b[6],
-            'layer': struct.unpack_from('<H', b, 8)[0]}
+            'layer': layer}
 
 
 # ── entity readers ───────────────────────────────────────────────────────
@@ -326,14 +407,57 @@ def _read_arccurve(ar, r):
     return {'k': 'arccurve'}
 
 
+def _register_burn(ar, delta):
+    """Record that the writer burned ``delta`` store-map indices without
+    serializing any bytes for them.
+
+    SketchUp maps an annotation's connection-point objects into the MFC
+    store map (CArchive::MapObject) when a dimension or leader text is
+    attached to geometry — each mapping consumes an index, but nothing is
+    written to the stream, so the file's later back-references run ahead
+    of a byte-exact walk. The band starts right after the last annotation
+    record (in FILE numbering); registrations never move — _backref
+    translates file references through the recorded bands instead, so no
+    slot value captured anywhere can go stale."""
+    ar.burns.append((ar.annot_watermark + ar.cum_delta, delta))
+    ar.cum_delta += delta
+    ar.annot_watermark = None
+    # each burn event corresponds to ONE phantom top-level entity that the
+    # entity list's declared count includes but the stream never carries —
+    # credit it so the list doesn't run past its real end
+    if ar.burn_stack:
+        ar.burn_stack[-1] += 1
+
+
 def _read_edgeuse(ar, r):
     _preamble(ar, r)
     es, _, _ = ar.read_object(r, expect='CEdge')
     sense = r.u8()
-    ps, pn, _ = ar.read_object(r)    # parent-loop back-ref: alignment oracle
-    if ps != ar.current_loop:
-        raise LegacyParseError(
-            f"edge-use parent slot {ps} != current loop {ar.current_loop} {r.ctx()}")
+    # parent-loop back-ref: the alignment oracle. Read as a RAW file index
+    # — after annotations the claimed index can sit AHEAD of the walker's
+    # numbering (burned MapObject indices, see _register_burn), which is a
+    # correction signal, not a mis-parse.
+    p0 = r.pos
+    tag = r.u16()
+    if tag == 0x7FFF:
+        ps = r.u32()
+        if ps & 0x80000000:
+            raise LegacyParseError(f"edge-use parent is a new object {r.ctx()}")
+    elif tag == 0xFFFF or tag & 0x8000:
+        raise LegacyParseError(f"edge-use parent is a new object {r.ctx()}")
+    else:
+        ps = tag if tag else None
+    expected = (ar.current_loop + ar.cum_delta
+                if ar.current_loop is not None else None)
+    if ps != expected:
+        delta = (ps - expected
+                 if isinstance(ps, int) and expected is not None else 0)
+        if 0 < delta <= 4096 and ar.annot_watermark is not None:
+            _register_burn(ar, delta)
+        else:
+            r.pos = p0
+            raise LegacyParseError(
+                f"edge-use parent slot {ps} != current loop {expected} {r.ctx()}")
     return {'k': 'edgeuse', 'edge': es, 'sense': sense}
 
 
@@ -403,13 +527,17 @@ def _read_attr_named(ar, r):
             return r.u32()           # time_t
         if t == 0x0A:
             return r.utf16()
+        if t == 0x0C:
+            return r.f64()           # Length (a double, inches)
         if t == 0x0B:
             n = r.u32()
             if n > 100000:
                 raise LegacyParseError(f"implausible attr array count {r.ctx()}")
             return [read_typed(r.u8()) for _ in range(n)]
+        if t == 0x11:
+            return r.f64s(3)         # 3D point (Geom::Point3d)
         if t == 0x12:
-            return r.f64s(3)         # 3D vector
+            return r.f64s(3)         # 3D vector (Geom::Vector3d)
         raise LegacyParseError(f"unknown attribute value type {t:#x} {r.ctx()}")
 
     entries = {}
@@ -429,12 +557,55 @@ def _read_layer(ar, r):
     while len(mid) < 8 and r.peek(3) != _STR_MARKER:
         mid += r.raw(1)              # flags: 3 bytes on v16, 4 on v17+
     r.utf16()                        # internal name ("Layer_<name>")
-    r.u16()
+    flags = r.u16()
+    if flags & 0x00FF:
+        # Colour-by-layer with a TEXTURED material: instead of the flat
+        # RGBA, the layer embeds the same texture block a CMaterial
+        # carries (SketchUp Pro assigns full materials to layers). Low
+        # byte of the flag word set = textured; a plain colour layer has
+        # 0 there (its high byte carries an unrelated flag, so the word
+        # as a whole is non-zero either way).
+        tex = _texture_block(ar, r)
+        r.raw(4)                     # trailing u32
+        return {'k': 'layer', 'name': name, 'hidden': mid[0] if mid else 0,
+                'rgba': tex['rgba']}
     rgba = r.raw(4)
     r.utf16()
     r.raw(21)
     return {'k': 'layer', 'name': name, 'hidden': mid[0] if mid else 0,
             'rgba': tuple(rgba)}
+
+
+def _texture_block(ar, r):
+    """The textured-material payload: an embedded CDib plus applied size,
+    source file name, average colour, and opacity. Shared verbatim between
+    a CMaterial with a texture and a colour-by-layer CLayer that carries a
+    textured material."""
+    r.raw(2 if ar.ver >= 17 else 1)     # texture flag pad
+    s, n, dib = ar.read_object(r, expect='CDib')
+    if not (isinstance(dib, dict) and dib.get('k') == 'dib'):
+        raise LegacyParseError(f"texture object is not a dib {r.ctx()}")
+    # optional u32 between the dib and the 2 x f64 applied size
+    marker = r.data.find(_STR_MARKER, r.pos, r.pos + 28)
+    if marker - r.pos == 20:
+        r.u32()
+    elif marker - r.pos != 16:
+        raise LegacyParseError(f"texture size block misaligned {r.ctx()}")
+    w = r.f64()
+    h = r.f64()
+    fname = r.utf16()
+    avg = r.raw(9)               # RGBA + 00 + RGBA (colour stored twice)
+    r.utf16()
+    blob = r.raw(8)              # u32 + u32 colorized flag
+    opacity = r.f64()
+    use_op = r.u8()
+    # A colourized (re-tinted) texture stores the ORIGINAL image plus
+    # the tint as the average colour; flagged by the second blob u32
+    # or by alpha 0xFF on the stored colour.
+    colorized = bool(blob[4]) or avg[3] == 0xFF
+    return {'rgba': tuple(avg[:4]), 'opacity': opacity, 'use_opacity': use_op,
+            'tex_dib': s, 'tex_w': w, 'tex_h': h, 'tex_file': fname,
+            'colorized': colorized}
 
 
 def _read_material(ar, r):
@@ -450,31 +621,7 @@ def _read_material(ar, r):
         use_op = r.u8()
         out.update(rgba=tuple(rgba), opacity=opacity, use_opacity=use_op)
     else:
-        r.raw(2 if ar.ver >= 17 else 1)     # texture flag pad
-        s, n, dib = ar.read_object(r, expect='CDib')
-        if not (isinstance(dib, dict) and dib.get('k') == 'dib'):
-            raise LegacyParseError(f"texture object is not a dib {r.ctx()}")
-        # optional u32 between the dib and the 2 x f64 applied size
-        marker = r.data.find(_STR_MARKER, r.pos, r.pos + 28)
-        if marker - r.pos == 20:
-            r.u32()
-        elif marker - r.pos != 16:
-            raise LegacyParseError(f"texture size block misaligned {r.ctx()}")
-        w = r.f64()
-        h = r.f64()
-        fname = r.utf16()
-        avg = r.raw(9)               # RGBA + 00 + RGBA (colour stored twice)
-        r.utf16()
-        blob = r.raw(8)              # u32 + u32 colorized flag
-        opacity = r.f64()
-        use_op = r.u8()
-        # A colourized (re-tinted) texture stores the ORIGINAL image plus
-        # the tint as the average colour; flagged by the second blob u32
-        # or by alpha 0xFF on the stored colour.
-        colorized = bool(blob[4]) or avg[3] == 0xFF
-        out.update(rgba=tuple(avg[:4]), opacity=opacity, use_opacity=use_op,
-                   tex_dib=s, tex_w=w, tex_h=h, tex_file=fname,
-                   colorized=colorized)
+        out.update(_texture_block(ar, r))
     return out
 
 
@@ -520,13 +667,57 @@ def _read_thumbnail(ar, r):
     return {'k': 'thumbnail', 'dib': dib}
 
 
-def _read_relationship(ar, r):
+def _read_image(ar, r):
+    """CImage: an Image entity — instance-shaped: a back-ref to the
+    (already walked) CComponentDefinition holding the image's face and
+    texture, a 3x4 placement, a constant 1.0, the source path string
+    (empty in every sample), and a 16-byte GUID. It appears as a normal
+    entity-list item inside the definition that owns the image (typically
+    a face-me/photo definition), whose own tail the ordinary definition
+    reader then consumes. Calibrated byte-exact on two real files — an
+    80 MB v18 and a 661 MB v17 — both previously rejected outright with
+    "no reader for class CImage"."""
     _preamble(ar, r)
+    db = _drawbase(ar, r)
+    ds, dn, _ = ar.read_object(r)             # the image's definition
+    xform = r.f64s(12)
+    r.f64()                                    # constant 1.0
+    r.utf16()                                  # source path
+    guid = r.raw(16)
+    return {'k': 'image', 'db': db, 'def': ds, 'xform': xform,
+            'guid': guid.hex().upper()}
+
+
+def _read_relationship(ar, r):
     # two object pointers (small maps: two u16 back-refs — which read like
-    # the "u32" of the public notes; big maps escalate them to big-tags)
-    ar.read_object(r)
-    ar.read_object(r)
-    return {'k': 'relationship'}
+    # the "u32" of the public notes; big maps escalate them to big-tags).
+    # They bind an annotation to the entity it labels, and the annotation
+    # side is routinely serialized BEFORE the geometry side — so these can
+    # point forward, past the walk cursor; _entity_ref tolerates that
+    # where read_object's back-ref path (rightly) does not.
+    _preamble(ar, r)
+    a = _entity_ref(ar, r)
+    b = _entity_ref(ar, r)
+    return {'k': 'relationship', 'refs': (a, b)}
+
+
+def _strict_next_tag(ar, data, at, allow_null=True) -> bool:
+    """True when the u16 at ``at`` starts an object read in one of the
+    UNAMBIGUOUS forms: null, escape, class definition, or a class-ref to a
+    class already known. Plain object back-refs are excluded on purpose —
+    any 2-byte junk below 0x8000 would qualify, which is exactly the
+    ambiguity this check exists to avoid."""
+    if at + 2 > len(data):
+        return False
+    t = struct.unpack_from('<H', data, at)[0]
+    if t == 0x0000:
+        return allow_null
+    if t in (0x7FFF, 0xFFFF):
+        return True
+    if t & 0x8000:
+        ent = ar.slots.get(t & 0x7FFF)
+        return ent is not None and ent[0] == 'class'
+    return False
 
 
 def _read_constructionline(ar, r):
@@ -534,8 +725,31 @@ def _read_constructionline(ar, r):
     _drawbase(ar, r)
     r.f64s(3)
     r.f64s(3)
-    r.f64s(2)
-    r.raw(7 if ar.ver >= 17 else 4)
+    r.f64s(2)                        # line params (±~4.4e29 = infinite)
+    # The trailing block varies by the WRITING BUILD, not cleanly by
+    # version: 7 bytes on the v17 calibration corpus, 4 on v16 and on a
+    # real v18, 0 on another real v17. Self-calibrate on the first guide
+    # line of the file — the length that lands on a legitimate next tag
+    # (strict forms only) — and cache it for the rest of the file.
+    k = getattr(ar, '_cline_tail', None)
+    if k is None:
+        default = 7 if ar.ver == 17 else 4
+        order = [default] + [c for c in (0, 4, 7) if c != default]
+        # two passes: a zero tail full of padding can mimic a null tag, so
+        # only accept a null-anchored candidate when no candidate lands on
+        # a STRONG form (escape / known class / class definition)
+        for allow_null in (False, True):
+            for cand in order:
+                if _strict_next_tag(ar, r.data, r.pos + cand,
+                                    allow_null=allow_null):
+                    k = cand
+                    break
+            if k is not None:
+                break
+        if k is None:
+            k = default
+        ar._cline_tail = k
+    r.raw(k)
     return {'k': 'cline'}
 
 
@@ -574,13 +788,45 @@ def _read_skfont(ar, r):
     return {'k': 'font'}
 
 
+def _entity_ref(ar, r):
+    """A reference-to-entity tag: dimension connection points and text
+    leader attachments. Unlike ``read_object``'s back-ref path, this
+    tolerates a slot the walk has not reached yet — SketchUp serializes a
+    label/dimension BEFORE the entity it anchors to when both live in the
+    same entity list, so the reference can legitimately point forward.
+    Returns the slot number, or ``None`` for a null reference."""
+    tag = r.u16()
+    if tag == 0:
+        return None
+    if tag == 0x7FFF:
+        big = r.u32()
+        if big & 0x80000000:
+            raise LegacyParseError(f"entity ref is a new object {r.ctx()}")
+        return big
+    if tag == 0xFFFF or tag & 0x8000:
+        raise LegacyParseError(f"entity ref is a new object {r.ctx()}")
+    return tag
+
+
 def _read_dimlinear(ar, r):
     _preamble(ar, r)
     db = _drawbase(ar, r)
     text = r.utf16()
     ar.read_object(r, expect='CSkFont')
-    r.raw(165)
-    return {'k': 'dimension', 'db': db, 'text': text}
+    # The tail is NOT a fixed 165-byte blob: it embeds two object
+    # references (the dimension's connection points into the geometry).
+    # Each is a normal MFC tag — 2 bytes in small files, but 6 bytes once
+    # the archive holds more than 0x7FFE objects and the 0x7FFF big-tag
+    # escape kicks in — so a fixed-size skip walks off the rails exactly
+    # on large models (found on a real 17 MB SketchUp 2018 file whose
+    # dimension sat past object #517k).
+    r.raw(37)
+    c1 = _entity_ref(ar, r)          # connection point 1 (may be null)
+    r.raw(42)
+    c2 = _entity_ref(ar, r)          # connection point 2 (may be null)
+    r.raw(82)
+    return {'k': 'dimension', 'db': db, 'text': text,
+            'connect': (c1, c2)}
 
 
 def _read_text(ar, r):
@@ -602,23 +848,61 @@ def _read_text(ar, r):
     r.raw(idx - r.pos)
     text = r.utf16()
     r.raw(5)
-    return {'k': 'text', 'text': text, 'db': db}
+    # Optional leader-attachment refs follow the fixed tail (a text label
+    # anchored to geometry stores the anchored entities here; they can
+    # point FORWARD — see _entity_ref). Only the escaped 6-byte form is
+    # recognisable without risk: a 2-byte back-ref here would be
+    # indistinguishable from the next list item's tag, and every known
+    # sample either has no attachments or lives in a >0x7FFE-object file
+    # where the escape is mandatory anyway.
+    attach = []
+    while r.peek(2) == b'\xff\x7f':
+        val = struct.unpack_from('<I', r.data, r.pos + 2)[0]
+        if val & 0x80000000:
+            break                    # new-object tag — the next entity
+        r.raw(6)
+        attach.append(val)
+    return {'k': 'text', 'text': text, 'db': db, 'attach': attach}
 
 
 def _read_entity_list(ar, r, count, owner):
     ents = []
+    ar.burn_stack.append(0)
+    try:
+        return _read_entity_list_inner(ar, r, count, owner, ents)
+    finally:
+        ar.burn_stack.pop()
+
+
+def _read_entity_list_inner(ar, r, count, owner, ents):
     while len(ents) < count:
         p = r.pos
+        if (owner == 'def' and ar.burn_stack and ar.burn_stack[-1]
+                and struct.unpack_from('<I', r.data, p)[0] == 0
+                and r.data[p + 22:p + 25] == _STR_MARKER):
+            # burned MapObject indices (see _register_burn) mean the declared
+            # count includes phantom entities the stream never carries; the
+            # definition tail signature (nrel=0 + pad + 16-byte GUID + name
+            # marker at +22) marks the list's REAL end
+            break
         prev_flag = ar.in_entity_list
         ar.in_entity_list = True
         try:
             s, n, v = ar.read_object(r)
         except LegacyParseError:
-            if owner != 'root':
-                raise
-            # over-declared root counts run into the document tail — stop
-            r.pos = p
-            break
+            if owner == 'root':
+                # over-declared root counts run into the document tail — stop
+                r.pos = p
+                break
+            if owner == 'def' and ar.burn_stack and ar.burn_stack[-1]:
+                # this list had burned MapObject indices (see _register_burn):
+                # the phantom connection points were also counted as items,
+                # so the declared count overshoots the real records. Stop at
+                # the failed item — the definition tail that follows (nrel,
+                # GUID anchor, thumbnail scan) validates the cut.
+                r.pos = p
+                break
+            raise
         finally:
             ar.in_entity_list = prev_flag
         ents.append((s, n, v))
@@ -631,19 +915,34 @@ def _read_definition(ar, r):
     nlayers = r.u32()
     if nlayers > 10000:
         raise LegacyParseError(f"implausible def layer count {r.ctx()}")
-    for _ in range(nlayers):
+    # like the model-level layer list, the count is REAL layers (new records
+    # or back-refs); SketchUp 2020 interleaves null separators between them
+    got = 0
+    while got < nlayers:
+        if r.peek_u16() == 0:
+            r.pos += 2
+            continue
         ar.read_object(r, expect='CLayer')
+        got += 1
     decl = r.u16()
     if decl == 0x7FFF:
         decl = r.u32()
-    r.u32()
-    count = r.u32()
+    # v20 can drop its undocumented filler right here, swallowing the u32
+    # field (and, behind a layer-separator null, even the decl itself): if
+    # the empty-string marker sits in the next few bytes, the real count is
+    # the first non-zero u32 after its padding.
+    count = None
+    if ar.ver >= 20:
+        count = _retry_count_after_v20_filler(r, r.pos, ar)
+    if count is None:
+        r.u32()
+        count = r.u32()
     # A zero count is as much a symptom of the v20 filler as an implausibly
     # large one: the reader lands on the leading zero bytes of the filler
     # instead of the count. A genuinely empty definition reads zero with no
     # filler ahead, and _retry_count_after_v20_filler leaves those alone.
     if count > 5_000_000 or count == 0:
-        retry = _retry_count_after_v20_filler(r, r.pos - 4)
+        retry = _retry_count_after_v20_filler(r, r.pos - 4, ar)
         if retry is not None:
             count = retry
     if count > 5_000_000:
@@ -651,7 +950,7 @@ def _read_definition(ar, r):
     ents = _read_entity_list(ar, r, count, 'def')
     nrel = r.u32()
     if nrel > 100000:
-        retry = _retry_count_after_v20_filler(r, r.pos - 4)
+        retry = _retry_count_after_v20_filler(r, r.pos - 4, ar)
         if retry is not None:
             nrel = retry
     if nrel > 100000:
@@ -729,7 +1028,7 @@ _READERS = {
     'CAttributeContainer': _read_attr_container,
     'CAttributeNamed': _read_attr_named, 'CCamera': _read_camera,
     'CThumbnail': _read_thumbnail, 'CRelationship': _read_relationship,
-    'CComponentDefinition': _read_definition,
+    'CComponentDefinition': _read_definition, 'CImage': _read_image,
     'CComponentInstance': _read_instance, 'CGroup': _read_instance,
     'CFaceTextureCoords': _read_ftc,
     'CConstructionLine': _read_constructionline,
@@ -870,17 +1169,37 @@ def _walk_model(data: bytes, ver: int, start: int, mat_count: int,
     layer_count = r.u32()
     if layer_count > 100000:
         raise LegacyParseError("implausible layer count")
+    # ``layer_count`` counts REAL layers. SketchUp 2020 interleaves a null
+    # object-ref after each layer record (a separator, not a layer), so
+    # counting reads walks off mid-list on files with several layers; count
+    # parsed layers instead, skip the separators, and stop early if the
+    # next tag is a back-ref (the definition-list anchor) — a v20 variant
+    # where the count over-includes separators.
     layers = []
-    for _ in range(layer_count):
+    while len(layers) < layer_count:
+        tag = r.peek_u16()
+        if tag == 0:
+            r.pos += 2
+            continue
+        if tag != 0xFFFF and not (tag & 0x8000):
+            break
         s, _, v = ar.read_object(r, expect='CLayer')
-        # A null object-ref occupies a slot in the list without carrying a
-        # layer record (seen in SketchUp 2020 files, where layer_count
-        # includes it). Keeping it would push a None into the list and blow
-        # up downstream on v['rgba']; read_object has still consumed the
-        # ref from the stream.
         if v is None:
             continue
         layers.append((s, v))
+    # trailing separators (and any layer records past the declared count)
+    lay_cls = ar.class_slot.get('CLayer')
+    while True:
+        tag = r.peek_u16()
+        if tag == 0:
+            r.pos += 2
+            continue
+        if lay_cls is not None and tag == (0x8000 | lay_cls):
+            s, _, v = ar.read_object(r, expect='CLayer')
+            if v is not None:
+                layers.append((s, v))
+            continue
+        break
 
     # definition list: object pointer to the ACTIVE layer, then count
     _, dn, _ = ar.read_object(r)
@@ -888,7 +1207,7 @@ def _walk_model(data: bytes, ver: int, start: int, mat_count: int,
         raise LegacyParseError(f"definition-list anchor is {dn}, not a layer")
     def_count = r.u32()
     if def_count > 1_000_000:
-        retry = _retry_count_after_v20_filler(r, r.pos - 4)
+        retry = _retry_count_after_v20_filler(r, r.pos - 4, ar)
         if retry is not None:
             def_count = retry
     if def_count > 1_000_000:
@@ -911,7 +1230,7 @@ def _walk_model(data: bytes, ver: int, start: int, mat_count: int,
     # root entity list
     root_count = r.u32()
     if root_count > 5_000_000:
-        retry = _retry_count_after_v20_filler(r, r.pos - 4)
+        retry = _retry_count_after_v20_filler(r, r.pos - 4, ar)
         if retry is not None:
             root_count = retry
     if root_count > 5_000_000:
