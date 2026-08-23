@@ -26,9 +26,12 @@ import {
   ParsedRawData,
   buildModelFromParsed,
   buildSceneFromParsed,
+  SceneOptions,
 } from './model';
 import { isLegacy, parseLegacyToRaw } from './legacy';
+import { encodeIndices } from './gltf-indices';
 import { buildInstancedSceneFromParsed, InstancedScene } from './instanced';
+import { extractThumbnail, SkpThumbnail } from './thumbnail';
 
 export * from './model';
 export type {
@@ -38,6 +41,8 @@ export type {
   LocalPrimitive,
 } from './instanced';
 export { toInstancedGLB } from './instanced-glb';
+export { extractThumbnail } from './thumbnail';
+export type { SkpThumbnail } from './thumbnail';
 export type { InstancedGlbOptions } from './instanced-glb';
 export * from './errors';
 export * from './observability';
@@ -348,7 +353,10 @@ export function parseSkp(buffer: ArrayBuffer, options?: ParseOptions): SkpModel 
  *
  * @param options - Optional progress/log callbacks (see {@link ParseOptions})
  */
-export function buildScene(buffer: ArrayBuffer, options?: ParseOptions): SkpScene {
+export function buildScene(
+  buffer: ArrayBuffer,
+  options?: ParseOptions & SceneOptions
+): SkpScene {
   return buildSceneFromParsed(parseToRaw(buffer, options), options);
 }
 
@@ -383,7 +391,7 @@ export function buildScene(buffer: ArrayBuffer, options?: ParseOptions): SkpScen
  */
 export function buildInstancedScene(
   buffer: ArrayBuffer,
-  options?: ParseOptions
+  options?: ParseOptions & SceneOptions
 ): InstancedScene {
   return buildInstancedSceneFromParsed(parseToRaw(buffer, options), options);
 }
@@ -478,12 +486,23 @@ export function toGLB(scene: SkpScene, options?: GlbOptions): Uint8Array {
   // larger, and a caller who only wants geometry should not pay for it.
   const sceneTextures = options?.textures ? scene.textures || [] : [];
 
+  // Narrow each index buffer to UNSIGNED_SHORT where every index fits,
+  // which is the overwhelmingly common case and halves the index data.
+  // Computed up front because the sizes decide the binary layout below.
+  const encodedIndices = prims.map((prim) => encodeIndices(prim.indices));
+
   let totalBinaryLength = 0;
-  for (const prim of prims) {
+  for (let i = 0; i < prims.length; i++) {
+    const prim = prims[i];
     totalBinaryLength += prim.positions.byteLength;
     totalBinaryLength += prim.normals.byteLength;
     totalBinaryLength += prim.uvs.byteLength;
-    totalBinaryLength += prim.indices.byteLength;
+    totalBinaryLength += encodedIndices[i].data.byteLength;
+    // A 16-bit index buffer of odd length leaves the offset 2-byte
+    // aligned; the next primitive's POSITION accessor is float32 and glTF
+    // requires 4-byte alignment, so pad here rather than emitting an
+    // invalid file.
+    totalBinaryLength += (4 - (totalBinaryLength % 4)) % 4;
   }
 
   // images go after the vertex data, each aligned to 4 bytes as glTF requires
@@ -501,7 +520,8 @@ export function toGLB(scene: SkpScene, options?: GlbOptions): Uint8Array {
 
   let byteOffset = 0;
 
-  for (const prim of prims) {
+  for (let primIndex = 0; primIndex < prims.length; primIndex++) {
+    const prim = prims[primIndex];
     const posByteOffset = byteOffset;
     binaryBuffer.set(new Uint8Array(prim.positions.buffer, prim.positions.byteOffset, prim.positions.byteLength), posByteOffset);
     byteOffset += prim.positions.byteLength;
@@ -514,9 +534,14 @@ export function toGLB(scene: SkpScene, options?: GlbOptions): Uint8Array {
     binaryBuffer.set(new Uint8Array(prim.uvs.buffer, prim.uvs.byteOffset, prim.uvs.byteLength), uvByteOffset);
     byteOffset += prim.uvs.byteLength;
 
+    const encoded = encodedIndices[primIndex];
     const indByteOffset = byteOffset;
-    binaryBuffer.set(new Uint8Array(prim.indices.buffer, prim.indices.byteOffset, prim.indices.byteLength), indByteOffset);
-    byteOffset += prim.indices.byteLength;
+    binaryBuffer.set(
+      new Uint8Array(encoded.data.buffer, encoded.data.byteOffset, encoded.data.byteLength),
+      indByteOffset
+    );
+    byteOffset += encoded.data.byteLength;
+    byteOffset += (4 - (byteOffset % 4)) % 4;
 
     const posBufferViewIdx = bufferViews.length;
     bufferViews.push({
@@ -546,7 +571,7 @@ export function toGLB(scene: SkpScene, options?: GlbOptions): Uint8Array {
     bufferViews.push({
       buffer: 0,
       byteOffset: indByteOffset,
-      byteLength: prim.indices.byteLength,
+      byteLength: encoded.data.byteLength,
       target: 34963, // ELEMENT_ARRAY_BUFFER
     });
 
@@ -599,7 +624,7 @@ export function toGLB(scene: SkpScene, options?: GlbOptions): Uint8Array {
     accessors.push({
       bufferView: indBufferViewIdx,
       byteOffset: 0,
-      componentType: 5125, // UNSIGNED_INT
+      componentType: encoded.componentType,
       count: prim.indices.length,
       type: 'SCALAR',
     });
@@ -837,7 +862,7 @@ export class SkpFile {
    * than reusing a prior parse() call, so calling only parse() never pays
    * for this heavier computation.
    * @param options - Optional progress/log callbacks (see {@link ParseOptions}) */
-  buildScene(options?: ParseOptions): SkpScene {
+  buildScene(options?: ParseOptions & SceneOptions): SkpScene {
     return buildScene(this.buffer, options);
   }
 
@@ -845,7 +870,14 @@ export class SkpFile {
    * geometry once, plus one transform per placement. See
    * {@link buildInstancedScene} for when to prefer this over buildScene().
    * @param options - Optional progress/log callbacks (see {@link ParseOptions}) */
-  buildInstancedScene(options?: ParseOptions): InstancedScene {
+  buildInstancedScene(options?: ParseOptions & SceneOptions): InstancedScene {
     return buildInstancedScene(this.buffer, options);
+  }
+
+  /** The preview image SketchUp stored in the file, or null when it has
+   * none. Cheap: reads container metadata only, never geometry.
+   * @param options - Optional progress/log callbacks */
+  thumbnail(options?: ParseOptions): SkpThumbnail | null {
+    return extractThumbnail(this.buffer, options);
   }
 }

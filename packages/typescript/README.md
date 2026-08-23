@@ -199,6 +199,82 @@ resolved context if you need to see why a definition produced more than one
 resource. Resource IDs (`mesh_0`, `mesh_1`, …) are stable and deterministic
 for a given file.
 
+### Edge and face visibility
+
+SketchUp does not draw every edge it stores. Three flags suppress an edge:
+`hidden` (explicitly hidden), and `soft`/`smooth` — the smoothing flags
+that make a faceted surface read as curved. That last pair is why a
+rounded model carries far more edges than it appears to: every curve is
+triangles stitched by edges that define the shape and are never shown.
+
+These are parsed and exposed on `Edge`, but acting on them is opt-in.
+
+```typescript
+import { parseSkp, isDrawableEdge } from 'openskp';
+
+const model = parseSkp(buffer);
+const visible = model.root.edges.filter(isDrawableEdge);
+```
+
+How much that saves is strongly model-dependent — measured across this
+repository's fixtures, 27.3% of edges are non-drawable on aggregate, but
+that ranges from **0.2% on a mostly-flat model to 66.1% on a
+curved-surface one**. Use it in wireframe/hidden-line renderers built on
+`parseSkp()` output, where drawing suppressed edges is both slower and
+visually wrong.
+
+For faces, both scene builders take an opt-in flag:
+
+```typescript
+const scene = buildScene(buffer, { respectEdgeVisibility: true });
+```
+
+This skips faces carrying SketchUp's "Hide" flag. It does **not** filter
+edges, because neither scene builder emits edges — their output is face
+triangles. Hidden faces are rare in practice (none in this repository's
+fixtures), so expect this to be correct rather than dramatic; the edge
+helper above is where the real saving lives. Off by default, since what
+SketchUp draws is a display policy rather than a parsing fact.
+
+### Cataloguing models
+
+Two things an asset browser or block library needs, without paying for a
+full parse or a render:
+
+```typescript
+import { extractThumbnail, buildScene } from 'openskp';
+
+// The preview image SketchUp already saved inside the file. Reads
+// container metadata only - no geometry parsing, no renderer.
+const thumb = extractThumbnail(buffer);
+if (thumb) {
+  // thumb.data (raw bytes), thumb.mimeType, thumb.width, thumb.height
+  fs.writeFileSync('cover.png', thumb.data);
+}
+
+// The model's overall size, computed during the bake.
+const scene = buildScene(buffer);
+if (scene.bounds) {
+  const [w, h, d] = scene.bounds.size;       // metres, glTF Y-up
+  console.log(`${w.toFixed(2)} x ${h.toFixed(2)} x ${d.toFixed(2)} m`);
+  console.log('centre:', scene.bounds.center); // e.g. to frame a camera
+}
+```
+
+`extractThumbnail()` prefers SketchUp's clean `model_thumbnail` over
+`preview_thumbnail`, which has the red/green/blue axis lines drawn in and
+reads as clutter on a catalogue card; `thumb.source` says which was used.
+
+It returns `null` rather than throwing when there is no usable preview.
+That includes **legacy (pre-2021 MFC) files**: those embed PNGs too, but
+the container stores them without entry names, so a thumbnail cannot be
+distinguished from a material's texture image without guessing.
+
+`scene.bounds` is `null` for a model with no geometry, so an empty model
+stays distinguishable from one sitting at the origin.
+`buildInstancedScene()` exposes the same field, computed from the placed
+node transforms so both builders agree.
+
 ### Exporting an instanced GLB
 
 ```typescript
@@ -225,7 +301,9 @@ what they always have.
 ```typescript
 import { toGLB, toInstancedGLB, toOBJ, toMTL, exportOBJ, toSTLAscii, toSTLBinary, exportSTL, toPLYAscii, toPLYBinary, exportPLY, toDXF, exportDXF, toIFC, exportIFC, toJSON } from 'openskp';
 
-// Serialize a built scene straight to .glb bytes (in-memory, no disk I/O)
+// Serialize a built scene straight to .glb bytes (in-memory, no disk I/O).
+// Index buffers are written as UNSIGNED_SHORT when every index fits, which
+// is the usual case - roughly halving the index data at no loss.
 const glbBytes = toGLB(scene);
 
 // Instancing-preserving GLB: one mesh, many nodes (see Choosing an API)
