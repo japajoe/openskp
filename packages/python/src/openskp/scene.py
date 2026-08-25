@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import _core
+from ._face_groups import FaceGroupContext, build_local_face_groups
 from .errors import SkpParseError
 
 logger = logging.getLogger("openskp.scene")
@@ -103,6 +104,23 @@ class GlbPrimitive:
 
 
 @dataclass
+class SceneTexture:
+    """One texture image referenced by :attr:`Scene.gltf_materials`.
+
+    Attributes:
+        data: The image file's raw bytes, exactly as stored in the .skp.
+        mime_type: Sniffed from the bytes, not from ``filename`` -
+            SketchUp records the authoring machine's path, whose
+            extension can disagree with the content.
+        filename: Best-effort original filename, for diagnostics only.
+    """
+
+    data: bytes
+    mime_type: str
+    filename: str = ""
+
+
+@dataclass
 class Scene:
     """The result of baking a parsed file's placed instances into a flat,
     world-space 3D scene."""
@@ -111,79 +129,22 @@ class Scene:
     mesh_index: Dict[str, MeshMetadata] = field(default_factory=dict)
     glb_primitives: List[GlbPrimitive] = field(default_factory=list)
     gltf_materials: List[Dict[str, Any]] = field(default_factory=list)
+    # Distinct texture images the placed materials use, deduplicated by
+    # source bytes. Empty when nothing placed in the scene is textured.
+    # GLB export only embeds these when explicitly asked (export(...,
+    # textures=True)) - most callers just want geometry, and photographic
+    # textures can multiply file size.
+    textures: List[SceneTexture] = field(default_factory=list)
 
 
-def _invert_3x3(m: Tuple[float, ...]) -> Tuple[float, ...]:
-    """Inverse of a row-major 3x3 matrix, via the cofactor/adjugate method."""
-    a, b, c, d, e, f, g, h, i = m
-    det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
-    if abs(det) < 1e-12:
-        return (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
-    inv_det = 1.0 / det
-    return (
-        (e * i - f * h) * inv_det, (c * h - b * i) * inv_det, (b * f - c * e) * inv_det,
-        (f * g - d * i) * inv_det, (a * i - c * g) * inv_det, (c * d - a * f) * inv_det,
-        (d * h - e * g) * inv_det, (b * g - a * h) * inv_det, (a * e - b * d) * inv_det,
-    )
-
-
-def _face_uv_basis(n: Tuple[float, float, float]) -> Tuple[Tuple[float, float, float], Tuple[float, float, float]]:
-    """Face-plane basis vectors (xr, yr) for UV projection, from a face
-    normal. See ``Face.uv_transform`` in model.py for the recipe this
-    implements."""
-    nx, ny, nz = n
-    # xr = normalize(Z x n) = normalize((-ny, nx, 0))
-    cx, cy = -ny, nx
-    clen = (cx * cx + cy * cy) ** 0.5
-    if clen < 1e-9:
-        xr = (1.0, 0.0, 0.0)
-        yr = (0.0, 1.0 if nz >= 0 else -1.0, 0.0)
-    else:
-        xr = (cx / clen, cy / clen, 0.0)
-        # yr = n x xr
-        yr = (
-            ny * xr[2] - nz * xr[1],
-            nz * xr[0] - nx * xr[2],
-            nx * xr[1] - ny * xr[0],
-        )
-    return xr, yr
-
-
-def _compute_face_uv(
-    p: Tuple[float, float, float],
-    xr: Tuple[float, float, float],
-    yr: Tuple[float, float, float],
-    uv_transform: Optional[Tuple[float, ...]],
-    tile_w: float,
-    tile_h: float,
-) -> Tuple[float, float]:
-    """UV of point *p* (inches, local/object space) on a face with the
-    given plane basis, per-face ``uv_transform`` (or ``None`` for the
-    default projection), and material tile size (inches)."""
-    px = p[0] * xr[0] + p[1] * xr[1] + p[2] * xr[2]
-    py = p[0] * yr[0] + p[1] * yr[1] + p[2] * yr[2]
-    if uv_transform is None:
-        return px / tile_w, py / tile_h
-    inv = _invert_3x3(uv_transform)
-    u = px * inv[0] + py * inv[3] + inv[6]
-    v = px * inv[1] + py * inv[4] + inv[7]
-    q = px * inv[2] + py * inv[5] + inv[8]
-    if abs(q) < 1e-12:
-        q = 1.0
-    return (u / q) / tile_w, (v / q) / tile_h
-
-
-def _reconstruct_loop_vertices(loop, edges) -> List[int]:
-    loop_verts: List[int] = []
-    for edge_id, orient in loop:
-        if edge_id in edges:
-            v1, v2 = edges[edge_id]
-            v_start = v1 if orient == 1 else v2
-            if not loop_verts or loop_verts[-1] != v_start:
-                loop_verts.append(v_start)
-    if len(loop_verts) > 1 and loop_verts[0] == loop_verts[-1]:
-        loop_verts = loop_verts[:-1]
-    return loop_verts
+def _sniff_image_mime(data: bytes) -> Optional[str]:
+    """Identify an image's MIME type from its magic bytes. Returns ``None``
+    for anything glTF cannot carry (glTF only allows PNG and JPEG)."""
+    if len(data) >= 3 and data[0] == 0xff and data[1] == 0xd8 and data[2] == 0xff:
+        return "image/jpeg"
+    if len(data) >= 8 and data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    return None
 
 
 def build_scene(parsed: Dict[str, Any]) -> Scene:
@@ -215,7 +176,33 @@ def build_scene(parsed: Dict[str, Any]) -> Scene:
     mesh_index: Dict[str, MeshMetadata] = {}
     glb_primitives: List[GlbPrimitive] = []
 
-    color_to_material_index: Dict[Tuple[Tuple[int, int, int], bool], int] = {}
+    # Textures deduplicated by bytes: the same image routinely backs
+    # several materials, and re-embedding it per material would multiply
+    # the export size for nothing.
+    textures: List[SceneTexture] = []
+    texture_index_by_key: Dict[str, int] = {}
+
+    def texture_index_for(tex: Optional[Dict[str, Any]]) -> Optional[int]:
+        if not tex:
+            return None
+        data = tex.get("data")
+        if not data:
+            return None
+        mime_type = _sniff_image_mime(data)
+        if mime_type is None:
+            return None  # a format glTF cannot carry
+        # length plus a short byte prefix is enough to tell real images
+        # apart without hashing megabytes on every face
+        key = f"{len(data)}:{data[:16].hex()}"
+        hit = texture_index_by_key.get(key)
+        if hit is not None:
+            return hit
+        idx = len(textures)
+        textures.append(SceneTexture(data=data, mime_type=mime_type, filename=tex.get("filename", "")))
+        texture_index_by_key[key] = idx
+        return idx
+
+    color_to_material_index: Dict[Tuple[Tuple[int, int, int], bool, Optional[int]], int] = {}
     gltf_materials: List[Dict[str, Any]] = []
 
     # Definitions currently being instantiated on the active recursion
@@ -228,19 +215,29 @@ def build_scene(parsed: Dict[str, Any]) -> Scene:
     def get_layer_color(name: str) -> Tuple[int, int, int]:
         return layer_colors.get(name, (136, 136, 136))
 
-    def get_material_index(color: Tuple[int, int, int], double_sided: bool) -> int:
-        key = (color, double_sided)
+    def get_material_index(
+        color: Tuple[int, int, int], double_sided: bool, texture_index: Optional[int]
+    ) -> int:
+        # The texture is part of the identity, not just the color: two
+        # different images can average to the same RGB (real files do
+        # this), and keying on color alone would merge them into one
+        # material and lose one of the images.
+        key = (color, double_sided, texture_index)
         if key in color_to_material_index:
             return color_to_material_index[key]
         idx = len(gltf_materials)
         r, g, b = color
-        mat_dict: Dict[str, Any] = {
-            "pbrMetallicRoughness": {
-                "baseColorFactor": [r / 255, g / 255, b / 255, 1.0],
-                "metallicFactor": 0.0,
-                "roughnessFactor": 0.8,
-            }
+        pbr: Dict[str, Any] = {
+            "baseColorFactor": [r / 255, g / 255, b / 255, 1.0],
+            "metallicFactor": 0.0,
+            "roughnessFactor": 0.8,
         }
+        # baseColorFactor stays as the resolved color even with a texture
+        # attached: glTF multiplies the two, and SketchUp's own colorized
+        # materials rely on exactly that tint.
+        if texture_index is not None:
+            pbr["baseColorTexture"] = {"index": texture_index}
+        mat_dict: Dict[str, Any] = {"pbrMetallicRoughness": pbr}
         if double_sided:
             mat_dict["doubleSided"] = True
         gltf_materials.append(mat_dict)
@@ -260,56 +257,31 @@ def build_scene(parsed: Dict[str, Any]) -> Scene:
         builder = d["builder"]
 
         if builder.faces:
-            # Group faces sharing a resolved (color, double_sided) pair into
-            # one mesh each - same grouping the C++ reference uses (the only
-            # port that already had this before this port): a face whose
-            # front/back resolve to the SAME color is emitted once, with its
-            # glTF material marked doubleSided so it's visible from either
-            # side without needing duplicate geometry; a face whose
+            # Group faces sharing a resolved (color, double_sided, texture)
+            # identity into one mesh each, in local space - shared with the
+            # instanced builder (openskp#200) via _face_groups.py: a face
+            # whose front/back resolve to the SAME color is emitted once,
+            # with its glTF material marked doubleSided so it's visible from
+            # either side without needing duplicate geometry; a face whose
             # front/back genuinely differ is emitted as TWO single-sided
             # triangle sets - one normal-wound using the front material, one
             # reverse-wound using the back material - so each side renders
             # its own correct color instead of the front material leaking
             # onto (or the back vanishing from) the far side.
-            face_groups: Dict[Tuple[Tuple[int, int, int], bool], Dict[str, Any]] = {}
+            fallback_color = inherited_color if inherited_color is not None else get_layer_color(parent_layer)
+            face_groups = build_local_face_groups(
+                builder,
+                FaceGroupContext(
+                    material_id_to_name=material_id_to_name,
+                    materials=materials,
+                    materials_by_folder=materials_by_folder,
+                    texture_index_for=texture_index_for,
+                    fallback_color=fallback_color,
+                    definition_id=def_id,
+                ),
+            )
 
-            for f_id, f_data in builder.faces.items():
-                fallback_color = inherited_color if inherited_color is not None else get_layer_color(parent_layer)
-
-                front_mat = _resolve_material(f_data.get("material_id"), material_id_to_name, materials, materials_by_folder)
-                back_mat = _resolve_material(f_data.get("back_material_id"), material_id_to_name, materials, materials_by_folder)
-                front_color = _resolve_color(front_mat) or fallback_color
-                back_color = _resolve_color(back_mat) or fallback_color
-
-                loops = []
-                for loop in f_data["loops"]:
-                    loop_verts = _reconstruct_loop_vertices(loop, builder.edges)
-                    if loop_verts:
-                        loops.append(loop_verts)
-                if not loops:
-                    continue
-
-                try:
-                    triangles = _core.triangulate_face_3d(builder.vertices, loops, f_data["normal"])
-                except Exception as e:
-                    raise SkpParseError(
-                        f"Failed to triangulate face: {e}",
-                        stage="build_scene", definition_id=def_id,
-                    ) from e
-
-                fn = f_data["normal"]
-                xr, yr = _face_uv_basis(fn)
-
-                if front_color == back_color:
-                    _add_face_side(face_groups, builder, triangles, fn, front_color, True, False, front_mat,
-                                   f_data.get("uv_transform"), xr, yr)
-                else:
-                    _add_face_side(face_groups, builder, triangles, fn, front_color, False, False, front_mat,
-                                   f_data.get("uv_transform"), xr, yr)
-                    _add_face_side(face_groups, builder, triangles, fn, back_color, False, True, back_mat,
-                                   f_data.get("uv_transform_back"), xr, yr)
-
-            for (face_color, double_sided), group in face_groups.items():
+            for (face_color, double_sided, tex_index), group in face_groups.items():
                 local_faces = group["local_faces"]
                 if not local_faces:
                     continue
@@ -378,7 +350,7 @@ def build_scene(parsed: Dict[str, Any]) -> Scene:
                     indices[i * 3 + 1] = tri[1]
                     indices[i * 3 + 2] = tri[2]
 
-                material_index = get_material_index(face_color, double_sided)
+                material_index = get_material_index(face_color, double_sided, tex_index)
                 glb_primitives.append(
                     GlbPrimitive(
                         positions=positions,
@@ -498,90 +470,5 @@ def build_scene(parsed: Dict[str, Any]) -> Scene:
         mesh_index=mesh_index,
         glb_primitives=glb_primitives,
         gltf_materials=gltf_materials,
+        textures=textures,
     )
-
-
-def _resolve_material(
-    mat_id: Optional[int],
-    material_id_to_name: Dict[int, str],
-    materials: Dict[str, Any],
-    materials_by_folder: Dict[str, Any],
-) -> Optional[Dict[str, Any]]:
-    if mat_id is None:
-        return None
-    mat_name = material_id_to_name.get(mat_id)
-    return materials.get(mat_name) or materials_by_folder.get(mat_name)
-
-
-def _resolve_color(mat: Optional[Dict[str, Any]]) -> Optional[Tuple[int, int, int]]:
-    if mat is None:
-        return None
-    c = mat["color"]
-    return (c["r"], c["g"], c["b"])
-
-
-def _add_face_side(
-    face_groups: Dict[Tuple[Tuple[int, int, int], bool], Dict[str, Any]],
-    builder: Any,
-    triangles: List[List[int]],
-    fn: Tuple[float, float, float],
-    color: Tuple[int, int, int],
-    double_sided: bool,
-    reverse: bool,
-    mat: Optional[Dict[str, Any]],
-    uv_transform: Optional[Tuple[float, ...]],
-    xr: Tuple[float, float, float],
-    yr: Tuple[float, float, float],
-) -> None:
-    key = (color, double_sided)
-    group = face_groups.get(key)
-    if group is None:
-        group = {
-            "color": color,
-            "double_sided": double_sided,
-            "local_verts": [],
-            "local_uvs": [],
-            "normals_accum": [],
-            "local_faces": [],
-            "local_v_map": {},
-        }
-        face_groups[key] = group
-
-    tex = mat.get("texture") if mat else None
-    tile_w = tex.get("x_scale") if tex else None
-    tile_h = tex.get("y_scale") if tex else None
-    tile_w = tile_w if tile_w and tile_w > 1e-9 else 1.0
-    tile_h = tile_h if tile_h and tile_h > 1e-9 else 1.0
-
-    side_normal = (-fn[0], -fn[1], -fn[2]) if reverse else fn
-
-    face_local_map: Dict[int, int] = {}
-    for tri in triangles:
-        tri_ids = list(tri)
-        if reverse:
-            tri_ids[1], tri_ids[2] = tri_ids[2], tri_ids[1]
-        face_indices = []
-        for v_id in tri_ids:
-            if v_id not in builder.vertices:
-                continue
-            idx = face_local_map.get(v_id)
-            if idx is None:
-                p = builder.vertices[v_id]
-                u, v = _compute_face_uv(p, xr, yr, uv_transform, tile_w, tile_h)
-                vkey = (v_id, u, v)
-                idx = group["local_v_map"].get(vkey)
-                if idx is None:
-                    group["local_verts"].append(p)
-                    group["local_uvs"].append((u, v))
-                    group["normals_accum"].append([side_normal[0], side_normal[1], side_normal[2]])
-                    idx = len(group["local_verts"]) - 1
-                    group["local_v_map"][vkey] = idx
-                else:
-                    accum = group["normals_accum"][idx]
-                    accum[0] += side_normal[0]
-                    accum[1] += side_normal[1]
-                    accum[2] += side_normal[2]
-                face_local_map[v_id] = idx
-            face_indices.append(idx)
-        if len(face_indices) == 3:
-            group["local_faces"].append(face_indices)

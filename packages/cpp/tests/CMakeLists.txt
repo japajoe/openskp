@@ -8,10 +8,14 @@ add_executable(
   face_instance_hidden_test.cpp
   geometry_test.cpp
   glb_test.cpp
+  glb_textures_test.cpp
   ifc_export_test.cpp
+  instanced_glb_test.cpp
+  instanced_scene_test.cpp
   json_export_test.cpp
   layer_hidden_test.cpp
   legacy_single_material_test.cpp
+  legacy_v20_filler_test.cpp
   legacy_v20_test.cpp
   lowlevel_test.cpp
   meta_units_test.cpp

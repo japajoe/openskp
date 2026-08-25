@@ -124,6 +124,16 @@ std::string extract_version(const ByteBuffer&);
 bool valid_header(const ByteBuffer&);
 bool is_legacy(const ByteBuffer&);
 bool legacy_instance_has_guid(const std::string&, std::optional<int>);
+
+/// Result of `find_count_after_v20_filler`: the recovered count and the
+/// offset just past it.
+struct V20FillerHit {
+  std::uint32_t count;
+  std::size_t next;
+};
+
+std::optional<V20FillerHit> find_count_after_v20_filler(const ByteBuffer&, std::size_t,
+                                                        std::uint32_t);
 RawParsed full_parse(const ByteBuffer&, const ParseOptions&);
 RawParsed parse_legacy(const ByteBuffer&, const ParseOptions&);
 void collect_geometry(const std::vector<TlvNode>&, GeometryBuilder&);
@@ -132,6 +142,7 @@ void collect_material_ids(const std::vector<TlvNode>&, std::map<EntityId, std::s
 void collect_definitions(const std::vector<TlvNode>&, std::map<EntityId, RawDefinition>&);
 SkpModel build_model(RawParsed&&, const ParseOptions& = {});
 Scene build_scene_raw(RawParsed&&, const ParseOptions&);
+InstancedScene build_instanced_scene_raw(RawParsed&&, const ParseOptions&);
 std::array<double, 3> transform_point(const std::vector<double>&, const std::array<double, 3>&);
 std::array<double, 3> transform_normal(const std::vector<double>&, const std::array<double, 3>&);
 double transform_determinant(const std::vector<double>&);

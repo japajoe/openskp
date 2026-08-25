@@ -65,6 +65,20 @@ namespace OpenSkp
         public string GeomName { get; set; } = "";
     }
 
+    /// <summary>One texture image referenced by Scene.GltfMaterials.</summary>
+    public sealed class SceneTexture
+    {
+        /// <summary>The image file's raw bytes, exactly as stored in the .skp.</summary>
+        public byte[] Data { get; set; } = Array.Empty<byte>();
+
+        /// <summary>Sniffed from the bytes, not from Filename: SketchUp
+        /// records the authoring machine's path, whose extension can
+        /// disagree with the content.</summary>
+        public string MimeType { get; set; } = "";
+
+        public string Filename { get; set; } = "";
+    }
+
     /// <summary>The result of baking a parsed file's placed instances into
     /// a flat, world-space 3D scene.</summary>
     public sealed class Scene
@@ -73,6 +87,11 @@ namespace OpenSkp
         public Dictionary<string, MeshMetadata> MeshIndex { get; set; } = new Dictionary<string, MeshMetadata>();
         public List<GlbPrimitive> GlbPrimitives { get; set; } = new List<GlbPrimitive>();
         public List<object> GltfMaterials { get; set; } = new List<object>();
+
+        /// <summary>Distinct texture images the placed materials use,
+        /// deduplicated by source bytes. Empty when nothing placed in the
+        /// scene is textured.</summary>
+        public List<SceneTexture> Textures { get; set; } = new List<SceneTexture>();
     }
 
     /// <summary>Bakes every instance actually placed in a parsed model into
@@ -86,91 +105,6 @@ namespace OpenSkp
     {
         private const double InchesToMm = 25.4;
         private const double InchesToM = 0.0254;
-
-        private sealed class FaceGroup
-        {
-            public (int R, int G, int B) Color;
-            public bool DoubleSided;
-            public List<(double X, double Y, double Z)> LocalVerts = new List<(double, double, double)>();
-            public List<(double U, double V)> LocalUvs = new List<(double, double)>();
-            public List<double[]> NormalsAccum = new List<double[]>();
-            public List<long[]> LocalFaces = new List<long[]>();
-            public Dictionary<(long VId, double U, double V), int> LocalVMap = new Dictionary<(long, double, double), int>();
-        }
-
-        /// <summary>Inverse of a row-major 3x3 matrix, via the
-        /// cofactor/adjugate method.</summary>
-        private static double[] InvertMatrix3x3(double[] m)
-        {
-            double a = m[0], b = m[1], c = m[2];
-            double d = m[3], e = m[4], f = m[5];
-            double g = m[6], h = m[7], i = m[8];
-            double det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
-            if (Math.Abs(det) < 1e-12)
-            {
-                return new double[] { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
-            }
-            double invDet = 1.0 / det;
-            return new double[]
-            {
-                (e * i - f * h) * invDet, (c * h - b * i) * invDet, (b * f - c * e) * invDet,
-                (f * g - d * i) * invDet, (a * i - c * g) * invDet, (c * d - a * f) * invDet,
-                (d * h - e * g) * invDet, (b * g - a * h) * invDet, (a * e - b * d) * invDet,
-            };
-        }
-
-        /// <summary>Face-plane basis vectors (xr, yr) for UV projection,
-        /// from a face normal. See Face.UvTransform's docs for the recipe
-        /// this implements.</summary>
-        /// <summary>Internal (not private) so Edit.cs can reuse this same
-        /// read-side UV basis/sampling when replaying a source face's
-        /// stored uv_transform into the 3-point correspondences
-        /// SkpBuilder.AddFace's front_uv/back_uv expects.</summary>
-        internal static ((double X, double Y, double Z) Xr, (double X, double Y, double Z) Yr) FaceUvBasis((double X, double Y, double Z) n)
-        {
-            double cx = -n.Y, cy = n.X;
-            double clen = Math.Sqrt(cx * cx + cy * cy);
-            (double, double, double) xr, yr;
-            if (clen < 1e-9)
-            {
-                xr = (1.0, 0.0, 0.0);
-                yr = (0.0, n.Z >= 0 ? 1.0 : -1.0, 0.0);
-            }
-            else
-            {
-                xr = (cx / clen, cy / clen, 0.0);
-                yr = (
-                    n.Y * xr.Item3 - n.Z * xr.Item2,
-                    n.Z * xr.Item1 - n.X * xr.Item3,
-                    n.X * xr.Item2 - n.Y * xr.Item1
-                );
-            }
-            return (xr, yr);
-        }
-
-        /// <summary>UV of point p (inches, local/object space) on a face
-        /// with the given plane basis, per-face uvTransform (or null for
-        /// the default projection), and material tile size (inches).</summary>
-        internal static (double U, double V) ComputeFaceUv(
-            (double X, double Y, double Z) p,
-            (double X, double Y, double Z) xr,
-            (double X, double Y, double Z) yr,
-            double[]? uvTransform,
-            double tileW, double tileH)
-        {
-            double px = p.X * xr.X + p.Y * xr.Y + p.Z * xr.Z;
-            double py = p.X * yr.X + p.Y * yr.Y + p.Z * yr.Z;
-            if (uvTransform == null)
-            {
-                return (px / tileW, py / tileH);
-            }
-            var inv = InvertMatrix3x3(uvTransform);
-            double u = px * inv[0] + py * inv[3] + inv[6];
-            double v = px * inv[1] + py * inv[4] + inv[7];
-            double q = px * inv[2] + py * inv[5] + inv[8];
-            if (Math.Abs(q) < 1e-12) q = 1.0;
-            return (u / q / tileW, v / q / tileH);
-        }
 
         public static Scene Build(Core.RawParsed parsed, SkpParseOptions? options = null)
         {
@@ -196,7 +130,29 @@ namespace OpenSkp
             // models with tens or hundreds of thousands of placed instances.
             var pathUpdates = new Dictionary<string, (Dictionary<string, string> Props, string Name)>();
 
-            var colorToMaterialIndex = new Dictionary<((int, int, int) Color, bool DoubleSided), int>();
+            // Textures deduplicated by bytes: the same image routinely backs
+            // several materials, and re-embedding it per material would
+            // multiply the export size for nothing.
+            var textures = new List<SceneTexture>();
+            var textureIndexByKey = new Dictionary<string, int>();
+
+            int? TextureIndexFor(Geometry.RawTexture? tex)
+            {
+                if (tex?.Data == null || tex.Data.Length == 0) return null;
+                var mimeType = SniffImageMime(tex.Data);
+                if (mimeType == null) return null; // a format glTF cannot carry
+                // length plus a short byte prefix is enough to tell real
+                // images apart without hashing megabytes on every face
+                var head = BitConverter.ToString(tex.Data, 0, Math.Min(16, tex.Data.Length));
+                var key = $"{tex.Data.Length}:{head}";
+                if (textureIndexByKey.TryGetValue(key, out var hit)) return hit;
+                var idx = textures.Count;
+                textures.Add(new SceneTexture { Data = tex.Data, MimeType = mimeType, Filename = tex.Filename });
+                textureIndexByKey[key] = idx;
+                return idx;
+            }
+
+            var colorToMaterialIndex = new Dictionary<((int, int, int) Color, bool DoubleSided, int? TextureIndex), int>();
             var gltfMaterials = new List<object>();
 
             // Definitions currently being instantiated on the active
@@ -212,20 +168,30 @@ namespace OpenSkp
                 return layerColors.TryGetValue(name, out var c) ? c : (136, 136, 136);
             }
 
-            int GetMaterialIndex((int R, int G, int B) color, bool doubleSided)
+            int GetMaterialIndex((int R, int G, int B) color, bool doubleSided, int? textureIndex)
             {
-                var key = (color, doubleSided);
+                // The texture is part of the identity, not just the color:
+                // two different images can average to the same RGB (real
+                // files do this), and keying on color alone would merge
+                // them into one material and lose one of the images.
+                var key = (color, doubleSided, textureIndex);
                 if (colorToMaterialIndex.TryGetValue(key, out var existing)) return existing;
                 int idx = gltfMaterials.Count;
-                var material = new Dictionary<string, object>
+                var pbr = new Dictionary<string, object>
                 {
-                    ["pbrMetallicRoughness"] = new
-                    {
-                        baseColorFactor = new[] { color.R / 255.0, color.G / 255.0, color.B / 255.0, 1.0 },
-                        metallicFactor = 0.0,
-                        roughnessFactor = 0.8,
-                    },
+                    ["baseColorFactor"] = new[] { color.R / 255.0, color.G / 255.0, color.B / 255.0, 1.0 },
+                    ["metallicFactor"] = 0.0,
+                    ["roughnessFactor"] = 0.8,
                 };
+                // baseColorFactor stays as the resolved color even with a
+                // texture attached: glTF multiplies the two, and
+                // SketchUp's own colorized materials rely on exactly that
+                // tint.
+                if (textureIndex.HasValue)
+                {
+                    pbr["baseColorTexture"] = new Dictionary<string, object> { ["index"] = textureIndex.Value };
+                }
+                var material = new Dictionary<string, object> { ["pbrMetallicRoughness"] = pbr };
                 if (doubleSided) material["doubleSided"] = true;
                 gltfMaterials.Add(material);
                 colorToMaterialIndex[key] = idx;
@@ -270,117 +236,14 @@ namespace OpenSkp
             {
                 if (builder.Faces.Count > 0)
                 {
-                    var faceGroups = new Dictionary<((int R, int G, int B) Color, bool DoubleSided), FaceGroup>();
-
-                    void AddSide(
-                        List<long[]> triangles, (double X, double Y, double Z) fn,
-                        (int R, int G, int B) color, bool doubleSided, bool reverse,
-                        Geometry.RawMaterial? mat, double[]? uvTransform,
-                        (double X, double Y, double Z) xr, (double X, double Y, double Z) yr)
-                    {
-                        var key = (color, doubleSided);
-                        if (!faceGroups.TryGetValue(key, out var group))
-                        {
-                            group = new FaceGroup { Color = color, DoubleSided = doubleSided };
-                            faceGroups[key] = group;
-                        }
-
-                        double? texW = mat?.Texture?.XScale;
-                        double? texH = mat?.Texture?.YScale;
-                        double tileW = (texW.HasValue && texW.Value > 1e-9) ? texW.Value : 1.0;
-                        double tileH = (texH.HasValue && texH.Value > 1e-9) ? texH.Value : 1.0;
-                        (double X, double Y, double Z) sideNormal = reverse ? (-fn.X, -fn.Y, -fn.Z) : fn;
-
-                        // Vertices are deduped per (vId, uv) rather than
-                        // just vId: UVs are inherently per-face, so a
-                        // vertex position shared by two faces that
-                        // disagree on texture mapping must become two
-                        // distinct output vertices (glTF requires
-                        // position/normal/uv aligned per index).
-                        var faceLocalMap = new Dictionary<long, int>();
-                        foreach (var tri in triangles)
-                        {
-                            var triIds = reverse ? new long[] { tri[0], tri[2], tri[1] } : tri;
-                            var faceIndices = new List<int>();
-                            foreach (var vId in triIds)
-                            {
-                                if (!builder.Vertices.ContainsKey(vId)) continue;
-                                if (!faceLocalMap.TryGetValue(vId, out int idx))
-                                {
-                                    var p = builder.Vertices[vId];
-                                    var (u, v) = ComputeFaceUv(p, xr, yr, uvTransform, tileW, tileH);
-                                    var vkey = (vId, u, v);
-                                    if (!group.LocalVMap.TryGetValue(vkey, out idx))
-                                    {
-                                        group.LocalVerts.Add(p);
-                                        group.LocalUvs.Add((u, v));
-                                        group.NormalsAccum.Add(new double[] { sideNormal.X, sideNormal.Y, sideNormal.Z });
-                                        idx = group.LocalVerts.Count - 1;
-                                        group.LocalVMap[vkey] = idx;
-                                    }
-                                    else
-                                    {
-                                        var accum = group.NormalsAccum[idx];
-                                        accum[0] += sideNormal.X; accum[1] += sideNormal.Y; accum[2] += sideNormal.Z;
-                                    }
-                                    faceLocalMap[vId] = idx;
-                                }
-                                faceIndices.Add(idx);
-                            }
-                            if (faceIndices.Count == 3)
-                            {
-                                group.LocalFaces.Add(new long[] { faceIndices[0], faceIndices[1], faceIndices[2] });
-                            }
-                        }
-                    }
-
                     var fallbackColor = inheritedColor ?? GetLayerColor(parentLayer);
-
-                    foreach (var faceKv in builder.Faces)
+                    var faceGroups = FaceGroups.BuildLocalFaceGroups(builder, new FaceGroups.Context
                     {
-                        long fId = faceKv.Key;
-                        var fData = faceKv.Value;
-
-                        var (frontMat, frontMatColor) = ResolveMaterial(fData.MaterialId);
-                        var (backMat, backMatColor) = ResolveMaterial(fData.BackMaterialId);
-                        var frontColor = frontMatColor ?? fallbackColor;
-                        var backColor = backMatColor ?? fallbackColor;
-
-                        var loops = new List<List<long>>();
-                        foreach (var loop in fData.Loops)
-                        {
-                            var loopVerts = ReconstructLoopVertices(loop, builder.Edges);
-                            if (loopVerts.Count > 0) loops.Add(loopVerts);
-                        }
-                        if (loops.Count == 0) continue;
-
-                        List<long[]> triangles;
-                        try
-                        {
-                            triangles = Triangulator.TriangulateFace3D(builder.Vertices, loops, fData.Normal);
-                        }
-                        catch (Exception e) when (!(e is SkpParseException))
-                        {
-                            throw new SkpParseException(
-                                $"Failed to triangulate face: {e.Message}",
-                                stage: "build_scene", definitionId: defId, innerException: e);
-                        }
-                        var fn = fData.Normal;
-                        var (xr, yr) = FaceUvBasis(fn);
-                        var uvTransform = fData.UvTransform;
-                        var uvTransformBack = fData.UvTransformBack;
-
-                        bool sameColor = frontColor.R == backColor.R && frontColor.G == backColor.G && frontColor.B == backColor.B;
-                        if (sameColor)
-                        {
-                            AddSide(triangles, fn, frontColor, true, false, frontMat, uvTransform, xr, yr);
-                        }
-                        else
-                        {
-                            AddSide(triangles, fn, frontColor, false, false, frontMat, uvTransform, xr, yr);
-                            AddSide(triangles, fn, backColor, false, true, backMat, uvTransformBack, xr, yr);
-                        }
-                    }
+                        ResolveMaterial = ResolveMaterial,
+                        TextureIndexFor = TextureIndexFor,
+                        FallbackColor = fallbackColor,
+                        DefinitionId = defId,
+                    });
 
                     bool isRootPath = pathName == "ROOT";
                     bool multiGroup = faceGroups.Count > 1;
@@ -388,6 +251,7 @@ namespace OpenSkp
                     foreach (var groupKv in faceGroups)
                     {
                         var color = groupKv.Key.Color;
+                        var texIndex = groupKv.Key.TextureIndex;
                         var group = groupKv.Value;
                         if (group.LocalFaces.Count == 0) continue;
 
@@ -468,7 +332,7 @@ namespace OpenSkp
                             indices[i * 3 + 2] = (uint)group.LocalFaces[i][2];
                         }
 
-                        int materialIndex = GetMaterialIndex(color, group.DoubleSided);
+                        int materialIndex = GetMaterialIndex(color, group.DoubleSided, texIndex);
                         glbPrimitives.Add(new GlbPrimitive
                         {
                             Positions = positions,
@@ -647,7 +511,26 @@ namespace OpenSkp
                 MeshIndex = meshIndex,
                 GlbPrimitives = glbPrimitives,
                 GltfMaterials = gltfMaterials,
+                Textures = textures,
             };
+        }
+
+        /// <summary>Identifies an image's MIME type from its magic bytes.
+        /// Returns null for anything glTF cannot carry (glTF only allows
+        /// PNG and JPEG).</summary>
+        private static string? SniffImageMime(byte[] data)
+        {
+            if (data.Length >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF)
+            {
+                return "image/jpeg";
+            }
+            if (data.Length >= 8 &&
+                data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47 &&
+                data[4] == 0x0D && data[5] == 0x0A && data[6] == 0x1A && data[7] == 0x0A)
+            {
+                return "image/png";
+            }
+            return null;
         }
 
         /// <summary>Internal (not private) so Edit.cs can reuse this same
