@@ -881,8 +881,11 @@ class LegacyReaders {
   /// carries no attribute container or no dynamic_attributes dictionary.
   static Map<String, String> extractLegacyDynamicProperties(AttrsRec? attrs) {
     if (attrs == null) return {};
-    for (final (name, value) in attrs.children) {
-      if (name == _dynamicAttributesDictName && value is DictRec) {
+    // The tuple's first element is the entity CLASS NAME (always
+    // 'CAttributeNamed', from readObject) - never the dictionary's own
+    // declared name, which lives in DictRec.name.
+    for (final (_, value) in attrs.children) {
+      if (value is DictRec && value.name == _dynamicAttributesDictName) {
         return {
           for (final entry in value.entries.entries)
             entry.key: stringifyAttrValue(entry.value)
@@ -1792,7 +1795,10 @@ class Legacy {
             final ent = slots[es];
             if (ent == null || ent.value == null) continue;
             _addEdge(builder, es, ent.value as EdgeRec, slots);
-            loop.add((es, u.sense != 0 ? 1 : 0));
+            // Normalize to the documented CoEdge contract (+1 = same
+            // direction as the edge, -1 = reversed) - u.sense is the raw
+            // SketchUp bit (0 = forward, 1 = reversed).
+            loop.add((es, u.sense != 0 ? -1 : 1));
           }
           loops.add(loop);
         }

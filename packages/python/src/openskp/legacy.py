@@ -1304,8 +1304,11 @@ def _extract_legacy_dynamic_properties(attrs):
     container or no dynamic_attributes dictionary."""
     if not isinstance(attrs, dict):
         return {}
-    for name, value in attrs.get('children', []):
-        if name == _DYNAMIC_ATTRIBUTES_DICT_NAME and isinstance(value, dict):
+    for _class_name, value in attrs.get('children', []):
+        # _class_name is the entity class name (always 'CAttributeNamed'
+        # here, from ar.read_object) - the dictionary's own declared name
+        # lives inside the value, as value['name'].
+        if isinstance(value, dict) and value.get('name') == _DYNAMIC_ATTRIBUTES_DICT_NAME:
             entries = value.get('entries', {})
             return {k: _stringify_attr_value(v) for k, v in entries.items()}
     return {}
@@ -1344,7 +1347,10 @@ def _fill_builder(builder, ents, slots):
                     if ent is None or ent[2] is None:
                         continue
                     _add_edge(builder, es, ent[2], slots)
-                    loop.append((es, 1 if u['sense'] else 0))
+                    # Normalize to the documented CoEdge contract (+1 = same
+                    # direction as the edge, -1 = reversed) - u['sense'] is
+                    # the raw SketchUp bit (0 = forward, 1 = reversed).
+                    loop.append((es, -1 if u['sense'] else 1))
                 loops.append(loop)
             face = {'loops': loops, 'normal': tuple(v['plane'][:3]),
                     'material_id': v['db']['mat'] or None,

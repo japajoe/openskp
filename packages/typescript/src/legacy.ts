@@ -689,8 +689,11 @@ export function stringifyAttrValue(value: any): string {
  * carries no attribute container or no dynamic_attributes dictionary. */
 export function extractLegacyDynamicProperties(attrs: any): Record<string, string> {
   if (!attrs || typeof attrs !== 'object') return {};
-  for (const [name, value] of attrs.children || []) {
-    if (name === DYNAMIC_ATTRIBUTES_DICT_NAME && value && typeof value === 'object') {
+  // Each child tuple's first element is the entity CLASS NAME (always
+  // 'CAttributeNamed', from ar.readObject) - never the dictionary's own
+  // declared name, which lives in value.name.
+  for (const [, value] of attrs.children || []) {
+    if (value && typeof value === 'object' && value.name === DYNAMIC_ATTRIBUTES_DICT_NAME) {
       const entries = value.entries || {};
       const properties: Record<string, string> = {};
       for (const key of Object.keys(entries)) {
@@ -1598,7 +1601,10 @@ function fillBuilder(builder: LegacyBuilder, ents: [number, string | null, any][
           const ent = slots.get(es);
           if (ent === undefined || ent[2] === null) continue;
           addEdge(builder, es, ent[2], slots);
-          loop.push({ edgeId: es, orientation: u.sense ? 1 : 0 });
+          // Normalize to the documented CoEdge contract (+1 = same
+          // direction as the edge, -1 = reversed) - u.sense is the raw
+          // SketchUp bit (0 = forward, 1 = reversed).
+          loop.push({ edgeId: es, orientation: u.sense ? -1 : 1 });
         }
         loops.push(loop);
       }
@@ -1812,6 +1818,12 @@ export function parseLegacyToRaw(data: Uint8Array, options?: ParseOptions): Pars
     layerColors,
     layerHidden,
     layerIdToName,
+    // Classic (pre-2021) files carry no equivalent VFF entity families -
+    // the legacy CArchive walker never surfaces scenes or model-level
+    // linear dimensions (legacy files still surface text-only dimensions
+    // per definition, via each entity list's own CDimensionLinear reads).
+    pages: [],
+    dimensions: [],
     materialIdToName,
     materialsMap,
     materialsByFolder: new Map(),

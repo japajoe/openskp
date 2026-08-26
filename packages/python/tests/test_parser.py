@@ -1714,6 +1714,33 @@ class TestLegacyStrings:
 # ── Legacy real-file regression (binary fixture) ─────────────────────────
 
 
+def _assert_connected_normalized_loops(definitions) -> None:
+    """Every face loop's coedges must (1) carry a normalized +1/-1
+    orientation (the public contract - see ``Face.loops`` docs) and (2)
+    actually connect head-to-tail: the vertex the coedge ENDS at
+    (accounting for its own orientation) must be where the next coedge in
+    the loop STARTS. A loop that "parses" without this holding describes
+    disconnected or misordered geometry - counting coedges or checking
+    their type alone does not catch a flipped orientation bit, since a
+    face with reversed coedges still has the same edge count and loop
+    length, just the wrong winding."""
+    for d in definitions:
+        for face in d.faces.values():
+            for loop in face.loops:
+                assert loop, "empty loop"
+                n = len(loop)
+                for i in range(n):
+                    edge_id, orientation = loop[i]
+                    next_edge_id, next_orientation = loop[(i + 1) % n]
+                    assert orientation in (1, -1)
+                    edge = d.edges[edge_id]
+                    next_edge = d.edges[next_edge_id]
+                    end = edge.v2_id if orientation == 1 else edge.v1_id
+                    next_start = (next_edge.v1_id if next_orientation == 1
+                                  else next_edge.v2_id)
+                    assert end == next_start
+
+
 class TestLegacyRealFile:
     """Decode a real classic (v17 MFC) ``.skp`` end to end and assert the
     geometry against known ground truth.
@@ -1785,6 +1812,11 @@ class TestLegacyRealFile:
         # its internal "ROOT" sentinel key - it has its own field.
         assert "ROOT" not in model.definitions
         assert all(isinstance(k, int) for k in model.definitions)
+
+    def test_coedge_orientations_are_normalized_and_connected(self) -> None:
+        model = self._model()
+        _assert_connected_normalized_loops(
+            list(model.definitions.values()) + [model.root])
 
 
 class TestModernRealFile:
@@ -1945,6 +1977,11 @@ class TestModernRealFile:
         first_mesh = next(iter(scene.mesh_index.values()))
         assert first_mesh.definition_name == "ROOT_MODEL"
 
+    def test_coedge_orientations_are_normalized_and_connected(self) -> None:
+        model = self._model(self.FIXTURE_UNTITLED).parse()
+        _assert_connected_normalized_loops(
+            list(model.definitions.values()) + [model.root])
+
 
 class TestLegacyDynamicProperties:
     """Legacy (pre-2021 MFC) instances now carry their already-parsed
@@ -1982,11 +2019,15 @@ class TestLegacyDynamicProperties:
 
     def test_extracts_dynamic_attributes_dict_by_name(self) -> None:
         from openskp.legacy import _extract_legacy_dynamic_properties
+        # Real shape from _read_attr_container/_read_attr_named: each
+        # child tuple's first element is the ENTITY CLASS NAME (always
+        # 'CAttributeNamed', from ar.read_object) - never the dictionary's
+        # own declared name, which lives inside the value as value['name'].
         attrs = {
             "k": "attrs",
             "children": [
-                ("SU_DefinitionSet", {"k": "dict", "name": "SU_DefinitionSet", "entries": {"unrelated": 1}}),
-                ("dynamic_attributes", {
+                ("CAttributeNamed", {"k": "dict", "name": "SU_DefinitionSet", "entries": {"unrelated": 1}}),
+                ("CAttributeNamed", {
                     "k": "dict", "name": "dynamic_attributes",
                     "entries": {"width": 10.0, "_width_label": "Width", "count": 4},
                 }),
@@ -1998,7 +2039,7 @@ class TestLegacyDynamicProperties:
     def test_returns_empty_dict_when_no_dynamic_attributes_dict(self) -> None:
         from openskp.legacy import _extract_legacy_dynamic_properties
         attrs = {"k": "attrs", "children": [
-            ("SU_DefinitionSet", {"k": "dict", "name": "SU_DefinitionSet", "entries": {"a": 1}}),
+            ("CAttributeNamed", {"k": "dict", "name": "SU_DefinitionSet", "entries": {"a": 1}}),
         ]}
         assert _extract_legacy_dynamic_properties(attrs) == {}
 
