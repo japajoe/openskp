@@ -113,6 +113,22 @@ auto glb = openskp::to_glb(scene);
 openskp::export_glb(scene, "model.glb");
 ```
 
+**A third, opt-in option: `buildInstancedScene()`.** Where `buildScene()`
+bakes every placement out into its own triangles, `buildInstancedScene()`
+(`build_instanced_scene()` in Python and C++, `BuildInstancedScene()` in
+.NET) keeps the instancing SketchUp already recorded — each distinct
+definition is triangulated once, and every placement becomes a node
+carrying a transform, so output scales with unique geometry plus instance
+transforms rather than definition geometry times placement count. Pair it
+with `toInstancedGLB()` (`to_instanced_glb()` in Python and C++,
+`InstancedGlbExport.ToInstancedGlb()`/`.ExportInstancedGlb()` in .NET,
+`toInstancedGlb()` in Dart) to write a glTF/GLB where many nodes reference
+one mesh instead of duplicating it per placement. It produces exactly the
+same triangles as `buildScene()` — lossless instancing preservation, not
+mesh decimation — and is worth reaching for whenever a file reuses
+definitions across many placements (see the [Unreleased] entry in
+[CHANGELOG.md](../CHANGELOG.md) for size/speed numbers on a repeated-1,000-times case).
+
 ## The data model
 
 All five languages produce structurally equivalent output for the same
@@ -320,11 +336,11 @@ differs is only naming, per each language's own convention:
 |---|---|---|---|---|---|---|---|---|
 | Python | ✅ | ✅ `openskp.export.glb` | ✅ `openskp.export.obj` | ✅ `openskp.export.stl` | ✅ `openskp.export.ply` | ✅ `openskp.export.dxf` | ✅ `openskp.export.ifc` | ✅ `openskp.export.json_export` |
 | TypeScript | ✅ | ✅ `toGLB(scene)` | ✅ `toOBJ(scene)` / `exportOBJ` | ✅ `toSTLAscii` / `exportSTL` | ✅ `toPLYAscii` / `exportPLY` | ✅ `toDXF(scene)` / `exportDXF` | ✅ `toIFC(scene)` / `exportIFC` | ✅ `toJSON(model, scene?)` |
-| .NET | ✅ | ✅ `GlbExport.ExportGlb` | ✅ `ObjExport.ExportObj` | ✅ `StlExport.ExportStl` | ✅ `PlyExport.ExportPly` | ✅ `DxfExport.ToDxf` / `ExportDxf` | ✅ `IfcExport.ToIfc` / `ExportIfc` | ✅ `JsonExport.ExportJson` |
-| Dart | ✅ | ✅ `exportGlb` | ✅ `exportObj` | ✅ `exportStl` | ✅ `exportPly` | ✅ `toDxf` / `exportDxf` | ✅ `toIfc` / `exportIfc` | ✅ `exportJson` |
+| .NET | ✅ | ✅ `GlbExport.ExportGlb` | ✅ `ObjExport.ExportObj` | ✅ `StlExport.ExportStl` | ✅ `PlyExport.ExportPly` | ✅ `DxfExport.ToDxf` / `ExportDxf` | ✅ `IfcExport.ToIfc` / `ExportIfc` | ✅ `JsonExport.ToDict` (in-memory only) |
+| Dart | ✅ | ✅ `exportGlb` | ✅ `exportObj` | ✅ `exportStl` | ✅ `exportPly` | ✅ `toDxf` / `exportDxf` | ✅ `toIfc` / `exportIfc` | ✅ `toJson` (in-memory only) |
 | C++ | ✅ | ✅ `export_glb` | ✅ `export_obj` | ✅ `export_stl` | ✅ `export_ply` | ✅ `to_dxf` / `export_dxf` | ✅ `to_ifc` / `export_ifc` | ✅ `export_json` |
 
-All five languages provide built-in file-writing and in-memory converters for GLB, OBJ, STL, PLY, DXF 3D, IFC4 (BIM), and JSON metadata. Below is the Python conversion example:
+All five languages provide built-in converters for GLB, OBJ, STL, PLY, DXF 3D, IFC4 (BIM), and JSON metadata; file-writing (not just in-memory bytes/objects) is included for every format in every language, with two exceptions: TypeScript's GLB export and TypeScript/.NET/Dart's JSON export are in-memory only (see below for both). Below is the Python conversion example:
 
 ```python
 from openskp import SkpFile
@@ -346,12 +362,12 @@ json_export.export(model, "output.json", scene=scene)  # scene= populates scene_
 Notes on each:
 
 - **`glb.export(skp_file, output_path, ...)`** requires `skp_file.parse()`
-  to have been called first. Internally it calls the older
-  `openskp._core.build_scene(parsed, output_dir, filename_stem)` helper
-  (trimesh-based, writes GLB+JSON straight to disk) — a different function
-  from the public `openskp.scene.build_scene()` this guide otherwise
-  describes, but it is real, working, public API reachable via
-  `openskp.export.glb`.
+  to have been called first. Internally it calls the same public
+  `openskp.scene.build_scene()` this guide describes elsewhere, then hands
+  the resulting primitives to trimesh purely for GLB binary serialization
+  - so every fix made to `scene.build_scene()` reaches real `.glb` output
+  automatically, with no separate scene-baking pipeline to fall out of
+  sync.
 - **`obj.export(scene, output_path)`** takes a built `Scene` (not the raw
   model) and writes one `o` group per `GlbPrimitive` with `v`/`f` records
   only — no materials, normals, or UVs.
@@ -359,6 +375,17 @@ Notes on each:
   definitions/layers/materials from `model` always; `scene_hierarchy` is
   `None` unless a built `Scene` is passed via `scene=`, in which case it's
   the real, resolved, world-space instance tree.
+
+Unlike every other export format, JSON file-writing exists in only two of
+the five languages: Python's `json_export.export(...)` and C++'s
+`export_json(...)` write straight to disk. TypeScript's `toJSON(model, scene?)`,
+.NET's `JsonExport.ToDict(model, scene)`, and Dart's `toJson(model, [scene])`
+all return the in-memory object/dictionary only — there is no
+`exportJSON`/`ExportJson`/`exportJson` file-writing counterpart in those
+three languages. Write the result to disk yourself with each language's
+own JSON encoder, e.g. TypeScript's `fs.writeFileSync(path, JSON.stringify(toJSON(model, scene)))`,
+.NET's `File.WriteAllText(path, JsonSerializer.Serialize(JsonExport.ToDict(model, scene)))`,
+or Dart's `File(path).writeAsStringSync(jsonEncode(toJson(model, scene)))`.
 
 TypeScript's `toGLB(scene)` provides complete, public, in-memory-to-`.glb`
 bytes only (no file-write variant). C++, .NET, and Dart all provide both:
@@ -369,69 +396,18 @@ dependency — .NET added a small internal JSON serializer since
 `netstandard2.0` has none built in; C++'s writer uses a private, pinned
 TinyGLTF dependency that does not appear in installed consumer
 interfaces; Dart's uses `dart:convert`'s built-in JSON support directly.
-None of the five GLB writers include OBJ export except Python (`openskp.export.obj`).
-However, because every language's `buildScene()` returns the same `Scene` shape (`GlbPrimitive[]` with triangulated `positions` and `indices`), generating a Wavefront `.obj` file in any language requires only a short loop over `scene.glbPrimitives`:
-
-```csharp
-// .NET OBJ export snippet
-using var writer = new StreamWriter("output.obj");
-int vertexOffset = 1;
-foreach (var prim in scene.GlbPrimitives) {
-    for (int i = 0; i < prim.Positions.Count; i += 3)
-        writer.WriteLine($"v {prim.Positions[i]} {prim.Positions[i+1]} {prim.Positions[i+2]}");
-    for (int i = 0; i < prim.Indices.Count; i += 3)
-        writer.WriteLine($"f {prim.Indices[i] + vertexOffset} {prim.Indices[i+1] + vertexOffset} {prim.Indices[i+2] + vertexOffset}");
-    vertexOffset += prim.Positions.Count / 3;
-}
-```
-
-```typescript
-// TypeScript OBJ export snippet
-let objText = "";
-let vertexOffset = 1;
-for (const prim of scene.glbPrimitives) {
-  for (let i = 0; i < prim.positions.length; i += 3) {
-    objText += `v ${prim.positions[i]} ${prim.positions[i+1]} ${prim.positions[i+2]}\n`;
-  }
-  for (let i = 0; i < prim.indices.length; i += 3) {
-    objText += `f ${prim.indices[i] + vertexOffset} ${prim.indices[i+1] + vertexOffset} ${prim.indices[i+2] + vertexOffset}\n`;
-  }
-  vertexOffset += prim.positions.length / 3;
-}
-```
-
-```dart
-// Dart OBJ export snippet
-final buffer = StringBuffer();
-var vertexOffset = 1;
-for (final prim in scene.glbPrimitives) {
-  for (var i = 0; i < prim.positions.length; i += 3) {
-    buffer.writeln('v ${prim.positions[i]} ${prim.positions[i + 1]} ${prim.positions[i + 2]}');
-  }
-  for (var i = 0; i < prim.indices.length; i += 3) {
-    buffer.writeln('f ${prim.indices[i] + vertexOffset} ${prim.indices[i + 1] + vertexOffset} ${prim.indices[i + 2] + vertexOffset}');
-  }
-  vertexOffset += prim.positions.length ~/ 3;
-}
-await File('output.obj').writeAsString(buffer.toString());
-```
-
-```cpp
-// C++ OBJ export snippet
-std::ofstream out("output.obj");
-std::uint32_t vertex_offset = 1;
-for (const auto& prim : scene.glb_primitives) {
-    for (std::size_t i = 0; i < prim.positions.size(); i += 3) {
-        out << "v " << prim.positions[i] << " " << prim.positions[i+1] << " " << prim.positions[i+2] << "\n";
-    }
-    for (std::size_t i = 0; i < prim.indices.size(); i += 3) {
-        out << "f " << (prim.indices[i] + vertex_offset) << " "
-            << (prim.indices[i+1] + vertex_offset) << " "
-            << (prim.indices[i+2] + vertex_offset) << "\n";
-    }
-    vertex_offset += static_cast<std::uint32_t>(prim.positions.size() / 3);
-}
-```
+OBJ export is native in all five languages, not just Python — see the
+capability table above (`openskp.export.obj` / `toOBJ`/`exportOBJ` /
+`ObjExport.ExportObj` / `toObj`/`exportObj` / `to_obj`/`export_obj`). Each
+takes a built `Scene` (not the raw model) and writes one `o` group per
+`GlbPrimitive` with `v`/`f` records only — no materials, normals, or UVs,
+matching Python's `obj.export(scene, output_path)` documented above. Since
+every language's `buildScene()` returns the same `Scene` shape
+(`GlbPrimitive[]` with triangulated `positions` and `indices`), a custom
+OBJ variant — say, with per-primitive groups or vertex normals the
+built-in writer omits — is only a short loop over `scene.glbPrimitives`
+away in any language, but the built-in exporters above cover the common
+case without writing that loop yourself.
 
 ## Write capabilities
 
@@ -758,18 +734,29 @@ constexpr double kHalfPi = 1.5707963267948966;  // avoids the M_PI portability w
 
 auto builder = create();
 int red = builder->add_material("Red", Color3{255, 0, 0});
-int roof = builder->add_layer("Roof", {.color = Color4{180, 60, 40, 255}, .hidden = true});
+
+LayerOptions lopts;
+lopts.color = Color4{180, 60, 40, 255};
+lopts.hidden = true;
+int roof = builder->add_layer("Roof", lopts);
+
 DefinitionOptions dopts;
 dopts.attributes = {{"sku", std::string{"CH-100"}}, {"price", 49.99}};
 auto& chair = builder->add_component_definition("Chair", dopts);
 chair.add_face({{0, 0, 0}, {20, 0, 0}, {20, 20, 0}, {0, 20, 0}});
 chair.close();
-builder->add_instance(chair, {
-    .translation = {50, 0, 0},
-    .rotation = Rotation{{0, 0, 1}, kHalfPi},
-    .hidden = true,
-});
-builder->add_face({{0, 0, 0}, {100, 0, 0}, {100, 100, 0}, {0, 100, 0}}, {.material = red, .layer = roof});
+
+InstanceOptions iopts;
+iopts.translation = {50, 0, 0};
+iopts.rotation = Rotation{{0, 0, 1}, kHalfPi};
+iopts.hidden = true;
+builder->add_instance(chair, iopts);
+
+FaceOptions fopts;
+fopts.material = red;
+fopts.layer = roof;
+builder->add_face({{0, 0, 0}, {100, 0, 0}, {100, 100, 0}, {0, 100, 0}}, fopts);
+
 builder->save("output.skp");
 ```
 
@@ -808,14 +795,17 @@ the same reason `openskp.create` only ever writes that format. The
 returned `warnings` list is the honest account of what couldn't be
 faithfully reproduced for that specific file - per-edge flags collapsed
 to a per-face approximation, a projected/distorted texture falling back
-to the default projection, a material's texture scale or colorized tint,
-section planes/text/dimensions (no writer support at all), and an
-original circle/arc's curve grouping (this project's reader doesn't
+to the default projection, a colorized (tinted) material variant losing
+its tint, section planes/text/dimensions (no writer support at all), and
+an original circle/arc's curve grouping (this project's reader doesn't
 preserve it, so it round-trips as a plain straight-edged face) - see
 [`openskp/edit.py`](../packages/python/src/openskp/edit.py)'s own
 module docstring for the complete, itemized list and the reasoning
 behind each one. Round-trip-validated against real, non-writer-authored
 architectural models, not just files this project's own writer produced.
+A material's real-world texture tile size *is* preserved, via an explicit
+`front_uv`/`back_uv` pin computed from it on every replayed textured face
+(not left to the writer's own default projection).
 
 Every material/layer the source had is already reachable on the
 returned `builder` without a separate lookup - `builder.materials_by_name
@@ -836,6 +826,79 @@ definitions must be finalized before any geometry) is already
 satisfied, so `add_material`/`add_layer`/`add_component_definition`/
 `add_group` all raise on this particular builder. Build anything new
 into a separate `create()` call instead.
+
+### Generating code from a file
+
+`openskp.to_python_code()` (and its equivalent in every other language -
+`toTypeScriptCode`, `Codegen.ToCSharpCode`, `toDartCode`, `to_cpp_code`)
+takes the opposite approach from `open_existing()`: instead of returning
+a builder you keep editing programmatically, it returns a **string of
+source code** - a faithful, human-readable, re-runnable transcript of
+`create()`/`SkpBuilder` calls that rebuilds an equivalent file when run:
+
+```python
+from openskp import SkpFile, to_python_code
+
+model = SkpFile.open("building.skp").parse()
+print(to_python_code(model))
+```
+
+```python
+import base64
+import os
+import tempfile
+
+from openskp import create
+
+
+def build():
+    builder = create()
+
+    # --- Materials (1) ---
+    mat0 = builder.add_material('Red', (255, 0, 0, 255))
+
+    # --- Layers (2) ---
+    layer0 = builder.add_layer('Layer0', color=(255, 84, 84), hidden=False)
+    layer1 = builder.add_layer('Roof', color=(200, 60, 60), hidden=False)
+
+    # 'Wheel' - 1 faces, 0 nested instances
+    with builder.add_component_definition('Wheel') as def0:
+        def0.add_face([(0.0, 0.0, 0.0), (10.0, 0.0, 0.0), (10.0, 10.0, 0.0), (0.0, 10.0, 0.0)], material=mat0, auto_triangulate=True)
+
+    # --- Root instances (1) ---
+    builder.add_instance(def0, translation=(50.0, 0.0, 0.0), matrix3x3=(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0), material=mat0, name='')
+
+    return builder.to_bytes()
+```
+
+(`base64`/`tempfile` are always imported, whether or not this particular
+model has a textured material - they're only exercised when one does,
+decoding its embedded image data back out to a temp file for
+`add_texture_material` to read)
+
+This is useful anywhere you want a file's structure as *editable code*
+rather than as an opaque binary - handing a real model to an AI coding
+agent as a starting point it can read and modify, generating a diffable/
+reviewable text representation of a `.skp` file for version control, or
+just understanding how a specific file was built without a SketchUp
+license. It's not an alternative to `open_existing()` for programmatic
+editing - the returned string still needs to be executed to produce a
+file, and every fidelity gap `open_existing()` has (see above) applies
+here too, since both share the same UV/hole/instance-paint reconstruction
+logic. One difference: `to_python_code()`'s output always pins UVs
+explicitly (`front_uv`/`back_uv`) on every textured face, even ones that
+originally used default projection, so the regenerated material's applied
+height never needs to match the source's.
+
+Only reproduces geometry reachable by walking a definition's faces -
+standalone/construction edges and curves that don't bound any face aren't
+reproduced (doesn't affect materials, textures, instance paint, or any
+visible face/surface geometry). See each language's own `codegen` module
+docstring (`packages/python/src/openskp/codegen.py`,
+`packages/typescript/src/codegen.ts`, `packages/dotnet/OpenSkp/Codegen.cs`,
+`packages/dart/lib/src/codegen.dart`, `packages/cpp/src/codegen.cpp`) for
+the exact same itemized gap list `open_existing()` has, since both share
+it.
 
 ## The web viewer
 

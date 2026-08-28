@@ -114,7 +114,15 @@ std::map<const Material*, int> replay_materials(SkpBuilder& builder, const SkpMo
                 static_cast<std::streamsize>(mat.texture->data->size()));
       }
       try {
-        slot = builder.add_texture_material(mat.name, tmp_path);
+        // applied_height: 1.0 - every textured face is now replayed with
+        // an explicit front_uv/back_uv (see replay_uv), whose pins already
+        // bake in the SOURCE's real tile size via compute_face_uv - the
+        // material's own stored applied height must be a no-op divisor
+        // (1.0) or the read-side UV formula divides by it a second time.
+        // This happens to match add_texture_material's own default too,
+        // but is kept explicit here since it's a hard requirement of this
+        // call site specifically, not just a safe default.
+        slot = builder.add_texture_material(mat.name, tmp_path, 1.0);
       } catch (...) {
         std::error_code ec;
         std::filesystem::remove(tmp_path, ec);
@@ -122,9 +130,6 @@ std::map<const Material*, int> replay_materials(SkpBuilder& builder, const SkpMo
       }
       std::error_code ec;
       std::filesystem::remove(tmp_path, ec);
-      if (mat.texture->width != 0.0 || mat.texture->height != 0.0) {
-        warnings.push_back("material '" + mat.name + "': original texture tile size not preserved");
-      }
       if (mat.colorized) {
         warnings.push_back("material '" + mat.name +
                            "': colorized tint not reproduced (base texture only)");
@@ -216,6 +221,38 @@ bool definition_has_content(const Definition& defn,
 // same duck-typing edit.py relies on for its `target` parameter).
 // ---------------------------------------------------------------------------------------------
 
+// front_uv/back_uv need exactly 3 correspondences whose (u, v) values are
+// NOT collinear (an affine fit is impossible otherwise) - real faces can
+// have a "flat" vertex (three consecutive vertices genuinely collinear in
+// 3D), which points[0..2] alone isn't guaranteed to avoid. Search for the
+// first non-collinear triple - an affine map preserves collinearity, so a
+// non-collinear triple in 3D is also non-collinear in (u, v).
+std::optional<std::array<Point3, 3>> non_collinear_triple(const std::vector<Point3>& points) {
+  for (std::size_t i = 0; i < points.size(); ++i) {
+    for (std::size_t j = i + 1; j < points.size(); ++j) {
+      for (std::size_t k = j + 1; k < points.size(); ++k) {
+        const Point3& a = points[i];
+        const Point3& b = points[j];
+        const Point3& c = points[k];
+        Point3 e1{b[0] - a[0], b[1] - a[1], b[2] - a[2]};
+        Point3 e2{c[0] - a[0], c[1] - a[1], c[2] - a[2]};
+        double cx = e1[1] * e2[2] - e1[2] * e2[1];
+        double cy = e1[2] * e2[0] - e1[0] * e2[2];
+        double cz = e1[0] * e2[1] - e1[1] * e2[0];
+        if (cx * cx + cy * cy + cz * cz > 1e-9) return std::array<Point3, 3>{a, b, c};
+      }
+    }
+  }
+  return std::nullopt;
+}
+
+// Explicit front_uv/back_uv for EVERY textured face, not just already-
+// positioned ones - compute_face_uv already computes the correct final UV
+// for the untouched-projection case too (uv_transform is unset) using the
+// source's real tile size, so this reproduces a default-projected face's
+// true rendering exactly without needing the material's own applied
+// width/height to match (which, post-replay, is intentionally 1.0 - see
+// replay_materials).
 std::optional<UvCorrespondence> replay_uv(std::optional<EntityId> material_id,
                                           const std::optional<std::array<double, 9>>& uv_transform,
                                           bool projected, const std::vector<Point3>& points,
@@ -223,28 +260,26 @@ std::optional<UvCorrespondence> replay_uv(std::optional<EntityId> material_id,
                                           const std::map<EntityId, const Material*>& by_id,
                                           std::vector<std::string>& warnings,
                                           const std::string& context, const std::string& side) {
-  if (!uv_transform) return std::nullopt;
+  if (!material_id) return std::nullopt;
+  auto it = by_id.find(*material_id);
+  const Material* mat = it != by_id.end() ? it->second : nullptr;
+  if (!mat || !mat->texture) return std::nullopt;  // solid color - no UV to replay
   if (projected) {
     warnings.push_back(context + ": " + side +
                        " texture is projected/draped - falls back to default projection");
     return std::nullopt;
   }
   if (!normal) return std::nullopt;
-  const Material* mat = nullptr;
-  if (material_id) {
-    auto it = by_id.find(*material_id);
-    if (it != by_id.end()) mat = it->second;
-  }
-  double tile_w = (mat && mat->texture && mat->texture->width != 0.0) ? mat->texture->width : 1.0;
-  double tile_h = (mat && mat->texture && mat->texture->height != 0.0) ? mat->texture->height : 1.0;
+  double tile_w = mat->texture->width != 0.0 ? mat->texture->width : 1.0;
+  double tile_h = mat->texture->height != 0.0 ? mat->texture->height : 1.0;
   Point3 n{(*normal)[0], (*normal)[1], (*normal)[2]};
   auto [xr, yr] = face_uv_basis(n);
-  if (points.size() < 3) return std::nullopt;
+  auto sample = non_collinear_triple(points);
+  if (!sample) return std::nullopt;  // every vertex triple collinear - a sliver face
   UvCorrespondence pairs;
-  for (int i = 0; i < 3; ++i) {
-    auto [u, v] =
-        compute_face_uv(points[static_cast<std::size_t>(i)], xr, yr, uv_transform, tile_w, tile_h);
-    pairs.push_back({points[static_cast<std::size_t>(i)], std::array<double, 2>{u, v}});
+  for (const auto& p : *sample) {
+    auto [u, v] = compute_face_uv(p, xr, yr, uv_transform, tile_w, tile_h);
+    pairs.push_back({p, std::array<double, 2>{u, v}});
   }
   return pairs;
 }
@@ -359,7 +394,15 @@ void replay_instance(Target& target, const Instance& inst,
   }
 
   InstanceOptions options;
-  if (!inst.name.empty()) options.name = inst.name;
+  // options.name = inst.name unconditionally, not `if (!inst.name.empty())
+  // ...` - an explicit empty string is a real, valid instance name
+  // (SketchUp itself stores it that way when a placement was never
+  // renamed, showing the definition's name in the Outliner only as a
+  // UI-level fallback); add_instance's own `options.name.value_or(
+  // definition.name())` fallback only triggers when options.name has NO
+  // value at all, so leaving it unset here for an empty name lets that
+  // name get silently replaced with the definition's own name instead.
+  options.name = inst.name;
   options.translation = translation;
   options.matrix3x3 = matrix3x3;
   options.material = material_slot(inst.material_id, by_id, material_slots);
@@ -431,13 +474,21 @@ OpenExistingResult open_existing(const std::filesystem::path& path) {
     auto it = model.definitions.find(def_id);
     if (it == model.definitions.end()) continue;
     const Definition& defn = it->second;
-    std::string dname = defn.name.empty() ? ("Definition" + std::to_string(def_id)) : defn.name;
-    std::string context = "definition '" + dname + "'";
+    std::string context_name =
+        defn.name.empty() ? ("Definition" + std::to_string(def_id)) : defn.name;
+    std::string context = "definition '" + context_name + "'";
     if (!definition_has_content(defn, def_builders)) {
       result.warnings.push_back(context + ": skipped (no replayable geometry)");
       continue;
     }
-    ComponentDefinitionBuilder& db = builder.add_component_definition(dname);
+    // defn.name unconditionally, not the context_name fallback above - an
+    // explicit empty string is a real, valid definition name. SketchUp
+    // Groups are internally just unnamed component definitions (unlike
+    // Components, which SketchUp auto-names), so an empty name is common
+    // in real files - same reasoning as replay_instance's own name
+    // handling below. context_name stays fallback-safe since it's only
+    // ever used for a human-readable warning message.
+    ComponentDefinitionBuilder& db = builder.add_component_definition(defn.name);
     replay_body(db, defn, by_id, material_slots, layer_slots, result.warnings, context,
                 def_builders);
     db.close();
