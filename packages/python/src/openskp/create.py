@@ -31,11 +31,15 @@ are involved, and how.
   offset, independently per side) instead of the default planar
   projection, on a face of any orientation - see `write_face`'s
   ``front_uv``/``back_uv`` parameters. Component definitions, instances,
-  and faces can also carry custom key/value metadata (``str``/``int``/
-  ``float`` values) - the same mechanism SketchUp's own "dynamic
-  component" attributes use - via each of their ``attributes`` parameters;
-  not yet supported on groups (ground truth shows a group's own
-  attribute pointer is always null, unlike a component instance's).
+  faces, and groups can also carry custom key/value metadata (any of
+  ``str``/``int``/``float``/``bool``/``None``/:class:`Point3d`/
+  :class:`Vector3d`/:class:`Length`/:class:`Timestamp`, or a nestable
+  list of these) - the same mechanism SketchUp's own "dynamic component"
+  attributes use - via each of their ``attributes``/``attribute_dicts``
+  parameters. A group only pays for a real attribute container when it
+  actually has one (ground truth: an un-attributed group's own attribute
+  pointer is null, same as an un-attributed face's), unlike a component
+  instance, which always carries a real (if often empty) one.
   Circular faces and partial (open) arcs - real, editable-by-radius
   SketchUp arc/circle entities, not disconnected straight edges that
   merely trace that shape - are supported via :meth:`SkpBuilder.
@@ -93,6 +97,7 @@ happens at import time, write time, or any other runtime path.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import math
 import re
@@ -100,17 +105,83 @@ import struct
 import time
 import uuid
 from importlib import resources
-from typing import Dict, FrozenSet, List, Optional, Sequence, Tuple
+from typing import Dict, FrozenSet, Iterator, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 from . import legacy
 
-__all__ = ["SkpWriteError", "SkpBuilder", "ComponentDefinitionBuilder", "create"]
+__all__ = [
+    "SkpWriteError", "SkpBuilder", "ComponentDefinitionBuilder", "create",
+    "Point3d", "Vector3d", "Length", "Timestamp",
+]
 
 Point3 = Tuple[float, float, float]
 
 
+class Point3d(NamedTuple):
+    """An attribute value written as SketchUp's ``Geom::Point3d`` type
+    (tag ``0x11``) - a position in inches. Disambiguates from
+    :class:`Vector3d` and from a plain 3-element array (tag ``0x0B``),
+    which share the same on-the-wire shape (3 floats) but a different
+    type tag - see :meth:`_ArchiveWriter.write_attribute_dict`."""
+    x: float
+    y: float
+    z: float
+
+
+class Vector3d(NamedTuple):
+    """An attribute value written as SketchUp's ``Geom::Vector3d`` type
+    (tag ``0x12``) - a direction, not a position. See :class:`Point3d`."""
+    x: float
+    y: float
+    z: float
+
+
+class Length(float):
+    """An attribute value written as SketchUp's ``Length`` type
+    (tag ``0x0C``, a double in inches) instead of a plain double
+    (``0x06``). Behaves exactly like a ``float`` otherwise."""
+    __slots__ = ()
+
+
+class Timestamp(int):
+    """An attribute value written as a ``time_t``-style unsigned 32-bit
+    integer (tag ``0x09``) instead of a plain 32-bit signed int
+    (``0x04``). Behaves exactly like an ``int`` otherwise; must be in
+    ``[0, 2**32)``."""
+    __slots__ = ()
+
+
+#: The full set of value types :meth:`_ArchiveWriter.write_attribute_dict`
+#: accepts, mirroring every type ``legacy._read_attr_named`` decodes.
+AttributeValue = Union[
+    None, bool, int, float, str, Point3d, Vector3d, Length, Timestamp,
+    List["AttributeValue"],
+]
+
+
 class SkpWriteError(Exception):
     """Raised when a ``.skp`` file cannot be constructed."""
+
+
+def _resolve_attribute_dicts(
+    attributes: Optional[Dict[str, object]],
+    attribute_dict_name: str,
+    attribute_dicts: Sequence[Tuple[str, Dict[str, object]]],
+) -> List[Tuple[str, Dict[str, object]]]:
+    """Resolve the two ways to attach custom attribute dictionaries to an
+    entity into a single ordered list: the ``attributes``/
+    ``attribute_dict_name`` shorthand for exactly one dictionary, or
+    ``attribute_dicts`` for several at once (real SketchUp entities
+    routinely carry more than one - e.g. a FrameBuilder-authored instance
+    typically has three). Passing both is an error rather than a silent
+    merge, to keep the resulting ordering unambiguous (openskp#256)."""
+    if attributes and attribute_dicts:
+        raise SkpWriteError(
+            "pass either attributes/attribute_dict_name or attribute_dicts, not both"
+        )
+    if attributes:
+        return [(attribute_dict_name, attributes)]
+    return list(attribute_dicts)
 
 
 _SCAFFOLD_FILE = "blank_v17.skp"
@@ -240,13 +311,19 @@ _ATTR_CONTAINER_SLOT = 3
 # reading back where its class-ref pointed.
 _ATTRIBUTE_NAMED_SLOT = 5
 
-# CAttributeNamed's own value-type tags, ground-truth-and-reader-confirmed
-# (legacy.py's _read_attr_named documents the full set this format
-# supports; only the 3 most commonly useful ones for custom metadata are
-# exposed by this writer for now - see write_attribute_dict).
+# CAttributeNamed's own value-type tags - the full set legacy.py's
+# _read_attr_named already decodes; write_attribute_dict below inverts
+# every one of them.
+_ATTR_TYPE_NULL = 0x00
 _ATTR_TYPE_INT32 = 0x04
 _ATTR_TYPE_DOUBLE = 0x06
+_ATTR_TYPE_BOOL = 0x07
+_ATTR_TYPE_TIME = 0x09       # uint32, time_t
 _ATTR_TYPE_STRING = 0x0A
+_ATTR_TYPE_ARRAY = 0x0B      # u32 count + that many (type-tag, value) pairs
+_ATTR_TYPE_LENGTH = 0x0C     # double, inches
+_ATTR_TYPE_POINT3D = 0x11    # 3 x f64
+_ATTR_TYPE_VECTOR3D = 0x12   # 3 x f64
 
 # The 176 bytes (everything after CCamera's 2-byte class-ref tag) real
 # SketchUp writes for a definition's default thumbnail camera - copied
@@ -718,39 +795,96 @@ class _ArchiveWriter:
     def _validate_attribute_entries(self, entries: Dict[str, object]) -> None:
         """Raise ``SkpWriteError`` for the first unsupported key/value in
         ``entries``, without writing anything - shares
-        `write_attribute_dict`'s own exact validation rules so a caller
-        can check every attribute dict a multi-part write will need
-        BEFORE that write starts mutating ``self.buf`` (and any shared
+        `_write_attr_value`'s own exact type dispatch so a caller can
+        check every attribute dict a multi-part write will need BEFORE
+        that write starts mutating ``self.buf`` (and any shared
         vertex/edge-sharing dicts a caller passes in), see `write_face`'s
         own upfront-validation comment for why that ordering matters.
         """
         for key, value in entries.items():
-            if isinstance(value, str):
-                continue
-            if isinstance(value, bool):
-                raise SkpWriteError(
-                    f"attribute {key!r}: bool is not a supported value type - "
-                    "use an int (0/1) if you need a boolean-like flag"
-                )
-            if isinstance(value, int):
-                if not (-(2**31) <= value < 2**31):
-                    raise SkpWriteError(f"attribute {key!r}: int value {value} out of signed 32-bit range")
-                continue
-            if isinstance(value, float):
-                continue
-            raise SkpWriteError(
-                f"attribute {key!r}: unsupported value type {type(value).__name__} "
-                "(only str, int, and float are supported for now)"
-            )
+            self._check_attribute_value(key, value)
+
+    def _check_attribute_value(self, key: str, value: object) -> None:
+        """Recursively validate one attribute value (array elements are
+        each checked in turn, so a bad value nested inside an array is
+        still caught before any writing starts)."""
+        if value is None or isinstance(value, bool):
+            return
+        if isinstance(value, (Point3d, Vector3d)):
+            if len(value) != 3 or not all(isinstance(c, (int, float)) and not isinstance(c, bool) for c in value):
+                raise SkpWriteError(f"attribute {key!r}: {type(value).__name__} needs exactly 3 numeric components")
+            return
+        if isinstance(value, Timestamp):
+            if not (0 <= int(value) < 2**32):
+                raise SkpWriteError(f"attribute {key!r}: Timestamp value {int(value)} out of unsigned 32-bit range")
+            return
+        if isinstance(value, (Length, str, float)):
+            return
+        if isinstance(value, int):
+            if not (-(2**31) <= value < 2**31):
+                raise SkpWriteError(f"attribute {key!r}: int value {value} out of signed 32-bit range")
+            return
+        if isinstance(value, (list, tuple)):
+            for i, item in enumerate(value):
+                self._check_attribute_value(f"{key}[{i}]", item)
+            return
+        raise SkpWriteError(
+            f"attribute {key!r}: unsupported value type {type(value).__name__} "
+            "(supported: None, bool, int, float, str, Point3d, Vector3d, Length, "
+            "Timestamp, or a list of these)"
+        )
+
+    def _write_attr_value(self, value: object) -> None:
+        """Write one type-tagged attribute value - the recursive core
+        both a top-level entry and each element of an array (tag
+        ``0x0B``) go through, since an array element is itself just
+        another type-tagged value."""
+        if value is None:
+            self.buf.append(_ATTR_TYPE_NULL)
+        elif isinstance(value, bool):
+            self.buf.append(_ATTR_TYPE_BOOL)
+            self.buf.append(1 if value else 0)
+        elif isinstance(value, Point3d):
+            self.buf.append(_ATTR_TYPE_POINT3D)
+            self.buf += b"".join(_f64(float(c)) for c in value)
+        elif isinstance(value, Vector3d):
+            self.buf.append(_ATTR_TYPE_VECTOR3D)
+            self.buf += b"".join(_f64(float(c)) for c in value)
+        elif isinstance(value, Length):
+            self.buf.append(_ATTR_TYPE_LENGTH)
+            self.buf += _f64(float(value))
+        elif isinstance(value, Timestamp):
+            self.buf.append(_ATTR_TYPE_TIME)
+            self.buf += _u32(int(value))
+        elif isinstance(value, str):
+            self.buf.append(_ATTR_TYPE_STRING)
+            self._write_str(value)
+        elif isinstance(value, int):
+            self.buf.append(_ATTR_TYPE_INT32)
+            self.buf += struct.pack("<i", value)
+        elif isinstance(value, float):
+            self.buf.append(_ATTR_TYPE_DOUBLE)
+            self.buf += _f64(value)
+        elif isinstance(value, (list, tuple)):
+            self.buf.append(_ATTR_TYPE_ARRAY)
+            self.buf += _u32(len(value))
+            for item in value:
+                self._write_attr_value(item)
+        else:
+            raise SkpWriteError(f"unsupported attribute value type {type(value).__name__}")
 
     def write_attribute_dict(self, dict_name: str, entries: Dict[str, object]) -> None:
         """Write one ``CAttributeNamed`` record - a named dictionary of
         custom key/value metadata attached to an entity's real attribute
         container (the same mechanism SketchUp's own "dynamic component"
         attributes use). Inverts ``legacy._read_attr_named`` field-for-
-        field; see that function's docstring for the full set of value
-        types this format supports - only ``str``, ``int`` (32-bit
-        signed), and ``float`` are exposed by this writer for now.
+        field, covering every value type that reader decodes: ``None``,
+        ``bool``, ``int`` (32-bit signed), ``float``, ``str``,
+        :class:`Point3d`, :class:`Vector3d`, :class:`Length`,
+        :class:`Timestamp`, and a ``list``/``tuple`` of any of these
+        (nestable, tag ``0x0B``) - see those classes' own docstrings for
+        when to reach for a wrapper type instead of a plain ``int``/
+        ``float``/3-tuple.
 
         Unlike every other class this project declares, ``CAttributeNamed``
         is already pre-declared in the scaffold's own prefix (ground
@@ -767,15 +901,7 @@ class _ArchiveWriter:
         self._write_str(dict_name)
         for key, value in entries.items():
             self._write_str(key)
-            if isinstance(value, str):
-                self.buf.append(_ATTR_TYPE_STRING)
-                self._write_str(value)
-            elif isinstance(value, int):
-                self.buf.append(_ATTR_TYPE_INT32)
-                self.buf += struct.pack("<i", value)
-            else:
-                self.buf.append(_ATTR_TYPE_DOUBLE)
-                self.buf += _f64(value)
+            self._write_attr_value(value)
         self._write_str("")  # empty-key terminator
         self.buf += _u32(0)  # ground truth: read and discarded by legacy.py's reader too
 
@@ -902,7 +1028,8 @@ class _ArchiveWriter:
             raise SkpWriteError("string too long to encode (255 char limit)")
         self.buf += b"\xff\xfe\xff" + struct.pack("<B", n) + encoded
 
-    def write_material(self, name: str, rgba: Tuple[int, int, int, int]) -> int:
+    def write_material(self, name: str, rgba: Tuple[int, int, int, int],
+                       opacity: Optional[float] = None) -> int:
         """Write one solid-color ``CMaterial`` record and return its slot."""
         slot = self._new_of_known_class("CMaterial", schema=_MATERIAL_SCHEMA)
         self._preamble()
@@ -911,13 +1038,16 @@ class _ArchiveWriter:
         self.buf += bytes(rgba)
         self._write_str("")  # texture path (empty - no texture)
         self.buf += bytes(8)  # unknown/padding - ground truth is all-zero here
-        self.buf += _f64(1.0)  # opacity
-        self.buf.append(0)  # use_opacity = False (alpha carries transparency instead)
+        # Stored TRANSPARENCY (0 = opaque); see write_textured_material.
+        self.buf += _f64(1.0 if opacity is None else 1.0 - float(opacity))
+        self.buf.append(0 if opacity is None else 1)  # use_opacity gates it
         return slot
 
     def write_textured_material(
         self, name: str, image_bytes: bytes, texture_path: str, subtype: int,
+        applied_width: Optional[float] = None,
         applied_height: Optional[float] = None,
+        opacity: Optional[float] = None,
     ) -> int:
         """Write one image-textured ``CMaterial`` record (embedding
         ``image_bytes`` verbatim inside a ``CDib`` sub-object) and return
@@ -926,11 +1056,13 @@ class _ArchiveWriter:
         string round-trips fine structurally. ``subtype`` is CDib's image
         format tag (4 for PNG, 1 for JPEG - see :func:`_detect_image_subtype`).
 
-        ``applied_height`` defaults to 1.0, matching applied width (always
-        1.0, unconditionally). Pass a different value for a textured
-        material used with default (unpositioned) projection, to make the
-        texture repeat at a specific real-world size instead of every 1
-        inch - `_face_groups.compute_face_uv`, this project's own
+        ``applied_width``/``applied_height`` both default to 1.0. Pass the
+        material's real-world tile size for a textured material used with
+        default (unpositioned) projection, to make the texture repeat at a
+        specific size instead of every 1 inch (real SketchUp writes the
+        material's own size here - a file authored in SketchUp Web carries
+        8.0 x 16.0 for a brick) - `_face_groups.compute_face_uv`, this
+        project's own
         reverse-engineered read-side formula, divides a face's final UV by
         the material's applied width/height, for a default-projected face
         exactly as much as a `front_uv`/`back_uv`-positioned one. Until
@@ -956,8 +1088,14 @@ class _ArchiveWriter:
             # qualities, same value both times), so not something this
             # project computes from the image; PNG has no such field.
             self.buf += _u32(90)
-        self.buf += _f64(1.0)  # applied width - ground truth default when unscaled
-        self.buf += _f64(applied_height if applied_height is not None else 1.0)
+        # Applied size: how much MODEL SPACE one tile of the image covers, in
+        # inches - two plain f64s, which is what legacy.py's
+        # ``_texture_block`` reads back as ``tex_w``/``tex_h``. For a texture
+        # applied WITHOUT positioning it is the only thing that says how big
+        # the image is - such faces carry no per-face UV record at all, so a
+        # wrong size here is the whole mapping wrong.
+        self.buf += _f64(1.0 if applied_width is None else float(applied_width))
+        self.buf += _f64(1.0 if applied_height is None else float(applied_height))
         self._write_str(texture_path)
         # avg color (RGBA + pad + RGBA repeated, per legacy.py's _read_material
         # comment) - neutral near-opaque white rather than a real image
@@ -974,8 +1112,15 @@ class _ArchiveWriter:
         self.buf += bytes([255, 255, 255, 254, 0, 255, 255, 255, 254])
         self._write_str("")  # second name field - empty in ground truth
         self.buf += struct.pack("<I", 1) + struct.pack("<I", 0)  # blob (colorize-related, ground truth: 1, 0)
-        self.buf += _f64(1.0)  # opacity
-        self.buf.append(0)  # use_opacity = False
+        # Opacity, and the u8 that GATES it. The stored f64 is TRANSPARENCY
+        # (0 = opaque) - legacy.py turns it into the opacity factor
+        # ``Material.transparency`` exposes with ``1.0 - stored``, and only
+        # when the flag is set - so an ``opacity`` argument is written
+        # inverted and round-trips as itself. Hardcoding 1.0/False meant a
+        # translucent material came out solid: a pool's water, 0.6 in the
+        # source, exported as an opaque slab.
+        self.buf += _f64(1.0 if opacity is None else 1.0 - float(opacity))
+        self.buf.append(0 if opacity is None else 1)
         return slot
 
     def write_layer(
@@ -1136,16 +1281,16 @@ class _ArchiveWriter:
         ``attribute_dicts``, if given, is a sequence of ``(dict_name,
         entries)`` pairs - custom key/value metadata attached to this
         instance (the same mechanism SketchUp's own "dynamic component"
-        attributes use). Not available on `write_group` - ground truth
-        shows a group's attribute pointer is always null, unlike a
-        component instance's real (if often empty) container.
+        attributes use). `write_group` supports the same parameter, but
+        conditionally (a container only when actually given) rather than
+        unconditionally like this method - see its own docstring.
 
         ``hidden`` hides the instance itself (SketchUp's "Hide" on this
         specific placement) - the same drawbase bit `write_face` already
         uses for a face, ground truth confirms it means the same thing
         here.
         """
-        # ground truth: instances also carry a real (empty) attr container, unlike CGroup
+        # ground truth: an instance always carries a real (possibly empty) attr container
         self._write_instance_like(
             "CComponentInstance", _INSTANCE_SCHEMA, True,
             definition_slot, name, translation, matrix3x3, instance_material, instance_layer,
@@ -1161,6 +1306,7 @@ class _ArchiveWriter:
         matrix3x3: Optional[Tuple[float, float, float, float, float, float, float, float, float]] = None,
         group_material: int = 0,
         group_layer: int = 0,
+        attribute_dicts: Sequence[Tuple[str, Dict[str, object]]] = (),
         hidden: bool = False,
     ) -> int:
         """Write one ``CGroup`` placing a copy of ``definition_slot`` and
@@ -1170,14 +1316,22 @@ class _ArchiveWriter:
         A group is structurally almost identical to a component instance
         (same preamble/drawbase/def-backref/transform/name/guid shape,
         confirmed via SDK ground truth) - the two real differences are its
-        class name/schema (CGroup, schema 1) and that - unlike
-        CComponentInstance - it uses a plain null attribute pointer rather
-        than the real (empty) CAttributeContainer instances need.
+        class name/schema (CGroup, schema 1) and its attribute pointer:
+        unlike CComponentInstance (which always carries a real, if often
+        empty, ``CAttributeContainer`` regardless of whether attributes
+        are given), a group only gets one when ``attribute_dicts`` is
+        actually given - matching `write_face`'s conditional pattern
+        instead. A real production Group WITH attributes (SketchUp 2020
+        export, ground truth) carries a genuine ``CAttributeContainer`` at
+        this exact schema; a plain, never-attributed Group correctly gets
+        a null pointer either way, so this doesn't change that case at
+        all - only makes attributes on a group possible for the first
+        time (openskp#261).
         """
         self._write_instance_like(
-            "CGroup", _GROUP_SCHEMA, False,
+            "CGroup", _GROUP_SCHEMA, bool(attribute_dicts),
             definition_slot, name, translation, matrix3x3, group_material, group_layer,
-            hidden=hidden,
+            attribute_dicts=attribute_dicts, hidden=hidden,
         )
         return 1
 
@@ -1660,7 +1814,7 @@ class ComponentDefinitionBuilder:
 
     def __init__(
         self, skp: "SkpBuilder", slot: int, name: str, count_patch_pos: int,
-        group_placement: Optional[Tuple[Tuple[float, float, float], Optional[Tuple[float, ...]], int, int, bool]] = None,
+        group_placement: Optional[Tuple[Tuple[float, float, float], Optional[Tuple[float, ...]], int, int, Sequence[Tuple[str, Dict[str, object]]], bool]] = None,
     ):
         self._skp = skp
         self.slot = slot
@@ -1696,6 +1850,7 @@ class ComponentDefinitionBuilder:
         back_uv: Optional[Sequence[Tuple[Point3, Tuple[float, float]]]] = None,
         attributes: Optional[Dict[str, object]] = None,
         attribute_dict_name: str = "attributes",
+        attribute_dicts: Sequence[Tuple[str, Dict[str, object]]] = (),
         auto_triangulate: bool = False,
         holes: Sequence[Sequence[Point3]] = (),
     ) -> None:
@@ -1711,12 +1866,12 @@ class ComponentDefinitionBuilder:
         if len(points) < 3:
             raise SkpWriteError("a face needs at least 3 points")
         holes = [[(float(p[0]), float(p[1]), float(p[2])) for p in hole] for hole in holes]
-        attribute_dicts = [(attribute_dict_name, attributes)] if attributes else []
+        resolved_attribute_dicts = _resolve_attribute_dicts(attributes, attribute_dict_name, attribute_dicts)
         self._new_entity_count += _write_face_or_triangulate(
             self._skp._definition_writer, points, self._vertex_slots, self._edge_registry,
             material or 0, layer or 0, back_material or 0,
             hidden, soft_edges, smooth_edges, hidden_edges,
-            front_uv, back_uv, attribute_dicts, auto_triangulate,
+            front_uv, back_uv, resolved_attribute_dicts, auto_triangulate,
             holes=holes,
         )
 
@@ -1734,6 +1889,7 @@ class ComponentDefinitionBuilder:
         back_uv: Optional[Sequence[Tuple[Point3, Tuple[float, float]]]] = None,
         attributes: Optional[Dict[str, object]] = None,
         attribute_dict_name: str = "attributes",
+        attribute_dicts: Sequence[Tuple[str, Dict[str, object]]] = (),
     ) -> None:
         """Add one circular face to this definition - same signature and
         behavior as :meth:`SkpBuilder.add_circle`, except vertices/edges
@@ -1752,12 +1908,12 @@ class ComponentDefinitionBuilder:
         xaxis = (radius * u[0], radius * u[1], radius * u[2])
         curve_params = (center, normal, xaxis, 0.0, 2.0 * math.pi, radius, num_segments)
         points = _circle_points(center, normal, radius, num_segments, u, w)
-        attribute_dicts = [(attribute_dict_name, attributes)] if attributes else []
+        resolved_attribute_dicts = _resolve_attribute_dicts(attributes, attribute_dict_name, attribute_dicts)
         self._new_entity_count += writer.write_face(
             points, self._vertex_slots, self._edge_registry,
             material or 0, layer or 0, back_material or 0,
             hidden, False, False, False,
-            front_uv, back_uv, attribute_dicts,
+            front_uv, back_uv, resolved_attribute_dicts,
             curve_params=curve_params,
         )
 
@@ -1825,6 +1981,7 @@ class ComponentDefinitionBuilder:
         layer: Optional[int] = None,
         attributes: Optional[Dict[str, object]] = None,
         attribute_dict_name: str = "attributes",
+        attribute_dicts: Sequence[Tuple[str, Dict[str, object]]] = (),
         hidden: bool = False,
     ) -> None:
         """Place one instance of another, already-closed component
@@ -1867,13 +2024,13 @@ class ComponentDefinitionBuilder:
         if definition is self:
             raise SkpWriteError(f"component definition {self.name!r} cannot nest an instance of itself")
         matrix3x3 = _resolve_matrix3x3(matrix3x3, rotation)
-        attribute_dicts = [(attribute_dict_name, attributes)] if attributes else []
+        resolved_attribute_dicts = _resolve_attribute_dicts(attributes, attribute_dict_name, attribute_dicts)
         # See SkpBuilder.add_instance's own comment on `name if name is not
         # None else ...` vs `name or ...` - an explicit empty string must
         # round-trip as empty, not silently become the definition's name.
         self._new_entity_count += self._skp._definition_writer.write_instance(
             definition.slot, name if name is not None else definition.name, translation, matrix3x3,
-            material or 0, layer or 0, attribute_dicts, hidden,
+            material or 0, layer or 0, resolved_attribute_dicts, hidden,
         )
 
     def add_group_instance(
@@ -1885,6 +2042,9 @@ class ComponentDefinitionBuilder:
         rotation: Optional[Tuple[Tuple[float, float, float], float]] = None,
         material: Optional[int] = None,
         layer: Optional[int] = None,
+        attributes: Optional[Dict[str, object]] = None,
+        attribute_dict_name: str = "attributes",
+        attribute_dicts: Sequence[Tuple[str, Dict[str, object]]] = (),
         hidden: bool = False,
     ) -> None:
         """Place another, already-closed component definition inside this
@@ -1911,6 +2071,11 @@ class ComponentDefinitionBuilder:
         alternative to hand-deriving ``matrix3x3`` for the common case of
         a pure rotation; pass at most one of the two. ``hidden`` hides
         this specific placement.
+
+        ``attributes``/``attribute_dict_name``/``attribute_dicts`` are the
+        same as `add_instance` - real production groups (SketchUp 2021+)
+        routinely carry them; a group with none given still writes the
+        same null attribute pointer as before (openskp#261).
         """
         self._check_writable("groups")
         self._skp._check_material_handle(material, "material")
@@ -1923,8 +2088,10 @@ class ComponentDefinitionBuilder:
         if definition is self:
             raise SkpWriteError(f"component definition {self.name!r} cannot nest a group instance of itself")
         matrix3x3 = _resolve_matrix3x3(matrix3x3, rotation)
+        resolved_attribute_dicts = _resolve_attribute_dicts(attributes, attribute_dict_name, attribute_dicts)
         self._new_entity_count += self._skp._definition_writer.write_group(
-            definition.slot, name or definition.name, translation, matrix3x3, material or 0, layer or 0, hidden,
+            definition.slot, name or definition.name, translation, matrix3x3, material or 0, layer or 0,
+            attribute_dicts=resolved_attribute_dicts, hidden=hidden,
         )
 
     def __enter__(self) -> "ComponentDefinitionBuilder":
@@ -2048,7 +2215,47 @@ class SkpBuilder:
         self._face_count = 0
         self._dim_font_slot: Optional[int] = None
 
-    def add_material(self, name: str, rgba: Sequence[int]) -> int:
+    @contextlib.contextmanager
+    def definitions(self) -> Iterator["SkpBuilder"]:
+        """Context manager marking this builder's "definitions phase" -
+        purely organizational, a place to visibly group every
+        `add_material`/`add_texture_material`/`add_layer`/
+        `add_component_definition` call together (openskp#257). It does
+        not itself relax or add to the underlying rule that all of those
+        must happen before the first `add_face`/`add_instance` call -
+        see `instances()`, which is the half that actually enforces
+        anything, for why a plain call to any of those methods (with or
+        without wrapping them in this block) already raises
+        `SkpWriteError` immediately if the ordering is wrong.
+
+        >>> with builder.definitions():
+        ...     chair = builder.add_component_definition("Chair")
+        ...     with chair:
+        ...         chair.add_face([(0, 0, 0), (20, 0, 0), (20, 20, 0), (0, 20, 0)])
+        >>> with builder.instances():
+        ...     builder.add_instance(chair)
+        """
+        yield self
+
+    @contextlib.contextmanager
+    def instances(self) -> Iterator["SkpBuilder"]:
+        """Context manager marking the start of this builder's "instance
+        phase" (openskp#257) - see `definitions()`'s own docstring for
+        the pair's full intent. Entering this block immediately locks in
+        this builder's geometry-section slot numbering, the same
+        irreversible step the first `add_face`/`add_instance` call would
+        trigger anyway - so a `add_material`/`add_layer`/
+        `add_component_definition` call misplaced inside (or after) this
+        block raises `SkpWriteError` right there, at the top of the
+        block, instead of only whenever the first real geometry call
+        happens to occur deep inside a long build. Safe to enter more
+        than once (a second `with builder.instances():` is a no-op, same
+        as calling `add_face` again already is)."""
+        self._ensure_geometry_writer()
+        yield self
+
+    def add_material(self, name: str, rgba: Sequence[int],
+                     opacity: Optional[float] = None) -> int:
         """Register a solid-color material and return a handle to pass as
         `add_face`'s ``material`` argument. ``rgba`` is ``(r, g, b)`` or
         ``(r, g, b, a)``, each 0-255; alpha defaults to 255 (opaque).
@@ -2075,30 +2282,34 @@ class SkpBuilder:
             rgba = (*rgba, 255)
         if len(rgba) != 4 or not all(isinstance(c, int) and 0 <= c <= 255 for c in rgba):
             raise SkpWriteError("rgba must be 3 or 4 integers in 0-255")
-        slot = self._material_writer.write_material(name, tuple(rgba))
+        slot = self._material_writer.write_material(name, tuple(rgba), opacity=opacity)
         self.materials_by_name[name] = slot
         self._material_count += 1
         return slot
 
     def add_texture_material(
-        self, name: str, image_path: str, applied_height: Optional[float] = None,
+        self, name: str, image_path: str,
+        applied_width: Optional[float] = None,
+        applied_height: Optional[float] = None,
+        opacity: Optional[float] = None,
     ) -> int:
         """Register an image-textured material from a local PNG or JPEG
         file and return a handle to pass as `add_face`'s ``material``
         argument.
+
+        ``applied_width``/``applied_height``, if given, are the applied
+        size in INCHES - how much model space one tile of the image
+        covers. Both default to 1.0. A texture applied without positioning
+        carries no per-face UV record, so this size IS its mapping - and
+        see `write_textured_material`'s own docstring for why it matters
+        even for `add_face`'s ``front_uv``/``back_uv`` pinning (a
+        positioned mapping still divides by it).
 
         The format is detected from the file's own magic bytes, not its
         extension - PNG and JPEG are the only two this project has
         confirmed the on-disk ``CDib`` subtype tag for via SDK ground
         truth (4 and 1 respectively; see :meth:`_ArchiveWriter.
         write_textured_material`).
-
-        ``applied_height`` defaults to 1.0 (matching applied width, always
-        1.0). Pass a different value to make a default-projected face's
-        texture repeat at a specific real-world size instead of every 1
-        inch - see `write_textured_material`'s own docstring for why this
-        field matters even for `add_face`'s ``front_uv``/``back_uv``
-        pinning (a positioned mapping still divides by it).
 
         Same ordering rules as `add_material` - must be called before any
         `add_layer`, `add_component_definition`, or `add_face` call.
@@ -2115,7 +2326,9 @@ class SkpBuilder:
             image_bytes = f.read()
         subtype = _detect_image_subtype(image_bytes)
         slot = self._material_writer.write_textured_material(
-            name, image_bytes, image_path, subtype=subtype, applied_height=applied_height,
+            name, image_bytes, image_path, subtype=subtype,
+            applied_width=applied_width, applied_height=applied_height,
+            opacity=opacity,
         )
         self.materials_by_name[name] = slot
         self._material_count += 1
@@ -2228,11 +2441,15 @@ class SkpBuilder:
 
     def _start_definition(
         self, name: str, caller: str,
-        group_placement: Optional[Tuple[Tuple[float, float, float], Optional[Tuple[float, ...]], int, int, bool]] = None,
+        group_placement: Optional[Tuple[Tuple[float, float, float], Optional[Tuple[float, ...]], int, int, Sequence[Tuple[str, Dict[str, object]]], bool]] = None,
         attribute_dicts: Sequence[Tuple[str, Dict[str, object]]] = (),
     ) -> "ComponentDefinitionBuilder":
         if self._geometry_writer is not None:
-            raise SkpWriteError(f"{caller} must be called before any add_face/add_instance calls")
+            raise SkpWriteError(
+                f"{caller} must be called before any add_face/add_instance calls "
+                f"({self._face_count} already written). Collect all definitions first, "
+                "then place instances - see SkpBuilder.definitions()/instances()."
+            )
         if self._open_definition is not None:
             raise SkpWriteError(
                 f"component definition {self._open_definition.name!r} is still open - "
@@ -2255,6 +2472,7 @@ class SkpBuilder:
         self, name: str,
         attributes: Optional[Dict[str, object]] = None,
         attribute_dict_name: str = "attributes",
+        attribute_dicts: Sequence[Tuple[str, Dict[str, object]]] = (),
     ) -> "ComponentDefinitionBuilder":
         """Start a new reusable component definition. Use the returned
         object as a context manager, adding its geometry via `.add_face`
@@ -2270,13 +2488,16 @@ class SkpBuilder:
         and layers, before root-level geometry, so their slot numbering
         depends on the final material and layer counts.
 
-        ``attributes``, if given, is custom key/value metadata (values
-        may be ``str``, ``int``, or ``float``) attached to the definition
-        itself, under a dictionary named ``attribute_dict_name`` - the
-        same mechanism SketchUp's own "dynamic component" attributes use.
+        ``attributes``, if given, is custom key/value metadata attached
+        to the definition itself, under a dictionary named
+        ``attribute_dict_name`` - the same mechanism SketchUp's own
+        "dynamic component" attributes use. Pass ``attribute_dicts``
+        instead (a sequence of ``(dict_name, entries)`` pairs) to attach
+        several dictionaries at once - real SketchUp entities routinely
+        carry more than one. Passing both raises.
         """
-        attribute_dicts = [(attribute_dict_name, attributes)] if attributes else []
-        return self._start_definition(name, "add_component_definition", attribute_dicts=attribute_dicts)
+        resolved_attribute_dicts = _resolve_attribute_dicts(attributes, attribute_dict_name, attribute_dicts)
+        return self._start_definition(name, "add_component_definition", attribute_dicts=resolved_attribute_dicts)
 
     def add_group(
         self,
@@ -2286,6 +2507,9 @@ class SkpBuilder:
         rotation: Optional[Tuple[Tuple[float, float, float], float]] = None,
         material: Optional[int] = None,
         layer: Optional[int] = None,
+        attributes: Optional[Dict[str, object]] = None,
+        attribute_dict_name: str = "attributes",
+        attribute_dicts: Sequence[Tuple[str, Dict[str, object]]] = (),
         hidden: bool = False,
     ) -> "ComponentDefinitionBuilder":
         """Start a new group. Use the returned object as a context manager,
@@ -2306,13 +2530,19 @@ class SkpBuilder:
         alternative to hand-deriving ``matrix3x3`` for the common case of
         a pure rotation; pass at most one of the two. ``hidden`` hides
         this group once placed.
+
+        ``attributes``/``attribute_dict_name``/``attribute_dicts`` are the
+        same as `add_instance` - real production groups (SketchUp 2021+)
+        routinely carry them; a group with none given still writes the
+        same null attribute pointer as before (openskp#261).
         """
         self._check_material_handle(material, "material")
         self._check_layer_handle(layer)
         matrix3x3 = _resolve_matrix3x3(matrix3x3, rotation)
+        resolved_attribute_dicts = _resolve_attribute_dicts(attributes, attribute_dict_name, attribute_dicts)
         return self._start_definition(
             name or "Group", "add_group",
-            group_placement=(translation, matrix3x3, material or 0, layer or 0, hidden),
+            group_placement=(translation, matrix3x3, material or 0, layer or 0, resolved_attribute_dicts, hidden),
         )
 
     def _definition_shift(self) -> int:
@@ -2336,6 +2566,7 @@ class SkpBuilder:
         layer: Optional[int] = None,
         attributes: Optional[Dict[str, object]] = None,
         attribute_dict_name: str = "attributes",
+        attribute_dicts: Sequence[Tuple[str, Dict[str, object]]] = (),
         hidden: bool = False,
     ) -> None:
         """Place one instance of ``definition`` (from
@@ -2379,7 +2610,7 @@ class SkpBuilder:
             )
         matrix3x3 = _resolve_matrix3x3(matrix3x3, rotation)
         self._ensure_geometry_writer()
-        attribute_dicts = [(attribute_dict_name, attributes)] if attributes else []
+        resolved_attribute_dicts = _resolve_attribute_dicts(attributes, attribute_dict_name, attribute_dicts)
         # `name if name is not None else definition.name`, not `name or
         # definition.name` - an explicit empty string is a real, valid
         # instance name (SketchUp itself stores it that way when a
@@ -2392,7 +2623,7 @@ class SkpBuilder:
         # an empty stored name.
         self._new_entity_count += self._geometry_writer.write_instance(
             definition.slot, name if name is not None else definition.name, translation, matrix3x3,
-            material or 0, layer or 0, attribute_dicts, hidden,
+            material or 0, layer or 0, resolved_attribute_dicts, hidden,
         )
         self._face_count += 1  # reuses the "at least one root entity" check in to_bytes
 
@@ -2502,9 +2733,10 @@ class SkpBuilder:
         # created - deferred until now so closing one group doesn't lock in
         # root-level slot numbering before a later add_group/
         # add_component_definition call has had a chance to run.
-        for comp, (translation, matrix3x3, mat, layer, hidden) in self._pending_groups:
+        for comp, (translation, matrix3x3, mat, layer, attribute_dicts, hidden) in self._pending_groups:
             self._new_entity_count += self._geometry_writer.write_group(
-                comp.slot, comp.name, translation, matrix3x3, mat, layer, hidden,
+                comp.slot, comp.name, translation, matrix3x3, mat, layer,
+                attribute_dicts=attribute_dicts, hidden=hidden,
             )
             self._face_count += 1
         self._pending_groups = []
@@ -2523,6 +2755,7 @@ class SkpBuilder:
         back_uv: Optional[Sequence[Tuple[Point3, Tuple[float, float]]]] = None,
         attributes: Optional[Dict[str, object]] = None,
         attribute_dict_name: str = "attributes",
+        attribute_dicts: Sequence[Tuple[str, Dict[str, object]]] = (),
         auto_triangulate: bool = False,
         holes: Sequence[Sequence[Point3]] = (),
     ) -> None:
@@ -2601,12 +2834,12 @@ class SkpBuilder:
             raise SkpWriteError("a face needs at least 3 points")
         holes = [[(float(p[0]), float(p[1]), float(p[2])) for p in hole] for hole in holes]
         self._ensure_geometry_writer()
-        attribute_dicts = [(attribute_dict_name, attributes)] if attributes else []
+        resolved_attribute_dicts = _resolve_attribute_dicts(attributes, attribute_dict_name, attribute_dicts)
         self._new_entity_count += _write_face_or_triangulate(
             self._geometry_writer, points, self._vertex_slots, self._edge_registry,
             material or 0, layer or 0, back_material or 0,
             hidden, soft_edges, smooth_edges, hidden_edges,
-            front_uv, back_uv, attribute_dicts, auto_triangulate,
+            front_uv, back_uv, resolved_attribute_dicts, auto_triangulate,
             holes=holes,
         )
         self._face_count += 1
@@ -2625,6 +2858,7 @@ class SkpBuilder:
         back_uv: Optional[Sequence[Tuple[Point3, Tuple[float, float]]]] = None,
         attributes: Optional[Dict[str, object]] = None,
         attribute_dict_name: str = "attributes",
+        attribute_dicts: Sequence[Tuple[str, Dict[str, object]]] = (),
     ) -> None:
         """Add one circular face - a true SketchUp circle (editable by
         radius, re-tessellatable, selectable as a single "Curve" entity),
@@ -2656,12 +2890,12 @@ class SkpBuilder:
         xaxis = (radius * u[0], radius * u[1], radius * u[2])
         curve_params = (center, normal, xaxis, 0.0, 2.0 * math.pi, radius, num_segments)
         points = _circle_points(center, normal, radius, num_segments, u, w)
-        attribute_dicts = [(attribute_dict_name, attributes)] if attributes else []
+        resolved_attribute_dicts = _resolve_attribute_dicts(attributes, attribute_dict_name, attribute_dicts)
         self._new_entity_count += self._geometry_writer.write_face(
             points, self._vertex_slots, self._edge_registry,
             material or 0, layer or 0, back_material or 0,
             hidden, False, False, False,
-            front_uv, back_uv, attribute_dicts,
+            front_uv, back_uv, resolved_attribute_dicts,
             curve_params=curve_params,
         )
         self._face_count += 1

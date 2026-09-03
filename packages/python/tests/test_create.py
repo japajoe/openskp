@@ -21,7 +21,9 @@ import struct
 
 import pytest
 
-from openskp.create import SkpBuilder, SkpWriteError, create
+from openskp.create import (
+    Length, Point3d, SkpBuilder, SkpWriteError, Timestamp, Vector3d, create,
+)
 from openskp import legacy
 from openskp import SkpFile
 
@@ -698,6 +700,87 @@ class TestGroups:
         ar, root, layers, materials = legacy._walk(data)
         assert root[0][2]["name"] == "Group"
 
+    # openskp#261: a group WITH attributes carries a real, non-null
+    # CAttributeContainer at the same schema (1) - verified against a
+    # real SketchUp 2020-legacy-format export of an attributed group
+    # (see CHECKLIST.md). A group with none given still writes a null
+    # pointer, same as before (test_basic_group_places_itself_on_close
+    # above already covers that unchanged case).
+
+    def test_group_with_attribute_dicts_carries_real_container(self):
+        builder = create()
+        with builder.add_group("W-1", attribute_dicts=[
+            ("fbd-einfo", {"depth": 15.5, "code": "Ks"}),
+        ]) as grp:
+            grp.add_face(SQUARE)
+        data = builder.to_bytes()
+        ar, root, layers, materials = legacy._walk(data)
+        assert root[0][2]["attrs"] == {
+            "k": "attrs", "children": [
+                ("CAttributeNamed", {
+                    "k": "dict", "name": "fbd-einfo",
+                    "entries": {"depth": 15.5, "code": "Ks"},
+                }),
+            ],
+        }
+
+    def test_group_with_attributes_shorthand(self):
+        builder = create()
+        with builder.add_group("W-1", attributes={"a": 1}) as grp:
+            grp.add_face(SQUARE)
+        data = builder.to_bytes()
+        ar, root, layers, materials = legacy._walk(data)
+        assert root[0][2]["attrs"]["children"][0][1]["name"] == "attributes"
+        assert root[0][2]["attrs"]["children"][0][1]["entries"] == {"a": 1}
+
+    def test_group_attributes_and_attribute_dicts_together_raises(self):
+        builder = create()
+        with pytest.raises(SkpWriteError, match="not both"):
+            with builder.add_group("W-1", attributes={"a": 1}, attribute_dicts=[("b", {"c": 2})]):
+                pass
+
+    def test_group_multiple_attribute_dicts(self):
+        builder = create()
+        with builder.add_group("W-1", attribute_dicts=[
+            ("fbd-einfo", {"depth": 15.5}),
+            ("fbd-profile", {"guide": 1}),
+        ]) as grp:
+            grp.add_face(SQUARE)
+        data = builder.to_bytes()
+        ar, root, layers, materials = legacy._walk(data)
+        names = [v["name"] for _, v in root[0][2]["attrs"]["children"]]
+        assert names == ["fbd-einfo", "fbd-profile"]
+
+    def test_group_instance_attribute_dicts(self):
+        # The nested (definition-scoped) placement path - add_group_instance,
+        # not the root-level self-placing add_group.
+        builder = create()
+        with builder.add_component_definition("Part") as part:
+            part.add_face(SQUARE)
+        with builder.add_component_definition("Assembly") as assembly:
+            assembly.add_group_instance(part, name="Nested", attribute_dicts=[("fbd-profile", {"guide": 1})])
+        builder.add_instance(assembly)
+        data = builder.to_bytes()
+        # Nested content lives inside the definition, not exposed by
+        # legacy._walk's root-only view - byte-level presence check,
+        # matching test_face_attributes_in_component_definition's own
+        # established pattern for this case.
+        assert "fbd-profile".encode("utf-16-le") in data
+        assert "guide".encode("utf-16-le") in data
+
+    def test_group_attribute_dictionaries_round_trip_through_public_reader(self, tmp_path):
+        builder = create()
+        with builder.add_group("W-1", attribute_dicts=[
+            ("fbd-einfo", {"depth": 15.5, "code": "Ks"}),
+        ]) as grp:
+            grp.add_face(SQUARE)
+        out = tmp_path / "group_attrs.skp"
+        builder.save(str(out))
+
+        model = SkpFile.open(str(out)).parse()
+        inst = model.root.instances[0]
+        assert inst.attribute_dictionaries == {"fbd-einfo": {"depth": 15.5, "code": "Ks"}}
+
     def test_many_definitions_instances_and_groups_self_parse(self):
         # Definitions/instances/groups haven't been stress-tested at scale
         # the way materials/layers already are elsewhere in this file -
@@ -1061,6 +1144,93 @@ class TestPreExistingOrderingGap:
             builder.add_instance(wheel)
 
 
+class TestDefinitionsInstancesPhaseApi:
+    # openskp#257: an explicit with builder.definitions()/instances()
+    # phase API, documenting the definitions-before-instances ordering
+    # rule and catching a misplaced call at the point it's made.
+
+    def test_happy_path_round_trips(self):
+        builder = create()
+        with builder.definitions():
+            with builder.add_component_definition("Chair") as chair:
+                chair.add_face(SQUARE)
+        with builder.instances():
+            builder.add_instance(chair)
+        data = builder.to_bytes()
+        ar, root, layers, materials = legacy._walk(data)
+        assert root[0][1] == "CComponentInstance"
+
+    def test_definitions_block_is_a_pure_marker_no_new_restriction(self):
+        # definitions() itself adds no new checks - the SAME material/
+        # layer/definition calls that work unwrapped still work inside
+        # it, in any order relative to each other.
+        builder = create()
+        with builder.definitions():
+            red = builder.add_material("Red", (255, 0, 0))
+            layer = builder.add_layer("L")
+            with builder.add_component_definition("Chair") as chair:
+                chair.add_face(SQUARE, material=red, layer=layer)
+        builder.add_instance(chair)
+        assert builder.to_bytes()
+
+    def test_add_component_definition_inside_instances_raises_immediately(self):
+        # The exact scenario openskp#257 asks for: the error arrives
+        # right when the definition is opened inside the instance phase,
+        # not only whenever the first real geometry call happens to
+        # occur - here that's immediately on entering instances(), since
+        # no add_face/add_instance was ever called before it.
+        builder = create()
+        with pytest.raises(SkpWriteError, match="before any add_face/add_instance"):
+            with builder.instances():
+                builder.add_component_definition("TooLate")
+
+    def test_add_material_inside_instances_raises_immediately(self):
+        builder = create()
+        with pytest.raises(SkpWriteError, match="before any add_face calls"):
+            with builder.instances():
+                builder.add_material("TooLate", (0, 0, 0))
+
+    def test_add_layer_inside_instances_raises_immediately(self):
+        builder = create()
+        with pytest.raises(SkpWriteError, match="before any add_face calls"):
+            with builder.instances():
+                builder.add_layer("TooLate")
+
+    def test_instances_entered_twice_is_a_no_op(self):
+        builder = create()
+        with builder.add_component_definition("Chair") as chair:
+            chair.add_face(SQUARE)
+        with builder.instances():
+            with builder.instances():
+                builder.add_instance(chair)
+        assert builder.to_bytes()
+
+    def test_error_message_reports_entities_already_written(self):
+        builder = create()
+        builder.add_face(SQUARE)
+        builder.add_face(SQUARE)
+        with pytest.raises(SkpWriteError, match=r"\(2 already written\)"):
+            builder.add_component_definition("TooLate")
+
+    def test_two_definitions_blocks_compose_like_two_independent_modules(self):
+        # The issue's "composing two independent modules" case: two
+        # separate definitions() blocks (standing in for e.g. walls.emit()
+        # and roof.emit() each declaring their own definitions) both
+        # still work, since definitions() is a pure marker with no
+        # exclusive-entry restriction of its own.
+        builder = create()
+        with builder.definitions():
+            with builder.add_component_definition("Wall") as wall:
+                wall.add_face(SQUARE)
+        with builder.definitions():
+            with builder.add_component_definition("Roof") as roof:
+                roof.add_face(SQUARE)
+        with builder.instances():
+            builder.add_instance(wall)
+            builder.add_instance(roof)
+        assert builder.to_bytes()
+
+
 class TestMaterials:
     def test_material_assigned_to_face_front(self):
         builder = create()
@@ -1176,10 +1346,9 @@ class TestTextures:
         # applied_height wrote a corrupted internal sentinel byte pattern
         # (~1.29e-231) instead of a real number - confirmed via real
         # SketchUp screenshots to render as a streaky, vertically-smeared
-        # texture. add_texture_material's applied WIDTH is unconditionally
-        # 1.0 (a deliberate ground-truth value); height should match it by
-        # default now, not silently corrupt every caller who doesn't know
-        # to pass applied_height=1.0 explicitly.
+        # texture. add_texture_material's applied width and height both
+        # default to 1.0 now (each overridable), not silently corrupt every
+        # caller who doesn't know to pass applied_height=1.0 explicitly.
         png_path = tmp_path / "tex.png"
         png_path.write_bytes(_make_test_png(size=4, rgb=(200, 50, 50)))
 
@@ -1205,6 +1374,25 @@ class TestTextures:
         ar, root, layers, materials = legacy._walk(data)
         mat_by_slot = {s: v for s, v in materials}
         assert mat_by_slot[tex]["tex_h"] == 48.0
+
+    def test_texture_material_applied_size_fully_overridable(self, tmp_path):
+        # Real SketchUp writes the material's own tile size in BOTH axes (a
+        # file authored in SketchUp Web carries 8.0 x 16.0 for a brick); a
+        # texture applied without positioning carries no per-face UV record,
+        # so this pair IS its mapping.
+        png_path = tmp_path / "tex.png"
+        png_path.write_bytes(_make_test_png(size=4, rgb=(200, 50, 50)))
+
+        builder = create()
+        tex = builder.add_texture_material(
+            "Brick", str(png_path), applied_width=8.0, applied_height=16.0)
+        builder.add_face(SQUARE, material=tex)
+        data = builder.to_bytes()
+
+        ar, root, layers, materials = legacy._walk(data)
+        mat_by_slot = {s: v for s, v in materials}
+        assert mat_by_slot[tex]["tex_w"] == 8.0
+        assert mat_by_slot[tex]["tex_h"] == 16.0
 
     def test_jpeg_texture_material_self_parses(self, tmp_path):
         jpg_path = tmp_path / "tex.jpg"
@@ -1593,6 +1781,44 @@ class TestAttributeDicts:
         ar, root, layers, materials = legacy._walk(data)
         assert root[0][2]["attrs"]["children"][0][1]["name"] == "dynamic_attributes"
 
+    def test_attribute_dictionaries_exposed_by_name_through_the_public_reader(self, tmp_path):
+        # openskp#254: every dictionary reachable by name through the
+        # public reader, not just a flat merge - and `properties` stays
+        # a backward-compatible view of the 'dynamic_attributes' one
+        # specifically.
+        builder = create()
+        with builder.add_component_definition("Stud") as stud:
+            stud.add_face(SQUARE)
+        builder.add_instance(stud, attribute_dicts=[
+            ("dynamic_attributes", {"width": 10.0, "count": 4}),
+            ("fbd-profile", {"guide": 1}),
+        ])
+        out = tmp_path / "attrs.skp"
+        builder.save(str(out))
+
+        model = SkpFile.open(str(out)).parse()
+        inst = model.root.instances[0]
+        # properties (backward-compatible) stringifies; attribute_dictionaries
+        # keeps each value's real type.
+        assert inst.properties == {"width": "10.0", "count": "4"}
+        assert inst.attribute_dictionaries == {
+            "dynamic_attributes": {"width": 10.0, "count": 4},
+            "fbd-profile": {"guide": 1},
+        }
+
+    def test_no_dynamic_attributes_dict_leaves_properties_empty_but_others_visible(self, tmp_path):
+        builder = create()
+        with builder.add_component_definition("Stud") as stud:
+            stud.add_face(SQUARE)
+        builder.add_instance(stud, attribute_dicts=[("fbd-profile", {"guide": 1})])
+        out = tmp_path / "attrs.skp"
+        builder.save(str(out))
+
+        model = SkpFile.open(str(out)).parse()
+        inst = model.root.instances[0]
+        assert inst.properties == {}
+        assert inst.attribute_dictionaries == {"fbd-profile": {"guide": 1}}
+
     def test_face_with_no_attributes_has_no_attr_container(self):
         # A face with no attributes (and no UV positioning) shouldn't pay
         # for (or emit) an attribute container at all - same discipline as
@@ -1620,19 +1846,24 @@ class TestAttributeDicts:
         ar, root, layers, materials = legacy._walk(data)
         assert root[0][2]["attrs"] == {"k": "attrs", "children": []}
 
-    def test_bool_value_raises(self):
+    def test_bool_value_round_trips(self):
+        # openskp#253: bool (tag 0x07) is a real, distinct type the reader
+        # already decodes - no longer rejected in favor of int(0/1).
         builder = create()
         with builder.add_component_definition("Chair") as chair:
             chair.add_face(SQUARE)
-        with pytest.raises(SkpWriteError, match="bool is not a supported"):
-            builder.add_instance(chair, attributes={"flag": True})
+        builder.add_instance(chair, attributes={"flag": True, "off": False})
+        data = builder.to_bytes()
+        ar, root, layers, materials = legacy._walk(data)
+        entries = root[0][2]["attrs"]["children"][0][1]["entries"]
+        assert entries == {"flag": 1, "off": 0}
 
     def test_unsupported_type_raises(self):
         builder = create()
         with builder.add_component_definition("Chair") as chair:
             chair.add_face(SQUARE)
         with pytest.raises(SkpWriteError, match="unsupported value type"):
-            builder.add_instance(chair, attributes={"bad": [1, 2, 3]})
+            builder.add_instance(chair, attributes={"bad": object()})
 
     def test_int32_out_of_range_raises(self):
         builder = create()
@@ -1640,6 +1871,185 @@ class TestAttributeDicts:
             chair.add_face(SQUARE)
         with pytest.raises(SkpWriteError, match="out of signed 32-bit range"):
             builder.add_instance(chair, attributes={"huge": 2**40})
+
+    # openskp#253: write_attribute_dict now covers all 9 value types
+    # legacy._read_attr_named already decodes, not just str/int/float.
+
+    def test_none_value_round_trips(self):
+        builder = create()
+        with builder.add_component_definition("Chair") as chair:
+            chair.add_face(SQUARE)
+        builder.add_instance(chair, attributes={"empty": None})
+        data = builder.to_bytes()
+        ar, root, layers, materials = legacy._walk(data)
+        entries = root[0][2]["attrs"]["children"][0][1]["entries"]
+        assert entries == {"empty": None}
+
+    def test_point3d_and_vector3d_round_trip(self):
+        builder = create()
+        with builder.add_component_definition("Chair") as chair:
+            chair.add_face(SQUARE)
+        builder.add_instance(chair, attributes={
+            "pt": Point3d(1.0, 2.0, 3.0),
+            "vec": Vector3d(0.0, 0.0, 1.0),
+        })
+        data = builder.to_bytes()
+        ar, root, layers, materials = legacy._walk(data)
+        entries = root[0][2]["attrs"]["children"][0][1]["entries"]
+        assert entries == {"pt": (1.0, 2.0, 3.0), "vec": (0.0, 0.0, 1.0)}
+
+    def test_length_round_trips_as_double_not_int32(self):
+        # Length is a float subclass - must be written as tag 0x0C, not
+        # accidentally caught by the plain-float branch's tag 0x06 (both
+        # decode to the same Python float, so this only distinguishes at
+        # the raw byte level - covered indirectly by every other test
+        # already using legacy._walk's own type-agnostic decode; this
+        # test exists to pin the *value*, which would still be wrong if
+        # Length silently fell through to the int32 branch instead).
+        builder = create()
+        with builder.add_component_definition("Chair") as chair:
+            chair.add_face(SQUARE)
+        builder.add_instance(chair, attributes={"depth": Length(94.92125984251969)})
+        data = builder.to_bytes()
+        ar, root, layers, materials = legacy._walk(data)
+        entries = root[0][2]["attrs"]["children"][0][1]["entries"]
+        assert entries == {"depth": 94.92125984251969}
+
+    def test_timestamp_round_trips_as_uint32(self):
+        builder = create()
+        with builder.add_component_definition("Chair") as chair:
+            chair.add_face(SQUARE)
+        builder.add_instance(chair, attributes={"saved": Timestamp(1234567890)})
+        data = builder.to_bytes()
+        ar, root, layers, materials = legacy._walk(data)
+        entries = root[0][2]["attrs"]["children"][0][1]["entries"]
+        assert entries == {"saved": 1234567890}
+
+    def test_timestamp_out_of_range_raises(self):
+        builder = create()
+        with builder.add_component_definition("Chair") as chair:
+            chair.add_face(SQUARE)
+        with pytest.raises(SkpWriteError, match="out of unsigned 32-bit range"):
+            builder.add_instance(chair, attributes={"bad": Timestamp(-1)})
+
+    def test_array_round_trips_with_mixed_element_types(self):
+        # openskp#253's motivating case: fbd-profile's guide-geometry keys
+        # are entirely arrays of Point3d (34,979 values across the
+        # reporter's 3 production files) - previously unwritable at all.
+        builder = create()
+        with builder.add_component_definition("Chair") as chair:
+            chair.add_face(SQUARE)
+        builder.add_instance(chair, attributes={
+            "guide": [Point3d(1.0, 2.0, 3.0), Point3d(4.0, 5.0, 6.0)],
+            "mixed": [1, "two", 3.0, None, True],
+        }, attribute_dict_name="fbd-profile")
+        data = builder.to_bytes()
+        ar, root, layers, materials = legacy._walk(data)
+        entries = root[0][2]["attrs"]["children"][0][1]["entries"]
+        assert entries == {
+            "guide": [(1.0, 2.0, 3.0), (4.0, 5.0, 6.0)],
+            "mixed": [1, "two", 3.0, None, 1],
+        }
+
+    def test_nested_array_round_trips(self):
+        builder = create()
+        with builder.add_component_definition("Chair") as chair:
+            chair.add_face(SQUARE)
+        builder.add_instance(chair, attributes={"nested": [[1, 2], [3, 4]]})
+        data = builder.to_bytes()
+        ar, root, layers, materials = legacy._walk(data)
+        entries = root[0][2]["attrs"]["children"][0][1]["entries"]
+        assert entries == {"nested": [[1, 2], [3, 4]]}
+
+    def test_bad_value_inside_array_raises_before_any_write(self):
+        builder = create()
+        with builder.add_component_definition("Chair") as chair:
+            chair.add_face(SQUARE)
+        with pytest.raises(SkpWriteError, match=r"attribute 'bad\[1\]'"):
+            builder.add_instance(chair, attributes={"bad": [1, object(), 3]})
+
+    def test_point3d_non_numeric_component_raises(self):
+        # Point3d's own NamedTuple constructor enforces arity (exactly 3
+        # positional args) before validation ever runs - what
+        # _check_attribute_value's "numeric components" check actually
+        # catches is a non-numeric element smuggled into one of those 3
+        # slots.
+        builder = create()
+        with builder.add_component_definition("Chair") as chair:
+            chair.add_face(SQUARE)
+        with pytest.raises(SkpWriteError, match="needs exactly 3 numeric components"):
+            builder.add_instance(chair, attributes={"pt": Point3d(1.0, 2.0, "bad")})
+
+    # openskp#256: the public API can attach several attribute
+    # dictionaries to one entity, not just the attributes/
+    # attribute_dict_name shorthand's single dictionary.
+
+    def test_multiple_attribute_dicts_on_instance(self):
+        # The FrameBuilder shape from the issue: three dictionaries on
+        # one instance, previously only the first was ever reachable.
+        builder = create()
+        with builder.add_component_definition("Stud") as stud:
+            stud.add_face(SQUARE)
+        builder.add_instance(stud, attribute_dicts=[
+            ("fbd-einfo", {"part": "Stud", "depth": 94.92}),
+            ("fbd-profile", {"guide": 1}),
+            ("fbd-profile-cords", {"x": 1.0, "y": 2.0}),
+        ])
+        data = builder.to_bytes()
+        ar, root, layers, materials = legacy._walk(data)
+        children = root[0][2]["attrs"]["children"]
+        names = [v["name"] for _, v in children]
+        assert names == ["fbd-einfo", "fbd-profile", "fbd-profile-cords"]
+        assert children[0][1]["entries"] == {"part": "Stud", "depth": 94.92}
+        assert children[2][1]["entries"] == {"x": 1.0, "y": 2.0}
+
+    def test_multiple_attribute_dicts_on_face(self):
+        builder = create()
+        builder.add_face(SQUARE, attribute_dicts=[("a", {"x": 1}), ("b", {"y": 2})])
+        data = builder.to_bytes()
+        assert "x".encode("utf-16-le") in data and "y".encode("utf-16-le") in data
+
+    def test_multiple_attribute_dicts_on_component_definition(self):
+        builder = create()
+        with builder.add_component_definition(
+            "Chair", attribute_dicts=[("a", {"x": 1}), ("b", {"y": 2})],
+        ) as chair:
+            chair.add_face(SQUARE)
+        builder.add_instance(chair)
+        data = builder.to_bytes()
+        assert "x".encode("utf-16-le") in data and "y".encode("utf-16-le") in data
+
+    def test_multiple_attribute_dicts_on_definition_scoped_instance(self):
+        # A nested definition-scoped add_instance (placing an already-
+        # closed sub-part definition inside another definition's own
+        # body) - built in the order this format requires: the part
+        # closed and ready before the assembly that nests it opens.
+        builder = create()
+        with builder.add_component_definition("Part") as part:
+            part.add_face(SQUARE)
+        with builder.add_component_definition("Assembly") as assembly:
+            assembly.add_instance(part, attribute_dicts=[("a", {"x": 1}), ("b", {"y": 2})])
+        builder.add_instance(assembly)
+        data = builder.to_bytes()
+        assert "x".encode("utf-16-le") in data and "y".encode("utf-16-le") in data
+
+    def test_attributes_and_attribute_dicts_together_raises(self):
+        builder = create()
+        with builder.add_component_definition("Chair") as chair:
+            chair.add_face(SQUARE)
+        with pytest.raises(SkpWriteError, match="not both"):
+            builder.add_instance(
+                chair, attributes={"a": 1}, attribute_dicts=[("b", {"c": 2})],
+            )
+
+    def test_empty_attribute_dicts_behaves_like_no_attributes(self):
+        builder = create()
+        with builder.add_component_definition("Chair") as chair:
+            chair.add_face(SQUARE)
+        builder.add_instance(chair, attribute_dicts=[])
+        data = builder.to_bytes()
+        ar, root, layers, materials = legacy._walk(data)
+        assert root[0][2]["attrs"] == {"k": "attrs", "children": []}
 
     def test_face_attributes_in_component_definition(self):
         builder = create()
@@ -2510,6 +2920,90 @@ class TestRealSketchUpOracle:
                 assert dll.SUMaterialGetColor(mat, ctypes.byref(color)) == 0
                 colors.append((color.red, color.green, color.blue))
             assert set(colors) == {(255, 0, 0), (0, 0, 255)}
+            dll.SUModelRelease(ctypes.byref(model))
+        finally:
+            dll.SUTerminate()
+
+    def test_bool_time_and_array_attribute_values_round_trip_through_real_sketchup(self, tmp_path):
+        # openskp#253: bool/Timestamp/array were previously unwritable at
+        # all. Point3d/Vector3d/Length are covered instead by the
+        # legacy._walk byte-level tests in TestAttributeDicts - the
+        # public C SDK's SUTypedValue surface has no
+        # SUTypedValueGetPoint3D/GetVector3D/GetLength accessor (confirmed
+        # by probing this DLL's exports directly), only
+        # GetBool/GetTime/GetArrayItems for the newly-added types.
+        import ctypes
+
+        builder = create()
+        with builder.add_component_definition("Chair") as chair:
+            chair.add_face(SQUARE)
+        builder.add_instance(chair, attributes={
+            "flag": True, "ts": Timestamp(1700000000), "arr": [1, 2, 3],
+        })
+        out = tmp_path / "bool_time_array.skp"
+        builder.save(str(out))
+
+        dll = ctypes.CDLL(_SDK_DLL_PATH)
+        dll.SUModelCreateFromFile.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_char_p]
+        dll.SUModelGetEntities.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+        dll.SUEntitiesGetInstances.argtypes = [
+            ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_size_t),
+        ]
+        dll.SUEntityGetAttributeDictionary.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p)]
+        dll.SUAttributeDictionaryGetValue.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p)]
+        dll.SUTypedValueCreate.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+        dll.SUTypedValueGetBool.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_bool)]
+        dll.SUTypedValueGetTime.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int64)]
+        dll.SUTypedValueGetNumArrayItems.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t)]
+        dll.SUTypedValueGetArrayItems.argtypes = [
+            ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_size_t),
+        ]
+        dll.SUTypedValueGetInt32.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32)]
+
+        def get_value(dict_ref, key):
+            tv = ctypes.c_void_p()
+            dll.SUTypedValueCreate(ctypes.byref(tv))
+            err = dll.SUAttributeDictionaryGetValue(dict_ref, key.encode(), ctypes.byref(tv))
+            assert err == 0, f"key {key!r} not found (error {err})"
+            return tv
+
+        dll.SUInitialize()
+        try:
+            model = ctypes.c_void_p()
+            err = dll.SUModelCreateFromFile(ctypes.byref(model), str(out).encode())
+            assert err == 0, f"SketchUp SDK rejected the file (error {err})"
+            entities = ctypes.c_void_p()
+            dll.SUModelGetEntities(model, ctypes.byref(entities))
+            insts = (ctypes.c_void_p * 1)()
+            got = ctypes.c_size_t()
+            dll.SUEntitiesGetInstances(entities, 1, insts, ctypes.byref(got))
+            attr_dict = ctypes.c_void_p()
+            err = dll.SUEntityGetAttributeDictionary(insts[0], b"attributes", ctypes.byref(attr_dict))
+            assert err == 0
+
+            flag_tv = get_value(attr_dict, "flag")
+            flag = ctypes.c_bool()
+            assert dll.SUTypedValueGetBool(flag_tv, ctypes.byref(flag)) == 0
+            assert flag.value is True
+
+            ts_tv = get_value(attr_dict, "ts")
+            ts = ctypes.c_int64()
+            assert dll.SUTypedValueGetTime(ts_tv, ctypes.byref(ts)) == 0
+            assert ts.value == 1700000000
+
+            arr_tv = get_value(attr_dict, "arr")
+            n = ctypes.c_size_t()
+            assert dll.SUTypedValueGetNumArrayItems(arr_tv, ctypes.byref(n)) == 0
+            assert n.value == 3
+            items = (ctypes.c_void_p * n.value)()
+            got_items = ctypes.c_size_t()
+            assert dll.SUTypedValueGetArrayItems(arr_tv, n.value, items, ctypes.byref(got_items)) == 0
+            values = []
+            for i in range(got_items.value):
+                v = ctypes.c_int32()
+                assert dll.SUTypedValueGetInt32(items[i], ctypes.byref(v)) == 0
+                values.append(v.value)
+            assert values == [1, 2, 3]
             dll.SUModelRelease(ctypes.byref(model))
         finally:
             dll.SUTerminate()
@@ -3698,3 +4192,40 @@ class TestRealSketchUpOracle:
             dll.SUModelRelease(ctypes.byref(model))
         finally:
             dll.SUTerminate()
+
+
+class TestMaterialOpacity:
+    def test_solid_material_carries_opacity(self):
+        builder = create()
+        glass = builder.add_material("Glass", (200, 220, 255), opacity=0.35)
+        builder.add_face(SQUARE, material=glass)
+        data = builder.to_bytes()
+
+        ar, root, layers, materials = legacy._walk(data)
+        mat = {s: v for s, v in materials}[glass]
+        # Stored as TRANSPARENCY gated by use_opacity - the exact solid-tail
+        # shape legacy.py documents (and VFF's useTrans semantics).
+        assert mat["use_opacity"] == 1
+        assert mat["opacity"] == pytest.approx(0.65)
+
+    def test_omitted_opacity_stays_ungated(self):
+        builder = create()
+        red = builder.add_material("Red", (255, 0, 0))
+        builder.add_face(SQUARE, material=red)
+        data = builder.to_bytes()
+
+        mat = {s: v for s, v in legacy._walk(data)[3]}[red]
+        assert mat["use_opacity"] == 0
+
+    def test_texture_material_carries_opacity(self, tmp_path):
+        png_path = tmp_path / "tex.png"
+        png_path.write_bytes(_make_test_png(size=4, rgb=(200, 50, 50)))
+
+        builder = create()
+        tex = builder.add_texture_material("Voile", str(png_path), opacity=0.5)
+        builder.add_face(SQUARE, material=tex)
+        data = builder.to_bytes()
+
+        mat = {s: v for s, v in legacy._walk(data)[3]}[tex]
+        assert mat["use_opacity"] == 1
+        assert mat["opacity"] == pytest.approx(0.5)
