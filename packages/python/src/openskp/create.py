@@ -108,6 +108,7 @@ from importlib import resources
 from typing import Dict, FrozenSet, Iterator, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 from . import legacy
+from ._face_groups import face_uv_basis
 
 __all__ = [
     "SkpWriteError", "SkpBuilder", "ComponentDefinitionBuilder", "create",
@@ -437,35 +438,12 @@ def _resolve_matrix3x3(
     return matrix3x3
 
 
-def _face_uv_basis(
-    points: Sequence[Point3], normal: Tuple[float, float, float]
-) -> Tuple[Tuple[float, float, float], Tuple[float, float, float]]:
-    """The in-plane 2D basis (U, W) real SketchUp uses to parameterize a
-    face's texture mapping, for a face of ANY orientation (not just
-    axis-aligned) - ground truth (an SDK-authored file's own computed
-    matrix, cross-checked against this formula using an asymmetric
-    correspondence specifically chosen to rule out simpler axis-dropping
-    projections) shows it's simply the face's own first edge direction
-    (``points[1] - points[0]``, normalized) as U, and the plane normal
-    crossed with that as W - both unit vectors. This exactly explains why
-    the axis-aligned case (this feature's first version) worked with
-    fixed (x, y)/(x, z)/(y, z) axis pairs: for a face whose first edge
-    happens to run along a world axis, this formula reduces to exactly
-    that pair.
-    """
-    u = _normalize3((
-        points[1][0] - points[0][0], points[1][1] - points[0][1], points[1][2] - points[0][2],
-    ))
-    w = _normalize3(_cross(normal, u))
-    return u, w
-
-
 def _circle_basis(
     normal: Tuple[float, float, float],
 ) -> Tuple[Tuple[float, float, float], Tuple[float, float, float]]:
     """An arbitrary orthonormal in-plane basis (U, W) for a circle/arc's
-    plane, given only its normal - unlike :func:`_face_uv_basis` there's
-    no "first edge" to derive U from here, so pick whichever of world
+    plane, given only its normal - any consistent choice works for an arc
+    (unlike a texture matrix, whose basis SketchUp fixes), so pick whichever of world
     +Z/+X is less parallel to ``normal`` as a seed and Gram-Schmidt it
     against ``normal`` to get U, then W = normal x U. This choice of seed
     only affects where angle 0 points around the circle, not its shape.
@@ -545,13 +523,24 @@ def _solve_uv_matrix(
     map (scale, rotation, shear, translation; no perspective/keystone term,
     matching the third column ground truth always shows as (0, 0, 1)).
 
-    ``basis`` is the face's own (U, W) in-plane unit vectors (see
-    `_face_uv_basis`) - each correspondence's world point is projected
-    onto them via a plain dot product (ground truth confirms this uses
-    the point's raw coordinates with no origin subtraction - confirmed by
-    positioning a face far from the world origin, where an "obviously
-    sensible" points[0]-relative hypothesis predicted the wrong
-    translation terms) before fitting.
+    ``basis`` is the (U, W) in-plane unit pair the stored matrix is
+    expressed in - SketchUp's own, derived from the face NORMAL alone
+    (`face_uv_basis` in `_face_groups`: ``U = normalize(Z × n)``,
+    ``W = n × U``; ``(X, ±Y)`` for a horizontal face), the same basis the
+    reader inverts the matrix in. Each correspondence's world point is
+    projected onto them via a plain dot product (ground truth confirms this
+    uses the point's raw coordinates with no origin subtraction - confirmed
+    by positioning a face far from the world origin, where an "obviously
+    sensible" points[0]-relative hypothesis predicted the wrong translation
+    terms) before fitting.
+
+    This writer first used the face's own first edge as U. That agrees with
+    SketchUp's basis exactly when the first edge happens to run along
+    ``Z × n`` - which every axis-aligned test square did - and otherwise
+    turns the mapping by the angle between the two: a horizontal face
+    listed from a different corner came out rotated 90° or 180°, a curved
+    surface of many small quads shattered. Measured through the SDK's own
+    ``SUMeshHelperGetFrontSTQCoords`` on 11 orientations (2026-09-04).
 
     Ground truth (see ``_read_ftc`` in legacy.py, which this inverts) shows
     the stored matrix satisfies ``(u, v, 1) @ M == (world_x, world_y, 1)``
@@ -577,8 +566,30 @@ def _uv_matrix_for_face(
     pairs: Sequence[Tuple[Point3, Tuple[float, float]]],
     normal: Tuple[float, float, float],
 ) -> Tuple[float, ...]:
-    """`_solve_uv_matrix` using the face's own `_face_uv_basis`."""
-    return _solve_uv_matrix(pairs, _face_uv_basis(points, normal))
+    """`_solve_uv_matrix` in the basis SketchUp reads the face's matrix in
+    (`face_uv_basis` of the plane normal; ``points`` no longer matter, kept
+    for the call sites)."""
+    return _solve_uv_matrix(pairs, face_uv_basis(normal))
+
+
+def _scale_pins(
+    pins: Optional[Sequence[Tuple[Point3, Tuple[float, float]]]],
+    size: Optional[Tuple[float, float]],
+) -> Optional[Sequence[Tuple[Point3, Tuple[float, float]]]]:
+    """A caller's ``front_uv``/``back_uv`` pins are in TILES of the image
+    ((1, 0) = one full repeat along U, however big the material's applied
+    size makes a tile). The matrix real SketchUp stores is in INCHES of
+    texture space - it divides by the material's applied width/height when
+    it reads a face's UV back (`_face_groups.compute_face_uv`, calibrated
+    against SDK-authored files, does the same) - so the pins are scaled up
+    by that size before the fit. Without this a texture applied at 2 m per
+    tile (78.74 in) came out 78.74× too big on every pinned face."""
+    if pins is None or size is None:
+        return pins
+    w, h = size
+    if w == 1.0 and h == 1.0:
+        return pins
+    return [(pt, (uv[0] * w, uv[1] * h)) for pt, uv in pins]
 
 
 def _u32(v: int) -> bytes:
@@ -601,6 +612,11 @@ _DIM_FONT_PAYLOAD = bytes.fromhex(
 # Leader-text delimiter block: [u32 1][u8 flag=1][u8 0][u32 ARROW=3 closed][u8 1]
 _TEXT_DELIM = bytes.fromhex("0100000001000300000001")
 _DIM_DRAWBASE = bytes.fromhex("00000001010000000000")
+# Sentinel a CConstructionLine's start/end distance-parameter carries when
+# unbounded in that direction - real SketchUp's own value, ground-truth
+# verified (2026-09) against Sketchup::ConstructionLine#start/#end
+# returning nil for that side.
+_CLINE_INFINITE = 1e30
 _DIM_B37 = bytes.fromhex("0101000000020000000400000000000000"
                          "0000000000000000000000000000000000000000")
 _DIM_B42 = bytes.fromhex("00000000000000000000020000000400000000000000"
@@ -1209,9 +1225,14 @@ class _ArchiveWriter:
         self.buf += _u32(0)  # placeholder entity count, patched by the caller
         return slot, count_patch_pos
 
-    def write_definition_tail(self, name: str) -> None:
+    def write_definition_tail(self, name: str, behavior: int = 0) -> None:
         """Close out a ``CComponentDefinition`` record: relationship count,
-        GUID, name, timestamp, behavior flags, and a default thumbnail."""
+        GUID, name, timestamp, behavior flags, and a default thumbnail.
+
+        ``behavior`` is SketchUp's component-behavior byte: bit 0 "always
+        face camera" (2D people and cut-out trees turn toward the eye), bit
+        1 "shadows face sun" - the same two bits legacy.py's
+        ``_read_definition`` decodes from byte -9 of the 43-byte gap."""
         self.buf += _u32(0)  # nrel: CRelationship count - always 0, not supported
         self.buf += struct.pack("<H", 0)
         self.buf += uuid.uuid4().bytes
@@ -1219,10 +1240,12 @@ class _ArchiveWriter:
         self._write_str("")  # description - empty in ground truth
         self._write_str("")  # second name field - empty in ground truth
         self.buf += _u32(int(time.time()))
-        # 43-byte gap; byte -9 carries the always-faces-camera/
-        # shadows-face-sun behavior flags (legacy.py's _read_definition) -
-        # both left off, matching neither being exposed by this writer yet.
-        self.buf += bytes(43)
+        # 43-byte gap; byte -9 carries the always-faces-camera (bit 0) /
+        # shadows-face-sun (bit 1) behavior flags (legacy.py's
+        # _read_definition reads exactly that byte).
+        gap = bytearray(43)
+        gap[43 - 9] = behavior & 0xFF
+        self.buf += bytes(gap)
         self.write_thumbnail()
 
     def _write_instance_like(
@@ -1819,6 +1842,9 @@ class ComponentDefinitionBuilder:
         self._skp = skp
         self.slot = slot
         self.name = name
+        #: SketchUp's behavior byte, set by `SkpBuilder.add_component_definition`
+        #: (bit 0 always-faces-camera, bit 1 shadows-face-sun).
+        self.behavior = 0
         self._count_patch_pos = count_patch_pos
         self._vertex_slots: Dict[Point3, int] = {}
         self._edge_registry: Dict[FrozenSet[int], Tuple[int, int]] = {}
@@ -1867,6 +1893,8 @@ class ComponentDefinitionBuilder:
             raise SkpWriteError("a face needs at least 3 points")
         holes = [[(float(p[0]), float(p[1]), float(p[2])) for p in hole] for hole in holes]
         resolved_attribute_dicts = _resolve_attribute_dicts(attributes, attribute_dict_name, attribute_dicts)
+        front_uv = _scale_pins(front_uv, self._skp._applied_sizes.get(material or 0))
+        back_uv = _scale_pins(back_uv, self._skp._applied_sizes.get(back_material or 0))
         self._new_entity_count += _write_face_or_triangulate(
             self._skp._definition_writer, points, self._vertex_slots, self._edge_registry,
             material or 0, layer or 0, back_material or 0,
@@ -2104,7 +2132,7 @@ class ComponentDefinitionBuilder:
             raise SkpWriteError(f"component definition {self.name!r} has no geometry - add at least one face")
         writer = self._skp._definition_writer
         struct.pack_into("<I", writer.buf, self._count_patch_pos, self._new_entity_count)
-        writer.write_definition_tail(self.name)
+        writer.write_definition_tail(self.name, behavior=self.behavior)
         self._closed = True
         self._skp._open_definition = None
         if self._group_placement is not None:
@@ -2179,7 +2207,16 @@ class SkpBuilder:
         self._scaffold_class_slot = ar.class_slot
         # Materials always start allocating at `base`, the same slot the
         # (possibly absent) material section would have occupied.
-        self._material_writer = _ArchiveWriter(next_slot=base, class_slot={})
+        # Persistent IDs run in ONE sequence across every section of the
+        # file, continuing from the scaffold's own counter (u32 at
+        # _PID_COUNTER_POS). Each section's writer used to start at 1 again,
+        # so a definition, a root instance and a material could all carry
+        # pid 1: SketchUp loads such a file, renumbers the duplicates, and
+        # then fails to SAVE it (SUModelSaveToFile -> SU_ERROR_SERIALIZATION,
+        # "Guardado fallido" in SketchUp Web) once the model is big enough
+        # or a definition happens to come first - measured on real exports.
+        self._pid_start = struct.unpack_from("<I", data, _PID_COUNTER_POS)[0] + 1
+        self._material_writer = _ArchiveWriter(next_slot=base, class_slot={}, next_pid=self._pid_start)
         #: Every material registered so far, by name - populated by
         #: `add_material`/`add_texture_material` as a side effect (they
         #: already de-dupe by name through this same dict), not something
@@ -2189,6 +2226,10 @@ class SkpBuilder:
         #: the source file had is already here.
         self.materials_by_name: Dict[str, int] = {}
         self._material_count = 0
+        #: Applied size (inches) each TEXTURED material slot was written
+        #: with - `add_face` scales its ``front_uv``/``back_uv`` pins by it
+        #: (see `_scale_pins`).
+        self._applied_sizes: Dict[int, Tuple[float, float]] = {}
         # Deferred: layers splice in AFTER materials, so the layer writer's
         # starting slot depends on the final material count. Constructed
         # lazily on the first add_layer() call, once material_shift is
@@ -2300,10 +2341,11 @@ class SkpBuilder:
         ``applied_width``/``applied_height``, if given, are the applied
         size in INCHES - how much model space one tile of the image
         covers. Both default to 1.0. A texture applied without positioning
-        carries no per-face UV record, so this size IS its mapping - and
-        see `write_textured_material`'s own docstring for why it matters
-        even for `add_face`'s ``front_uv``/``back_uv`` pinning (a
-        positioned mapping still divides by it).
+        carries no per-face UV record, so this size IS its mapping; a face
+        positioned with `add_face`'s ``front_uv``/``back_uv`` keeps its
+        pins in tiles of the image regardless of it (`add_face` scales
+        them by this size, since SketchUp stores and reads the per-face
+        matrix in inches of texture space - see `_scale_pins`).
 
         The format is detected from the file's own magic bytes, not its
         extension - PNG and JPEG are the only two this project has
@@ -2331,6 +2373,10 @@ class SkpBuilder:
             opacity=opacity,
         )
         self.materials_by_name[name] = slot
+        self._applied_sizes[slot] = (
+            1.0 if applied_width is None else float(applied_width),
+            1.0 if applied_height is None else float(applied_height),
+        )
         self._material_count += 1
         return slot
 
@@ -2383,7 +2429,8 @@ class SkpBuilder:
             # up (write_layer's short class-ref for CLayer needs the true
             # post-shift slot, not the baseline one).
             self._layer_writer = _ArchiveWriter(
-                next_slot=self._layer_writer_start, class_slot=self._material_shifted_class_slot()
+                next_slot=self._layer_writer_start, class_slot=self._material_shifted_class_slot(),
+                next_pid=self._material_writer.next_pid,
             )
         slot = self._layer_writer.write_layer(name, hidden=hidden, rgba=rgba)
         self.layers_by_name[name] = slot
@@ -2460,7 +2507,8 @@ class SkpBuilder:
                 self._material_writer.next_slot - self._base
             ) + self._layer_shift()
             self._definition_writer = _ArchiveWriter(
-                next_slot=self._definition_writer_start, class_slot=self._post_layer_class_slot()
+                next_slot=self._definition_writer_start, class_slot=self._post_layer_class_slot(),
+                next_pid=self._next_pid(),
             )
         slot, count_patch_pos = self._definition_writer.write_definition_header(attribute_dicts)
         self._definition_count += 1
@@ -2473,11 +2521,20 @@ class SkpBuilder:
         attributes: Optional[Dict[str, object]] = None,
         attribute_dict_name: str = "attributes",
         attribute_dicts: Sequence[Tuple[str, Dict[str, object]]] = (),
+        always_faces_camera: bool = False,
+        shadows_face_sun: bool = False,
     ) -> "ComponentDefinitionBuilder":
         """Start a new reusable component definition. Use the returned
         object as a context manager, adding its geometry via `.add_face`
         inside the ``with`` block; once closed, pass it to `add_instance`
         to place copies of it in the model.
+
+        ``always_faces_camera`` makes the definition a SketchUp face-me
+        component - 2D people and cut-out trees that turn about their own Z
+        so their local -Y axis points at the camera; ``shadows_face_sun``
+        keeps such a component's cast shadow still while the camera moves.
+        Both read back as ``Definition.always_faces_camera`` /
+        ``Definition.shadows_face_sun``.
 
         >>> with builder.add_component_definition("Chair") as chair:
         ...     chair.add_face([(0, 0, 0), (20, 0, 0), (20, 20, 0), (0, 20, 0)])
@@ -2497,7 +2554,9 @@ class SkpBuilder:
         carry more than one. Passing both raises.
         """
         resolved_attribute_dicts = _resolve_attribute_dicts(attributes, attribute_dict_name, attribute_dicts)
-        return self._start_definition(name, "add_component_definition", attribute_dicts=resolved_attribute_dicts)
+        db = self._start_definition(name, "add_component_definition", attribute_dicts=resolved_attribute_dicts)
+        db.behavior = (1 if always_faces_camera else 0) | (2 if shadows_face_sun else 0)
+        return db
 
     def add_group(
         self,
@@ -2705,6 +2764,16 @@ class SkpBuilder:
         )
         self._face_count += 1  # reuses the "at least one root entity" check in to_bytes
 
+    def _next_pid(self) -> int:
+        """The next free persistent ID: sections are written in order
+        (materials, layers, definitions, root geometry), each continuing
+        where the previous one stopped."""
+        for w in (self._geometry_writer, self._definition_writer,
+                  self._layer_writer, self._material_writer):
+            if w is not None:
+                return w.next_pid
+        return self._pid_start
+
     def _ensure_geometry_writer(self) -> None:
         if self._geometry_writer is not None:
             return
@@ -2728,6 +2797,7 @@ class SkpBuilder:
         self._geometry_writer = _ArchiveWriter(
             next_slot=self._scaffold_next_slot + material_shift + self._layer_shift() + self._definition_shift(),
             class_slot=self._post_definition_class_slot(),
+            next_pid=self._next_pid(),
         )
         # Flush any groups that closed earlier, in the order they were
         # created - deferred until now so closing one group doesn't lock in
@@ -2783,8 +2853,10 @@ class SkpBuilder:
         ``front_uv``/``back_uv``, if given, explicitly position that
         side's texture instead of the default planar projection: exactly
         3 ``(point, (u, v))`` pairs, each a world point on the face paired
-        with the texture coordinate that should land there. Works on a
-        face of any orientation, not just axis-aligned ones.
+        with the texture coordinate that should land there, in TILES of
+        the image ((1, 0) is one full repeat along U whatever the
+        material's applied size). Works on a face of any orientation and
+        any vertex order, not just axis-aligned ones.
 
         >>> brick = builder.add_texture_material("Brick", "brick.png")
         >>> builder.add_face(
@@ -2835,6 +2907,8 @@ class SkpBuilder:
         holes = [[(float(p[0]), float(p[1]), float(p[2])) for p in hole] for hole in holes]
         self._ensure_geometry_writer()
         resolved_attribute_dicts = _resolve_attribute_dicts(attributes, attribute_dict_name, attribute_dicts)
+        front_uv = _scale_pins(front_uv, self._applied_sizes.get(material or 0))
+        back_uv = _scale_pins(back_uv, self._applied_sizes.get(back_material or 0))
         self._new_entity_count += _write_face_or_triangulate(
             self._geometry_writer, points, self._vertex_slots, self._edge_registry,
             material or 0, layer or 0, back_material or 0,
@@ -3075,6 +3149,120 @@ class SkpBuilder:
         self._new_entity_count += 1
         self._face_count += 1  # reuses the "at least one root entity" check in to_bytes
 
+    def add_construction_line(
+        self, point: Point3,
+        point2: Optional[Point3] = None,
+        direction: Optional[Point3] = None,
+    ) -> None:
+        """Add a construction/guide line (SketchUp's Construction Line
+        tool). Pass exactly one of ``point2`` (a bounded segment between
+        ``point`` and ``point2``, matching ``Entities#add_cline(p1, p2)``)
+        or ``direction`` (an unbounded guide line through ``point``,
+        matching ``Entities#add_cline(point, vector)``).
+
+        Ground truth (real SketchUp 2025, SDK/Ruby cross-checked, against
+        BOTH a v2020-downgrade save and a genuinely v17-native save -
+        schema, field values, and this trailer all matched exactly between
+        the two independently-produced real files): the record stores a
+        point + normalized direction + two signed distance parameters
+        along that direction marking the visible segment's start/end -
+        exactly the shape ``Sketchup::ConstructionLine#start``/``#end``/
+        ``#direction`` exposes, confirmed byte-for-byte including the
+        segment length itself. An unbounded direction is written as the
+        real ``±1e30`` sentinel SketchUp itself uses
+        (``Sketchup::ConstructionLine#start``/``#end`` return ``nil`` for
+        that side). A 4-byte trailer follows - present (with different,
+        evidently-inert content) in both real samples, so written as
+        zero rather than omitted (an earlier version of this method wrote
+        zero trailer bytes, matching an older/different SketchUp build's
+        historical variant documented in the reader's own comment, not
+        this one - real SketchUp rejected the result as an unrecognized
+        file).
+        """
+        self._ensure_geometry_writer()
+        w = self._geometry_writer
+        p = (float(point[0]), float(point[1]), float(point[2]))
+        if (point2 is None) == (direction is None):
+            raise SkpWriteError("add_construction_line: pass exactly one of point2 or direction")
+        if point2 is not None:
+            p2 = (float(point2[0]), float(point2[1]), float(point2[2]))
+            dx, dy, dz = p2[0] - p[0], p2[1] - p[1], p2[2] - p[2]
+            length = math.sqrt(dx * dx + dy * dy + dz * dz)
+            if length == 0.0:
+                raise SkpWriteError("add_construction_line: point and point2 coincide")
+            dirv = (dx / length, dy / length, dz / length)
+            start_param, end_param = 0.0, length
+        else:
+            d = (float(direction[0]), float(direction[1]), float(direction[2]))
+            dlen = math.sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2])
+            if dlen == 0.0:
+                raise SkpWriteError("add_construction_line: direction must be nonzero")
+            dirv = (d[0] / dlen, d[1] / dlen, d[2] / dlen)
+            start_param, end_param = -_CLINE_INFINITE, _CLINE_INFINITE
+        w._new_of_known_class("CConstructionLine", schema=1)
+        w._preamble()
+        w.buf += _DIM_DRAWBASE
+        for v in (p[0], p[1], p[2], dirv[0], dirv[1], dirv[2], start_param, end_param):
+            w.buf += _f64(v)
+        w.buf += bytes(4)  # trailer - see docstring
+        self._new_entity_count += 1
+        self._face_count += 1  # reuses the "at least one root entity" check in to_bytes
+
+    def add_construction_point(self, position: Point3) -> None:
+        """Add a construction/guide point (SketchUp's Construction Point
+        tool) at ``position`` (inches, world space).
+
+        Ground truth (real SketchUp 2025, SDK/Ruby cross-checked): a
+        second, always-zero 3-double block and a trailing zero byte follow
+        the position - reserved/unused (no corresponding
+        ``Sketchup::ConstructionPoint`` property exists to name them
+        after), written as zero to match every real-file sample seen.
+        """
+        self._ensure_geometry_writer()
+        w = self._geometry_writer
+        p = (float(position[0]), float(position[1]), float(position[2]))
+        w._new_of_known_class("CConstructionPoint", schema=0)
+        w._preamble()
+        w.buf += _DIM_DRAWBASE
+        for v in (p[0], p[1], p[2], 0.0, 0.0, 0.0):
+            w.buf += _f64(v)
+        w.buf += bytes(1)
+        self._new_entity_count += 1
+        self._face_count += 1  # reuses the "at least one root entity" check in to_bytes
+
+    def add_section_plane(self, point: Point3, normal: Point3) -> None:
+        """Add a section plane (SketchUp's Section Plane tool) through
+        ``point`` with the given ``normal`` (need not be unit length),
+        matching ``Entities#add_section_plane([point, normal])``.
+
+        Ground truth (real SketchUp 2025, SDK/Ruby cross-checked against a
+        genuinely v17-native save): the record is preamble + drawbase +
+        the plane as 4 doubles ``(a, b, c, d)`` satisfying
+        ``a*x + b*y + c*z + d = 0`` for every point on the plane - the
+        same implicit form ``Sketchup::SectionPlane#get_plane`` returns,
+        confirmed to match exactly (``normal`` normalized, ``d = -(normal
+        . point)``). A name/short-label pair can follow on v18+ saves per
+        the reader (``legacy.py``'s ``_read_sectionplane``) - omitted
+        here since this writer only ever produces v17-tagged files, same
+        scope as ``add_dimension``/``add_text``/``add_construction_line``.
+        """
+        self._ensure_geometry_writer()
+        w = self._geometry_writer
+        p = (float(point[0]), float(point[1]), float(point[2]))
+        n = (float(normal[0]), float(normal[1]), float(normal[2]))
+        nlen = math.sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2])
+        if nlen == 0.0:
+            raise SkpWriteError("add_section_plane: normal must be nonzero")
+        a, b, c = n[0] / nlen, n[1] / nlen, n[2] / nlen
+        d = -(a * p[0] + b * p[1] + c * p[2])
+        w._new_of_known_class("CSectionPlane", schema=3)
+        w._preamble()
+        w.buf += _DIM_DRAWBASE
+        for v in (a, b, c, d):
+            w.buf += _f64(v)
+        self._new_entity_count += 1
+        self._face_count += 1  # reuses the "at least one root entity" check in to_bytes
+
     def to_bytes(self) -> bytes:
         """Return the finished file's bytes."""
         if self._pending_groups:
@@ -3105,15 +3293,12 @@ class SkpBuilder:
         # file by 4 extra bytes here; ground-truth-confirmed by diffing SDK-
         # authored files (an earlier version of this method double-counted
         # this field as a fresh insertion, corrupting every offset after it).
-        # Each layer's record embeds 2 pids (see write_layer); materials
-        # use 1 pid each (write_material).
-        layer_pids = (self._layer_writer.next_pid - 1) if self._layer_writer else 0
-        pid_delta = self._material_count + layer_pids
-
         prefix = bytearray(self._data[: self._material_insert_pos - 4])
-        if pid_delta:
-            u16 = struct.unpack_from("<H", prefix, _PID_COUNTER_POS)[0]
-            struct.pack_into("<H", prefix, _PID_COUNTER_POS, u16 + pid_delta)
+        # The model's pid counter: the last pid handed out, in every
+        # section. A 32-bit field (the two bytes after the old u16 are part
+        # of it - a counter of 2 000 000 round-trips through the SDK), so a
+        # model with more than 65 535 entities keeps a truthful counter.
+        struct.pack_into("<I", prefix, _PID_COUNTER_POS, self._next_pid() - 1)
         prefix[_ISO_CAMERA_PREFIX_OFFSET : _ISO_CAMERA_PREFIX_OFFSET + len(_ISO_CAMERA_PREFIX_PATCH)] = (
             _ISO_CAMERA_PREFIX_PATCH
         )

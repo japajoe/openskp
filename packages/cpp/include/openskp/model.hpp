@@ -22,6 +22,13 @@ using Vec3 = std::array<double, 3>;
 using Color3 = std::array<std::uint8_t, 3>;
 using Color4 = std::array<std::uint8_t, 4>;
 
+// 1 metre = 39.37007874015748 inches (SketchUp native unit). Shared by
+// every exporter that takes a coordinate scale factor (dxf_export.hpp,
+// ifc_export.hpp, ...) - defined once here rather than duplicated per
+// header, since two same-named constexprs in the same namespace collide
+// as a redefinition error in any translation unit that includes both.
+constexpr double METRES_TO_INCHES = 39.37007874015748;
+
 /// 3D point coordinate in raw SketchUp space.
 struct Vertex {
   /// Unique TLV entity ID.
@@ -157,8 +164,15 @@ struct Instance {
   /// that resolved value.
   std::string layer;
   /// Arbitrary key/value dynamic attributes attached directly to this
-  /// instance (SketchUp's Dynamic Components).
+  /// instance (SketchUp's Dynamic Components) - a backward-compatible
+  /// view of attribute_dictionaries["dynamic_attributes"].
   std::map<std::string, std::string> properties;
+  /// Every custom attribute dictionary attached to this instance, keyed
+  /// by the dictionary's own declared name - not just the one
+  /// SketchUp's own Dynamic Components extension uses. A real instance
+  /// routinely carries several at once (a plugin's own dictionary
+  /// alongside SketchUp's, or several of the plugin's own).
+  std::map<std::string, std::map<std::string, std::string>> attribute_dictionaries;
   /// Instance material override ID.
   std::optional<EntityId> material_id;
   /// Whether the instance itself is hidden (SketchUp's "Hide" on this
@@ -205,6 +219,39 @@ struct Dimension {
   std::optional<Vec3> normal;
 };
 
+/// A construction/guide line (SketchUp's Construction Line tool).
+/// Legacy (pre-2021) files only - the VFF (2021+) reader does not
+/// currently recognize this entity.
+///
+/// Stored internally (and here, unchanged) as a point + normalized
+/// direction + two signed distance parameters along that direction
+/// marking where the visible segment starts/ends - the same shape
+/// `Sketchup::ConstructionLine`'s own `start`/`end`/`direction`
+/// properties expose. A parameter magnitude of `1e30` means unbounded
+/// in that direction (SketchUp draws this as an infinite guide line
+/// through `point`) - `start`/`end` come back unset in that case,
+/// matching the real API returning `nil`.
+struct ConstructionLine {
+  /// A point on the line, in inches (world space) - matches the bounded
+  /// case's own `start`, or the anchor point given for an infinite line.
+  Vec3 point{0.0, 0.0, 0.0};
+  /// The line's normalized direction vector.
+  Vec3 direction{1.0, 0.0, 0.0};
+  /// The bounded segment's start point, or unset if unbounded in this
+  /// direction.
+  std::optional<Vec3> start;
+  /// The bounded segment's end point, or unset if unbounded.
+  std::optional<Vec3> end;
+};
+
+/// A construction/guide point (SketchUp's Construction Point tool).
+/// Legacy (pre-2021) files only - the VFF (2021+) reader does not
+/// currently recognize this entity.
+struct ConstructionPoint {
+  /// The point's position, in inches (world space).
+  Vec3 position{0.0, 0.0, 0.0};
+};
+
 /// A saved scene (SketchUp's "Scenes" tabs; "pages" in the SDK).
 struct Page {
   /// Scene name as shown on its tab.
@@ -248,6 +295,10 @@ struct Definition {
   std::vector<TextEntity> texts;
   /// Dimensions placed inside this definition.
   std::vector<Dimension> dimensions;
+  /// Construction/guide lines placed inside this definition.
+  std::vector<ConstructionLine> construction_lines;
+  /// Construction/guide points placed inside this definition.
+  std::vector<ConstructionPoint> construction_points;
   /// Always faces camera behavior flag.
   bool always_faces_camera{};
   /// Shadows face sun behavior flag.

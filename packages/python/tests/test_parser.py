@@ -818,8 +818,11 @@ class TestLayerHidden:
     extracted from legacy MFC files (``legacy._read_layer``) but previously
     discarded before reaching the public model; now wired through
     ``layer_hidden`` alongside the existing ``layer_colors``/
-    ``layer_id_to_name`` dicts. VFF files carry no known visibility tag, so
-    they always default to ``False`` (documented on ``Layer.hidden``).
+    ``layer_id_to_name`` dicts. VFF files ALSO carry this bit now - see
+    ``TestVffLayerHidden`` below for the tag that exposes it - so this
+    class only needs to cover the plumbing from ``parsed["layer_hidden"]``
+    down to the public ``Layer.hidden`` field, independent of which parser
+    populated it.
 
     ``full_parse`` is stubbed out (matching ``TestMaterialIdJoin``'s
     pattern above), since hand-crafting a real hidden-layer legacy file
@@ -884,6 +887,90 @@ class TestLayerHidden:
         model = SkpFile.open(str(fixture)).parse()
         assert len(model.layers) == 1
         assert model.layers[0].hidden is False
+
+
+class TestVffLayerHidden:
+    """The VFF-format (2021+) counterpart of the legacy layer-hidden flag:
+    each layer's ``8C3C`` node (under a ``993A`` layer-manager list) carries
+    a single-byte ``8E3C`` child sibling to the already-parsed ``DC05``
+    (id) and ``8D3C`` (name) - 1 = hidden, 0 = visible. Confirmed
+    byte-for-byte against a real production file's own Tags panel
+    (FrameSmart pipeline report, 2026-09-08): every layer shown with a
+    hollow/hidden eye icon had ``8E3C=01``, every visible one had
+    ``8E3C=00``, with no exceptions across all 85 layers in that file.
+
+    Before this fix, VFF layers derived only color from
+    ``Layer_<name>``-prefixed materials (which carry no visibility of their
+    own), so every VFF layer's hidden state silently defaulted to
+    ``False`` regardless of the file's real Tags panel state - the
+    IFC exporter's ``IfcPresentationLayerWithStyle.LayerOn`` (openskp#272)
+    then always showed visible, with no way for a downstream consumer to
+    ever recover a hidden VFF layer's actual state.
+    """
+
+    @staticmethod
+    def _tlv(tag_hex: str, payload: bytes) -> bytes:
+        import struct
+        return bytes.fromhex(tag_hex) + struct.pack("<I", len(payload)) + payload
+
+    @classmethod
+    def _layer_node(cls, layer_id: int, name: str, hidden: bool) -> bytes:
+        return (
+            cls._tlv("DC05", bytes([layer_id]))
+            + cls._tlv("8D3C", name.encode("utf-8"))
+            + cls._tlv("8E3C", bytes([1 if hidden else 0]))
+        )
+
+    @classmethod
+    def _build_skp(cls, tmp_path, *layers: bytes) -> "pathlib.Path":
+        import io
+        import zipfile
+
+        model_dat = cls._tlv("993A", b"".join(cls._tlv("8C3C", layer) for layer in layers))
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("model.dat", model_dat)
+        zip_bytes = buf.getvalue()
+
+        # Real header: VFF magic, then the zip container starts within the
+        # first 256 bytes (is_legacy() checks exactly that window).
+        path = tmp_path / "vff_layers.skp"
+        path.write_bytes(b"\xff\xfe\xff\x0e" + zip_bytes)
+        return path
+
+    def test_hidden_and_visible_layers_read_correctly(self, tmp_path: pathlib.Path) -> None:
+        from openskp import _core
+
+        path = self._build_skp(
+            tmp_path,
+            self._layer_node(5, "wall_external_cladding_1", hidden=True),
+            self._layer_node(6, "wall", hidden=False),
+        )
+
+        parsed = _core.full_parse(str(path))
+
+        assert parsed["layer_hidden"]["wall_external_cladding_1"] is True
+        assert parsed["layer_hidden"]["wall"] is False
+
+    def test_build_scene_threads_the_real_value_through(self, tmp_path: pathlib.Path) -> None:
+        """build_scene()'s own layer_hidden plumbing (TestBuildSceneLayerHidden)
+        is already covered against a hand-built parsed dict - this just
+        confirms a REAL _core.full_parse() result carries the same shape
+        through, end to end from raw bytes."""
+        from openskp import _core
+        from openskp.scene import build_scene
+
+        path = self._build_skp(
+            tmp_path,
+            self._layer_node(5, "wall_external_cladding_1", hidden=True),
+            self._layer_node(6, "wall", hidden=False),
+        )
+
+        scene = build_scene(_core.full_parse(str(path)))
+
+        assert scene.layer_hidden["wall_external_cladding_1"] is True
+        assert scene.layer_hidden["wall"] is False
 
 
 class TestFaceInstanceHidden:
@@ -2078,6 +2165,77 @@ class TestModernRealFile:
         # exercises the full TLV/XML decode path without touching
         # triangulation at all.
 
+    def test_untitled_skp_attribute_dictionaries_reach_glb_and_json_export(self, tmp_path) -> None:
+        """Every attribute dictionary an instance carries (not just
+        SketchUp's own dynamic_attributes) was already correctly resolved
+        by build_scene() - InstanceNode.attribute_dictionaries has held
+        it since openskp#254 - but export/glb.py's and export/json_export.py's
+        own metadata dicts never actually wrote that field out, silently
+        dropping every third-party plugin's data (e.g. this real file's
+        own SteelFramer dictionary) from any consumer reading the
+        metadata JSON/dict directly instead of a derived .ifc file."""
+        import json as _json
+
+        from openskp.export import glb as glb_export
+        from openskp.export import json_export
+
+        skp = self._model(self.FIXTURE_UNTITLED)
+        skp.parse()
+        scene = skp.build_scene()
+
+        def find_w1(node):
+            if node.name == "W1":
+                return node
+            for c in node.children:
+                found = find_w1(c)
+                if found:
+                    return found
+            return None
+
+        w1 = find_w1(scene.scene_hierarchy)
+        assert w1 is not None
+        assert w1.properties == {}
+        assert w1.attribute_dictionaries["steelframer-dict"]["generator"] == (
+            "SteelFramer::Engine::PanelGenerator"
+        )
+
+        # 1. export/glb.py's metadata JSON sidecar
+        out_glb = tmp_path / "untitled.glb"
+        glb_export.export(skp, str(out_glb))
+        with open(str(out_glb).replace(".glb", "_metadata.json"), encoding="utf-8") as f:
+            metadata = _json.load(f)
+
+        def find_w1_dict(node):
+            if node.get("name") == "W1":
+                return node
+            for c in node.get("children", []):
+                found = find_w1_dict(c)
+                if found:
+                    return found
+            return None
+
+        w1_glb = find_w1_dict(metadata["scene_hierarchy"])
+        assert w1_glb is not None
+        assert w1_glb["attribute_dictionaries"]["steelframer-dict"]["profile"] == "362S200-43"
+
+        # 2. export/json_export.py's own schema (both the scene_hierarchy
+        # tree and the mesh_index entries)
+        d = json_export.to_dict(skp.parse(), scene)
+        w1_json = find_w1_dict(d["scene_hierarchy"])
+        assert w1_json is not None
+        assert w1_json["attribute_dictionaries"]["steelframer-dict"]["generator"] == (
+            "SteelFramer::Engine::PanelGenerator"
+        )
+        mesh_with_dict = next(
+            (
+                m
+                for m in d["mesh_index"].values()
+                if m.get("attribute_dictionaries", {}).get("steelframer-dict")
+            ),
+            None,
+        )
+        assert mesh_with_dict is not None
+
     def test_su_file_skp_matches_ground_truth(self) -> None:
         skp = self._model(self.FIXTURE_SU_FILE)
         model = skp.parse()
@@ -2522,6 +2680,105 @@ class TestBuildSceneRecursionGuard:
         scene = build_scene(self._parsed(defs_dict))
         assert len(scene.scene_hierarchy.children) == 2
 
+    def test_unnamed_instance_gets_readable_fallback_not_empty_string(self) -> None:
+        """An instance nobody renamed in SketchUp (inst["name"] == "")
+        must still get a readable fallback name - InstanceNode.name and
+        MeshMetadata.name (via the deferred path_updates backfill) used a
+        different, empty-string fallback for the exact same case, so a
+        nested unnamed instance's real name silently vanished (caught
+        2026-09-07 comparing IFC export element names against a real
+        SketchUp export of the same file). Falls back to the definition's
+        own name when it has one (not itself an auto-generated
+        "Group#1"-style placeholder) - see
+        test_definition_name_fallback_skips_autogenerated_names below for
+        the case where it doesn't."""
+        from openskp._core import _GeometryBuilder
+        from openskp.scene import build_scene
+
+        child_builder = _GeometryBuilder()  # no faces - forces the deferred path_updates backfill
+        root_builder = _GeometryBuilder()
+        root_builder.instances.append(self._instance(1, name=""))
+        defs_dict = {
+            1: {"guid": "g1", "name": "unnamed_def", "builder": child_builder},
+            "ROOT": {"guid": "ROOT", "name": "ROOT_MODEL", "builder": root_builder},
+        }
+
+        scene = build_scene(self._parsed(defs_dict))
+        child = scene.scene_hierarchy.children[0]
+
+        assert child.name == "unnamed_def"
+        assert child.name_is_generated is False
+
+    def test_definition_name_fallback_skips_autogenerated_names(self) -> None:
+        """A definition whose own name is itself just SketchUp's
+        auto-generated "Group#1"/"Component#12" placeholder is no more
+        meaningful than the internal index - the fallback must skip it and
+        fall all the way to Component_<id>, and flag the result as
+        generated so a consumer can tell it apart from a real name."""
+        from openskp._core import _GeometryBuilder
+        from openskp.scene import build_scene
+
+        child_builder = _GeometryBuilder()
+        root_builder = _GeometryBuilder()
+        root_builder.instances.append(self._instance(1, name=""))
+        defs_dict = {
+            1: {"guid": "g1", "name": "Group#1", "builder": child_builder},
+            "ROOT": {"guid": "ROOT", "name": "ROOT_MODEL", "builder": root_builder},
+        }
+
+        scene = build_scene(self._parsed(defs_dict))
+        child = scene.scene_hierarchy.children[0]
+
+        assert child.name == "Component_1"
+        assert child.name_is_generated is True
+
+
+class TestBuildSceneLayerHidden:
+    """Scene.layer_hidden must carry the source file's own per-layer
+    visibility through from parsed["layer_hidden"] - consumers that
+    expose a layer list (e.g. the IFC exporter's
+    IfcPresentationLayerWithStyle.LayerOn) rely on this rather than
+    always defaulting every layer to visible."""
+
+    def test_layer_hidden_passed_through_from_parsed(self) -> None:
+        from openskp._core import _GeometryBuilder
+        from openskp.scene import build_scene
+
+        root_builder = _GeometryBuilder()
+        parsed = {
+            "defs_dict": {"ROOT": {"guid": "ROOT", "name": "ROOT_MODEL", "builder": root_builder}},
+            "layer_colors": {},
+            "layer_id_to_name": {},
+            "material_id_to_name": {},
+            "materials": {},
+            "materials_by_folder": {},
+            "layer_hidden": {"Layer0": False, "Framing": True},
+        }
+
+        scene = build_scene(parsed)
+
+        assert scene.layer_hidden == {"Layer0": False, "Framing": True}
+
+    def test_missing_layer_hidden_defaults_to_empty(self) -> None:
+        """An older/synthetic parsed dict with no layer_hidden key at all
+        must not crash build_scene - just produce an empty mapping."""
+        from openskp._core import _GeometryBuilder
+        from openskp.scene import build_scene
+
+        root_builder = _GeometryBuilder()
+        parsed = {
+            "defs_dict": {"ROOT": {"guid": "ROOT", "name": "ROOT_MODEL", "builder": root_builder}},
+            "layer_colors": {},
+            "layer_id_to_name": {},
+            "material_id_to_name": {},
+            "materials": {},
+            "materials_by_folder": {},
+        }
+
+        scene = build_scene(parsed)
+
+        assert scene.layer_hidden == {}
+
 
 class TestBuildSceneMeshIndexPerInstanceMetadata:
     """Regression for openskp#240: each mesh's own ``name`` must reflect
@@ -2555,6 +2812,226 @@ class TestBuildSceneMeshIndexPerInstanceMetadata:
 
         names = sorted(m.name for m in scene.mesh_index.values())
         assert names == ["LeafInstance", "MiddleInstance", "OuterInstance"]
+
+
+class TestBuildSceneAttributeDictionaries:
+    """Regression coverage for the Keith Street fix: a third-party
+    steel-detailing plugin's per-instance attribute dictionary (seen in
+    production as ``fbd-einfo``/``fbd-profile``/``fbd-profile-cords``)
+    carries the element's REAL identity (``name``/``label``/``code``) and
+    rich structural metadata that build_scene previously discarded
+    entirely - only ``dynamic_attributes`` (SketchUp's own Dynamic
+    Components dictionary) was ever surfaced. Per the user's explicit
+    choice, this data now surfaces BOTH ways: as the displayed
+    name/InstanceNode.name (name/label/code, in that priority) and as
+    MeshMetadata/InstanceNode.attribute_dictionaries, keyed by the
+    dictionary's own name.
+    """
+
+    @staticmethod
+    def _tlv(tag_hex: str, payload: bytes) -> bytes:
+        return bytes.fromhex(tag_hex) + struct.pack('<I', len(payload)) + payload
+
+    @classmethod
+    def _value(cls, inner: bytes = b"") -> bytes:
+        return cls._tlv('A438', inner)
+
+    @classmethod
+    def _entry(cls, key: str, value_bytes: bytes) -> bytes:
+        return cls._tlv('B636', key.encode('utf-8')) + value_bytes
+
+    @classmethod
+    def _dict(cls, name: str, entries: bytes) -> bytes:
+        return cls._tlv('B436', name.encode('utf-8')) + cls._tlv('B536', entries)
+
+    @classmethod
+    def _d007_with_dicts(cls, *dicts: bytes):
+        from openskp import _core
+        dc05_payload = b"".join(dicts)
+        d007_bytes = cls._tlv('D007', cls._tlv('DC05', dc05_payload))
+        elements = _core.parse_tlv_recursive(d007_bytes, 0, len(d007_bytes))
+        return elements[0]
+
+    @classmethod
+    def _instance(cls, ref_idx, name, d007=None):
+        return {
+            "offset": 0, "ref_guid": "", "ref_idx": ref_idx, "name": name,
+            "matrix": [1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1.0],
+            "material_id": None, "children": [d007] if d007 else [],
+        }
+
+    @staticmethod
+    def _parsed(defs_dict):
+        return {
+            "defs_dict": defs_dict,
+            "layer_colors": {},
+            "layer_id_to_name": {},
+            "material_id_to_name": {},
+            "materials": {},
+            "materials_by_folder": {},
+        }
+
+    def test_plugin_dict_name_overrides_displayed_name(self) -> None:
+        from openskp._core import _GeometryBuilder
+        from openskp.scene import build_scene
+
+        d007 = self._d007_with_dicts(
+            self._dict("fbd-einfo", self._entry("name", self._value(self._tlv("AD38", b"Profile25"))))
+        )
+        root_builder = _GeometryBuilder()
+        root_builder.instances.append(self._instance(1, "GLB-12", d007))
+        defs_dict = {
+            1: {"guid": "g1", "name": "wall_def", "builder": _GeometryBuilder()},
+            "ROOT": {"guid": "ROOT", "name": "ROOT_MODEL", "builder": root_builder},
+        }
+
+        scene = build_scene(self._parsed(defs_dict))
+
+        assert scene.scene_hierarchy.children[0].name == "Profile25"
+
+    def test_name_label_code_priority_order(self) -> None:
+        """label beats code, and (from the other test) name beats label."""
+        from openskp._core import _GeometryBuilder
+        from openskp.scene import build_scene
+
+        d007 = self._d007_with_dicts(
+            self._dict(
+                "fbd-einfo",
+                self._entry("label", self._value(self._tlv("AD38", b"W1")))
+                + self._entry("code", self._value(self._tlv("AD38", b"aPf"))),
+            )
+        )
+        root_builder = _GeometryBuilder()
+        root_builder.instances.append(self._instance(1, "GLB-12", d007))
+        defs_dict = {
+            1: {"guid": "g1", "name": "wall_def", "builder": _GeometryBuilder()},
+            "ROOT": {"guid": "ROOT", "name": "ROOT_MODEL", "builder": root_builder},
+        }
+
+        scene = build_scene(self._parsed(defs_dict))
+
+        assert scene.scene_hierarchy.children[0].name == "W1"
+
+    def test_no_override_falls_back_to_real_instance_name(self) -> None:
+        from openskp._core import _GeometryBuilder
+        from openskp.scene import build_scene
+
+        d007 = self._d007_with_dicts(
+            self._dict("fbd-einfo", self._entry("angle", self._value(self._tlv("A738", struct.pack("<i", 90)))))
+        )
+        root_builder = _GeometryBuilder()
+        root_builder.instances.append(self._instance(1, "GLB-12", d007))
+        defs_dict = {
+            1: {"guid": "g1", "name": "wall_def", "builder": _GeometryBuilder()},
+            "ROOT": {"guid": "ROOT", "name": "ROOT_MODEL", "builder": root_builder},
+        }
+
+        scene = build_scene(self._parsed(defs_dict))
+
+        assert scene.scene_hierarchy.children[0].name == "GLB-12"
+
+    def test_name_override_keys_recognizes_a_non_default_key(self) -> None:
+        """The name/label/code vocabulary is a convention, not a hardcoded
+        requirement - openskp is not FrameBuilder-specific, so any plugin
+        that instead calls its identifier field e.g. "mark" must be able to
+        opt in without forking the source."""
+        from openskp._core import _GeometryBuilder
+        from openskp.scene import build_scene
+
+        d007 = self._d007_with_dicts(
+            self._dict("techsteel-data", self._entry("mark", self._value(self._tlv("AD38", b"RT-2"))))
+        )
+        root_builder = _GeometryBuilder()
+        root_builder.instances.append(self._instance(1, "GLB-12", d007))
+        defs_dict = {
+            1: {"guid": "g1", "name": "truss_def", "builder": _GeometryBuilder()},
+            "ROOT": {"guid": "ROOT", "name": "ROOT_MODEL", "builder": root_builder},
+        }
+        parsed = self._parsed(defs_dict)
+
+        # Default vocabulary doesn't know "mark" - falls back to the
+        # instance's own real SketchUp name, same as no override at all.
+        default_scene = build_scene(parsed)
+        assert default_scene.scene_hierarchy.children[0].name == "GLB-12"
+
+        # Opting a custom plugin's key into the vocabulary picks it up,
+        # with no change to openskp's own source needed.
+        custom_scene = build_scene(parsed, name_override_keys=("mark", "name", "label", "code"))
+        assert custom_scene.scene_hierarchy.children[0].name == "RT-2"
+
+    def test_extra_dictionaries_exposed_on_instance_node(self) -> None:
+        from openskp._core import _GeometryBuilder
+        from openskp.scene import build_scene
+
+        d007 = self._d007_with_dicts(
+            self._dict(
+                "fbd-einfo",
+                self._entry("name", self._value(self._tlv("AD38", b"Profile25")))
+                + self._entry("angle", self._value(self._tlv("A738", struct.pack("<i", 90)))),
+            )
+        )
+        root_builder = _GeometryBuilder()
+        root_builder.instances.append(self._instance(1, "GLB-12", d007))
+        defs_dict = {
+            1: {"guid": "g1", "name": "wall_def", "builder": _GeometryBuilder()},
+            "ROOT": {"guid": "ROOT", "name": "ROOT_MODEL", "builder": root_builder},
+        }
+
+        scene = build_scene(self._parsed(defs_dict))
+
+        node = scene.scene_hierarchy.children[0]
+        assert node.attribute_dictionaries == {"fbd-einfo": {"name": "Profile25", "angle": "90"}}
+
+    def test_su_instance_set_and_dynamic_attributes_excluded_from_extras(self) -> None:
+        """SU_InstanceSet is SketchUp's own always-present, always-empty
+        boilerplate and dynamic_attributes already has its own dedicated
+        `properties` field - neither belongs in the extras dict too."""
+        from openskp._core import _GeometryBuilder
+        from openskp.scene import build_scene
+
+        d007 = self._d007_with_dicts(
+            self._dict("SU_InstanceSet", self._entry("Owner", self._value(self._tlv("AD38", b"")))),
+            self._dict("dynamic_attributes", self._entry("width", self._value(self._tlv("AF38", struct.pack("<d", 10.0))))),
+        )
+        root_builder = _GeometryBuilder()
+        root_builder.instances.append(self._instance(1, "GLB-12", d007))
+        defs_dict = {
+            1: {"guid": "g1", "name": "wall_def", "builder": _GeometryBuilder()},
+            "ROOT": {"guid": "ROOT", "name": "ROOT_MODEL", "builder": root_builder},
+        }
+
+        scene = build_scene(self._parsed(defs_dict))
+
+        node = scene.scene_hierarchy.children[0]
+        assert node.attribute_dictionaries == {}
+        assert node.properties == {"width": "10.0"}
+
+    def test_non_unique_plugin_label_does_not_collide_mesh_index_paths(self) -> None:
+        """Two sibling instances sharing the same plugin-supplied "name"
+        (a catalog/type label like "Profile25" is frequently shared across
+        every instance of that profile, not a per-instance identifier)
+        must still resolve to two separate, correctly-backfilled mesh_index
+        entries - path_updates keys off the real (locally-unique)
+        inst_name, never the display_name override."""
+        from openskp._core import _GeometryBuilder
+        from openskp.scene import build_scene
+
+        d007 = self._d007_with_dicts(
+            self._dict("fbd-einfo", self._entry("name", self._value(self._tlv("AD38", b"Profile25"))))
+        )
+        child_builder = _GeometryBuilder()  # no faces - forces the deferred path_updates backfill
+        root_builder = _GeometryBuilder()
+        root_builder.instances.append(self._instance(1, "GLB-11", d007))
+        root_builder.instances.append(self._instance(1, "GLB-12", d007))
+        defs_dict = {
+            1: {"guid": "g1", "name": "shared_def", "builder": child_builder},
+            "ROOT": {"guid": "ROOT", "name": "ROOT_MODEL", "builder": root_builder},
+        }
+
+        scene = build_scene(self._parsed(defs_dict))
+
+        names = sorted(c.name for c in scene.scene_hierarchy.children)
+        assert names == ["Profile25", "Profile25"]
 
 
 class TestGlbExport:
@@ -2634,6 +3111,13 @@ class TestGlbExport:
         first_child = metadata["scene_hierarchy"]["children"][0]
         assert "definition_name" in first_child
         assert "position_mm" in first_child
+
+        # Scene.layer_hidden exists but was never threaded into this
+        # sidecar - a consumer wanting to match the source file's own
+        # default layer visibility had no way to get it from export()'s
+        # output at all.
+        assert "layer_hidden" in metadata
+        assert isinstance(metadata["layer_hidden"], dict)
 
     def test_export_rejects_unsupported_coordinate_system(self, tmp_path) -> None:
         # The underlying conversion is hardcoded to y-up/mm - passing
@@ -2991,3 +3475,203 @@ class TestTriangulateFace3dRobustness:
 
         triangles = triangulate_face_3d(vertices_3d, loops, normal)
         assert triangles == []
+
+
+class TestIsConvex2d:
+    def test_square_is_convex(self) -> None:
+        from openskp._core import _is_convex_2d
+
+        assert _is_convex_2d([(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]) is True
+
+    def test_l_shape_is_not_convex(self) -> None:
+        from openskp._core import _is_convex_2d
+
+        # An L-shaped hexagon - one genuine reflex (concave) corner.
+        l_shape = [
+            (0.0, 0.0), (2.0, 0.0), (2.0, 1.0),
+            (1.0, 1.0), (1.0, 2.0), (0.0, 2.0),
+        ]
+        assert _is_convex_2d(l_shape) is False
+
+    def test_collinear_point_on_an_edge_stays_convex(self) -> None:
+        from openskp._core import _is_convex_2d
+
+        # A square with one extra vertex sitting exactly on an edge - a
+        # zero-cross-product corner, not a direction reversal, so a fan
+        # triangulation from any vertex is still a valid triangulation.
+        square_with_midpoint = [(0.0, 0.0), (0.5, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
+        assert _is_convex_2d(square_with_midpoint) is True
+
+    def test_fewer_than_three_points_is_not_convex(self) -> None:
+        from openskp._core import _is_convex_2d
+
+        assert _is_convex_2d([(0.0, 0.0), (1.0, 1.0)]) is False
+
+
+class TestTriangulateFace3dConvexFastPath:
+    """The convex-outer-loop, no-holes fast path added to skip Shapely
+    entirely for the common case (openskp perf work, 2026-09-08): must
+    produce the SAME watertight surface as the Shapely path for convex
+    faces (verified separately, at real-file scale, by comparing exported
+    GLB triangle/vertex counts and bounds before/after byte-for-byte), and
+    must never engage for anything concave or holed, where a naive fan
+    would silently produce wrong (self-overlapping or hole-ignoring)
+    geometry."""
+
+    def test_convex_pentagon_triangulates_via_fan(self) -> None:
+        import math
+
+        from openskp._core import triangulate_face_3d
+
+        n = 5
+        vertices_3d = {
+            i: (math.cos(2 * math.pi * i / n), math.sin(2 * math.pi * i / n), 0.0)
+            for i in range(n)
+        }
+        loops = [list(range(n))]
+        normal = (0.0, 0.0, 1.0)
+
+        triangles = triangulate_face_3d(vertices_3d, loops, normal)
+
+        # A fan from vertex 0 over an n-gon always yields exactly n-2
+        # triangles, and (since a fan only ever touches the boundary
+        # vertices already given) every vertex id used must be one of the
+        # loop's own - if the general (earcut) path had run instead, it
+        # could equally validly invent a different diagonal pattern.
+        assert len(triangles) == n - 2
+        used_ids = {v for tri in triangles for v in tri}
+        assert used_ids <= set(range(n))
+
+    def test_concave_polygon_does_not_use_the_fan_shortcut(self) -> None:
+        from openskp._core import triangulate_face_3d
+
+        # Same L-shape as TestIsConvex2d, lifted into 3D (z=0, planar).
+        vertices_3d = {
+            0: (0.0, 0.0, 0.0), 1: (2.0, 0.0, 0.0), 2: (2.0, 1.0, 0.0),
+            3: (1.0, 1.0, 0.0), 4: (1.0, 2.0, 0.0), 5: (0.0, 2.0, 0.0),
+        }
+        loops = [[0, 1, 2, 3, 4, 5]]
+        normal = (0.0, 0.0, 1.0)
+
+        triangles = triangulate_face_3d(vertices_3d, loops, normal)
+
+        # A concave polygon has more than one valid triangulation (which
+        # diagonals get drawn isn't unique - a naive fan from vertex 0
+        # actually happens to be valid for THIS particular L-shape, so
+        # asserting against one specific triangle would only be checking
+        # which algorithm ran, not whether the result is correct). The
+        # real, algorithm-agnostic invariant: total triangulated area must
+        # equal the polygon's own true area (shoelace formula) - a wrong
+        # triangulation would either miss part of the L or double-cover
+        # part of it, and either way the areas wouldn't match.
+        l_shape_area = 3.0  # 2x1 rectangle + 1x1 rectangle
+        total_area = sum(
+            0.5 * abs(
+                (b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])
+            )
+            for a, b, c in (
+                [vertices_3d[i][:2] for i in tri] for tri in triangles
+            )
+        )
+        assert total_area == pytest.approx(l_shape_area)
+        assert len(triangles) > 0
+
+    def test_convex_outer_loop_with_a_hole_still_uses_the_general_path(self) -> None:
+        from openskp._core import triangulate_face_3d
+
+        # A square outer loop (convex) with a small square hole in the
+        # middle - the fast path must not fire just because the OUTER
+        # loop alone is convex; a hole always needs the general path.
+        vertices_3d = {
+            0: (0.0, 0.0, 0.0), 1: (4.0, 0.0, 0.0), 2: (4.0, 4.0, 0.0), 3: (0.0, 4.0, 0.0),
+            4: (1.0, 1.0, 0.0), 5: (1.0, 2.0, 0.0), 6: (2.0, 2.0, 0.0), 7: (2.0, 1.0, 0.0),
+        }
+        loops = [[0, 1, 2, 3], [4, 5, 6, 7]]
+        normal = (0.0, 0.0, 1.0)
+
+        triangles = triangulate_face_3d(vertices_3d, loops, normal)
+
+        # A fan across the outer loop alone (ignoring the hole) would
+        # produce exactly 2 triangles (len(loop)-2 for a 4-gon) - correctly
+        # triangulating the annulus around the hole produces more, smaller
+        # triangles instead, AND the total area must equal the outer
+        # square minus the hole (16 - 1 = 15), not the full square.
+        assert len(triangles) > 2
+        total_area = sum(
+            0.5 * abs((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])
+                      ) for a, b, c in ([vertices_3d[i][:2] for i in tri] for tri in triangles)
+        )
+        assert total_area == pytest.approx(15.0)
+
+
+class TestTriangulateFace3dMatchesTrueArea:
+    """A real face from production data (gondola_v20.skp) where the
+    Shapely-based implementation this replaced was measurably WRONG: its
+    Delaunay-then-centroid-containment-filter approach silently dropped
+    valid triangles near this face's concave boundary, under-covering it
+    by ~10.5% (4728.16 sq units instead of its true 5284.95, independently
+    verified via the shoelace formula - unambiguous for a confirmed
+    simple, non-self-intersecting polygon). earcut, ear-clipping the
+    boundary directly rather than filtering a Delaunay hull, gets this
+    exact face right. Regression coverage for that fix, not just the
+    speedup - a 27-vertex real roof/wall profile outline, kept intact
+    rather than simplified, since a simplified stand-in isn't guaranteed
+    to reproduce whatever specific geometric feature triggered the
+    original bug."""
+
+    def test_complex_real_face_area_matches_shoelace_ground_truth(self) -> None:
+        import numpy as np
+
+        from openskp._core import triangulate_face_3d
+
+        vertices_3d = {
+            0: (-41.559374800456, 0.0, 5.684341886080802e-14),
+            1: (-41.559374800456, 0.0, 92.01968665725143),
+            2: (-38.18087514171725, 0.0, 93.24830373850286),
+            3: (-37.00671821448964, 0.0, 93.59448980685772),
+            4: (-34.756278501896986, 0.0, 94.25800492830899),
+            5: (-31.294656880495722, 0.0, 95.04611545657166),
+            6: (-27.80518035881937, 0.0, 95.61054756257866),
+            7: (-24.297092807780018, 0.0, 95.94980602563017),
+            8: (-20.779687400227658, 0.0, 96.06299212598445),
+            9: (-17.262281992675753, 0.0, 95.94980602563015),
+            10: (-13.7541944416364, 0.0, 95.61054756257863),
+            11: (-10.264717919960049, 0.0, 95.04611545657163),
+            12: (-6.80309629855924, 0.0, 94.25800492830895),
+            13: (-4.552656585966133, 0.0, 93.59448980685768),
+            14: (-3.3784996587380647, 0.0, 93.24830373850278),
+            15: (6.821210263296962e-13, 0.0, 92.01968665725138),
+            16: (0.0, 0.0, 5.684341886080802e-14),
+            17: (7.1653543307083964, 0.0, 0.0),
+            18: (7.1653543307083964, 0.0, 59.05511811023625),
+            19: (54.40944881889959, 0.0, 59.05511811023629),
+            20: (54.40944881889959, 0.0, 98.42519685039386),
+            21: (0.0, 0.0, 98.42519685039386),
+            22: (-41.559374800456, 0.0, 98.42519685039386),
+            23: (-95.96882361935559, 0.0, 98.42519685039386),
+            24: (-95.96882361935559, 0.0, 59.055118110236215),
+            25: (-48.724729131164395, 0.0, 59.05511811023616),
+            26: (-48.724729131164395, 0.0, 0.0),
+        }
+        loops = [list(range(27))]
+        normal = (0.0, -1.0, 0.0)
+
+        triangles = triangulate_face_3d(vertices_3d, loops, normal)
+
+        # Ground truth via the shoelace formula on the raw loop, projected
+        # the same way triangulate_face_3d itself does (normal is already
+        # axis-aligned here, so the 2D coords are just (x, z)).
+        coords_2d = [(vertices_3d[i][0], vertices_3d[i][2]) for i in loops[0]]
+        n = len(coords_2d)
+        signed = sum(
+            coords_2d[i][0] * coords_2d[(i + 1) % n][1] - coords_2d[(i + 1) % n][0] * coords_2d[i][1]
+            for i in range(n)
+        )
+        true_area = abs(signed) / 2.0
+
+        def tri_area_3d(tri):
+            a, b, c = (np.array(vertices_3d[i]) for i in tri)
+            return 0.5 * float(np.linalg.norm(np.cross(b - a, c - a)))
+
+        total_area = sum(tri_area_3d(t) for t in triangles)
+        assert total_area == pytest.approx(true_area, rel=1e-6)

@@ -734,15 +734,24 @@ def _strict_next_tag(ar, data, at, allow_null=True) -> bool:
 
 def _read_constructionline(ar, r):
     _preamble(ar, r)
-    _drawbase(ar, r)
-    r.f64s(3)
-    r.f64s(3)
-    r.f64s(2)                        # line params (±~4.4e29 = infinite)
+    db = _drawbase(ar, r)
+    point = r.f64s(3)
+    direction = r.f64s(3)
+    # Signed distance along `direction` from `point` marking where the
+    # visible segment starts/ends - ground truth (real SketchUp 2025,
+    # SDK/Ruby cross-checked, 2026-09): a bounded segment's start/end
+    # exactly equal `point`/`direction` scaled by these two parameters
+    # (verified against Sketchup::ConstructionLine#start/#end/#direction
+    # byte-for-byte, including the segment LENGTH as end_param); an
+    # unbounded direction uses a ±1e30 sentinel, matching
+    # Sketchup::ConstructionLine#start/#end returning nil for that side.
+    start_param, end_param = r.f64s(2)
     # The trailing block varies by the WRITING BUILD, not cleanly by
     # version: 7 bytes on the v17 calibration corpus, 4 on v16 and on a
-    # real v18, 0 on another real v17. Self-calibrate on the first guide
-    # line of the file — the length that lands on a legitimate next tag
-    # (strict forms only) — and cache it for the rest of the file.
+    # real v18, 0 on another real v17 (also 0 on a real SketchUp 2025
+    # build). Self-calibrate on the first guide line of the file — the
+    # length that lands on a legitimate next tag (strict forms only) — and
+    # cache it for the rest of the file.
     k = getattr(ar, '_cline_tail', None)
     if k is None:
         default = 7 if ar.ver == 17 else 4
@@ -762,15 +771,22 @@ def _read_constructionline(ar, r):
             k = default
         ar._cline_tail = k
     r.raw(k)
-    return {'k': 'cline'}
+    huge = 1e20  # well below the real ±1e30 sentinel, far above any real geometry extent
+    start = None if abs(start_param) >= huge else tuple(
+        point[i] + direction[i] * start_param for i in range(3))
+    end = None if abs(end_param) >= huge else tuple(
+        point[i] + direction[i] * end_param for i in range(3))
+    return {'k': 'cline', 'db': db, 'point': tuple(point),
+            'direction': tuple(direction), 'start': start, 'end': end}
 
 
 def _read_constructionpoint(ar, r):
     _preamble(ar, r)
     db = _drawbase(ar, r)
     pos = r.f64s(3)
-    r.f64s(3)
-    r.u8()
+    r.f64s(3)  # reserved/unused (observed all-zero, real SDK ground truth 2026-09) - no
+               # corresponding Sketchup::ConstructionPoint property to name it after
+    r.u8()     # reserved/unused (observed 0)
     return {'k': 'cpoint', 'db': db, 'pos': pos}
 
 
@@ -799,6 +815,120 @@ def _read_skfont(ar, r):
     r.utf16()
     r.raw(15)
     return {'k': 'font'}
+
+
+# ── pages (scenes) ──────────────────────────────────────────────────────
+#
+# CViewPage's full record embeds a camera, an optional thumbnail image, a
+# font, and — whenever any of its several independent "use_*" capture
+# flags beyond hidden-layers is set — an entire Style sub-object with no
+# documented fixed size. Reverse engineering that is out of scope, matching
+# this project's existing CCamera precedent, so only the narrow case is
+# supported: a page whose captured flags are exactly the baseline (nothing
+# captured) or baseline + hidden-layers. Ground truth for both was captured
+# from real v17-native SketchUp saves; ``_PAGE_ALLOWED_FLAGS`` and the
+# 0x20 hidden-layers bit are empirical, not documented by SketchUp.
+_PAGE_ALLOWED_FLAGS = (0xc00, 0xc20)
+_PAGE_HIDDEN_LAYERS_BIT = 0x20
+
+
+def _skip_typed_ref(ar, r, cls_name, reader_fn):
+    """Consume one reference to an object of *cls_name* — a null tag, a
+    back-ref (value unneeded here, so left unresolved), a class-ref to an
+    already-declared class, or (rarely, if this is the class's first use
+    in the file) a fresh declaration — without relying on the referenced
+    object's slot already being known to *ar* the way ``ar.read_object``
+    requires. The page scan below runs over a region of the file the main
+    walk never visits, so back-refs into that region can't be resolved."""
+    tag = r.peek_u16()
+    if tag == 0:
+        r.u16()
+        return
+    if tag == 0xFFFF:
+        r.u16()
+        schema = r.u16()
+        namelen = r.u16()
+        if namelen > 40:
+            raise LegacyParseError("implausible class name length")
+        name = r.raw(namelen).decode('ascii')
+        if name != cls_name:
+            raise LegacyParseError(f"expected {cls_name} decl, got {name}")
+        if cls_name not in ar.class_slot:
+            ar.class_slot[cls_name] = ar.alloc(('class', cls_name, schema))
+        reader_fn(ar, r)
+        return
+    if tag & 0x8000:
+        cslot = tag & 0x7FFF
+        ent = ar.slots.get(cslot)
+        if not (ent and ent[0] == 'class' and ent[1] == cls_name):
+            raise LegacyParseError(f"unexpected {cls_name} class-ref")
+        r.u16()
+        reader_fn(ar, r)
+        return
+    r.u16()   # plain back-ref — the referenced value isn't needed here
+
+
+def _scan_pages(data: bytes, ar) -> list:
+    """Best-effort scan for CViewPage (scene) records: name + hidden-layer
+    slot ids only, for the narrow flag combinations this reader
+    understands (see ``_PAGE_ALLOWED_FLAGS`` above).
+
+    This runs as an independent scan over the file tail (from where the
+    main entity walk stops) rather than as a sequential archive read:
+    each candidate is validated by its own local structure (a name string
+    immediately followed by an empty second string and a recognized flags
+    word) and any candidate that doesn't fully validate — an unsupported
+    flag combination, or a reference into a part of the file this scan
+    never visited — is silently skipped rather than guessed at, so a page
+    this reader can't fully understand is just absent from the result
+    instead of producing wrong data.
+    """
+    pages = []
+    pos = ar.r.pos
+    n = len(data)
+    while True:
+        idx = data.find(_STR_MARKER, pos)
+        if idx == -1:
+            break
+        pos = idx + 1
+        nlen_pos = idx + 3
+        if nlen_pos >= n:
+            break
+        nlen = data[nlen_pos]
+        if nlen == 0 or nlen > 40:
+            continue
+        name_start = nlen_pos + 1
+        name_end = name_start + 2 * nlen
+        if name_end + 7 > n:
+            continue
+        if data[name_end:name_end + 3] != _STR_MARKER or data[name_end + 3] != 0:
+            continue                                  # second name must be empty
+        flags_pos = name_end + 4
+        flags = struct.unpack_from('<I', data, flags_pos)[0]
+        if flags not in _PAGE_ALLOWED_FLAGS:
+            continue
+        name = data[name_start:name_end].decode('utf-16-le', errors='replace')
+        try:
+            r = _R(data, flags_pos + 4)
+            _skip_typed_ref(ar, r, 'CCamera', _read_camera)
+            _skip_typed_ref(ar, r, 'CDib', _read_dib)
+            hidden_ids = []
+            if flags & _PAGE_HIDDEN_LAYERS_BIT:
+                while True:
+                    save = r.pos
+                    v = r.u16()
+                    ent = ar.slots.get(v)
+                    if ent and ent[0] == 'obj' and ent[1] == 'CLayer':
+                        hidden_ids.append(v)
+                    else:
+                        r.pos = save
+                        break
+                if r.u32() != 1:
+                    raise LegacyParseError("unexpected hidden-layers marker")
+        except (LegacyParseError, struct.error, IndexError):
+            continue
+        pages.append({'name': name, 'hidden_layer_ids': hidden_ids})
+    return pages
 
 
 def _entity_ref(ar, r):
@@ -1352,6 +1482,8 @@ class _Builder:
         self.section_planes = []
         self.texts = []
         self.dimensions = []
+        self.construction_lines = []
+        self.construction_points = []
 
 
 def _fill_builder(builder, ents, slots):
@@ -1455,6 +1587,17 @@ def _fill_builder(builder, ents, slots):
             if len(pts) == 2 and pts[0] and pts[1]:
                 dim['a'], dim['b'] = pts[0], pts[1]
             builder.dimensions.append(dim)
+        elif k == 'cline':
+            builder.construction_lines.append({
+                'point': v.get('point', (0.0, 0.0, 0.0)),
+                'direction': v.get('direction', (1.0, 0.0, 0.0)),
+                'start': v.get('start'),
+                'end': v.get('end'),
+            })
+        elif k == 'cpoint':
+            builder.construction_points.append({
+                'position': v.get('pos', (0.0, 0.0, 0.0)),
+            })
 
 
 def _add_edge(builder, slot, e, slots):
@@ -1584,6 +1727,11 @@ def full_parse_legacy(skp_path: str) -> Dict[str, Any]:
     defs_dict['ROOT'] = {'guid': 'ROOT', 'name': 'ROOT_MODEL',
                          'builder': root_builder}
 
+    try:
+        pages = _scan_pages(data, ar)
+    except (LegacyParseError, struct.error, IndexError):
+        pages = []
+
     logger.info(
         "Parse complete: %s (%d defs, %.2fs)",
         skp_path, len(defs_dict), time.monotonic() - t0,
@@ -1601,6 +1749,7 @@ def full_parse_legacy(skp_path: str) -> Dict[str, Any]:
         'materials_by_folder': {},
         'defs_dict': defs_dict,
         'elements': [],
+        'pages': pages,
         'thumbnail_data': None,
         'styles': [],
         # Legacy (pre-2021 MFC) files carry no meta/meta.dat container -

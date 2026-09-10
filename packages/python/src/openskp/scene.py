@@ -19,10 +19,11 @@ them.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from array import array
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from . import _core
 from ._face_groups import FaceGroupContext, build_local_face_groups
@@ -38,17 +39,45 @@ _PROGRESS_INTERVAL = 500
 INCHES_TO_MM = 25.4
 INCHES_TO_M = 0.0254
 
+# See openskp.instanced_scene._is_generic_definition_name - same pattern,
+# duplicated rather than cross-imported since instanced_scene.py already
+# imports from this module and a name-resolution helper isn't worth a
+# shared-utility module of its own for one regex.
+_GENERIC_DEFINITION_NAME_RE = re.compile(r"^(?:Group|Component)\d*#\d+$")
+
+
+def _is_generic_definition_name(name: str) -> bool:
+    return bool(_GENERIC_DEFINITION_NAME_RE.match(name))
+
 
 @dataclass
 class InstanceNode:
     """One node in the baked, world-space instance tree."""
 
     name: str = ""
+    # See openskp.instanced_scene.InstancedNode.name_is_generated - same
+    # meaning: True when `name` is a fallback this project generated,
+    # rather than a real name from the source file.
+    name_is_generated: bool = False
     definition_name: str = ""
     layer: str = ""
     position_mm: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     properties: Dict[str, str] = field(default_factory=dict)
+    # Every OTHER attribute dictionary this instance carries, keyed by the
+    # dictionary's own name, values stringified the same way `properties`
+    # already is - `properties` stays exactly SketchUp's own Dynamic
+    # Components data (`dynamic_attributes`) for backward compatibility;
+    # third-party plugins (BIM/steel-detailing tools, etc.) commonly
+    # attach their own richer per-instance data under their own dictionary
+    # name instead, which this project never surfaced before.
+    attribute_dictionaries: Dict[str, Dict[str, str]] = field(default_factory=dict)
     children: List["InstanceNode"] = field(default_factory=list)
+    # Same full-path string that scoping instance's own meshes (and every
+    # nested descendant's meshes) carry as MeshMetadata.path - lets a
+    # consumer (e.g. export/ifc.py's assembly grouping) correlate a flat
+    # GlbPrimitive back to its owning tree node by exact string match,
+    # without re-deriving SketchUp's own name-resolution/override rules.
+    path: str = ""
 
 
 @dataclass
@@ -61,6 +90,8 @@ class MeshMetadata:
     layer: str = ""
     position_mm: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     properties: Dict[str, str] = field(default_factory=dict)
+    # See InstanceNode.attribute_dictionaries.
+    attribute_dictionaries: Dict[str, Dict[str, str]] = field(default_factory=dict)
     path: str = ""
 
 
@@ -135,6 +166,13 @@ class Scene:
     # textures=True)) - most callers just want geometry, and photographic
     # textures can multiply file size.
     textures: List[SceneTexture] = field(default_factory=list)
+    # Each layer's own visibility checkbox in SketchUp (the parsed file's
+    # own "layer_hidden", keyed by layer name) - independent of whether any
+    # placed geometry on that layer ended up in glb_primitives. Consumers
+    # that expose a layer list (e.g. the IFC exporter's IfcPresentationLayerWithStyle.LayerOn)
+    # use this to match SketchUp's own on/off state instead of always
+    # defaulting every layer to visible.
+    layer_hidden: Dict[str, bool] = field(default_factory=dict)
 
 
 def _sniff_image_mime(data: bytes) -> Optional[str]:
@@ -147,7 +185,10 @@ def _sniff_image_mime(data: bytes) -> Optional[str]:
     return None
 
 
-def build_scene(parsed: Dict[str, Any]) -> Scene:
+def build_scene(
+    parsed: Dict[str, Any],
+    name_override_keys: Sequence[str] = ("name", "label", "code"),
+) -> Scene:
     """Bake every instance actually placed in ``parsed`` (the output of
     :func:`openskp._core.full_parse` / ``full_parse_legacy``) into
     world-space, triangulated mesh data.
@@ -157,6 +198,15 @@ def build_scene(parsed: Dict[str, Any]) -> Scene:
             this by calling :meth:`SkpFile.parse` first is *not* required -
             :meth:`SkpFile.build_scene` re-runs the raw parse independently,
             so a plain ``parse()`` call never carries this cost.
+        name_override_keys: Attribute-dictionary key names (checked in
+            order, first match wins) that identify an instance's real,
+            plugin-assigned name - tried across every non-boilerplate
+            dictionary the instance carries, whichever third-party plugin
+            (FrameBuilder, TechSteel, or any other SketchUp extension that
+            attaches its own attribute dictionary) wrote it, not a specific
+            plugin's own dictionary name. The default covers the common
+            convention; pass your own tuple to also recognize a plugin
+            that instead uses e.g. ``"mark"`` or ``"partNumber"``.
 
     Returns:
         A populated :class:`Scene`.
@@ -184,7 +234,7 @@ def build_scene(parsed: Dict[str, Any]) -> Scene:
     # match the wrong meshes (a shallow instance's path is always a string
     # prefix of every deeper descendant's path too, so "in" matched far
     # more than intended - see openskp#240).
-    path_updates: Dict[str, Tuple[Dict[str, str], str]] = {}
+    path_updates: Dict[str, Tuple[Dict[str, str], str, Dict[str, Dict[str, str]]]] = {}
 
     # Textures deduplicated by bytes: the same image routinely backs
     # several materials, and re-embedding it per material would multiply
@@ -406,6 +456,8 @@ def build_scene(parsed: Dict[str, Any]) -> Scene:
             # this stays {} for them and gets overwritten below via the
             # D007/DC05 TLV walk instead.
             properties: Dict[str, str] = dict(inst.get("properties") or {})
+            attribute_dicts: Dict[str, Dict[str, str]] = {}
+            name_override: Optional[str] = None
 
             d007 = next((c for c in inst["children"] if c["tag"] == "D007"), None)
             if d007:
@@ -425,14 +477,51 @@ def build_scene(parsed: Dict[str, Any]) -> Scene:
                         inst_color = (c["r"], c["g"], c["b"])
 
                 try:
-                    properties = _core.extract_dynamic_properties(d007)
+                    all_dicts = _core.extract_attribute_dictionaries(d007)
+                    dynamic = all_dicts.get("dynamic_attributes", {})
+                    properties = {k: _core._stringify_vff_attr_value(v) for k, v in dynamic.items()}
+                    # Every other dictionary a third-party plugin (BIM
+                    # workflow, steel-detailing tool, ...) attached to
+                    # this specific instance - SU_InstanceSet is
+                    # SketchUp's own always-present, always-empty
+                    # Owner/Status boilerplate, not worth surfacing.
+                    for dict_name, entries in all_dicts.items():
+                        if dict_name in ("dynamic_attributes", "SU_InstanceSet"):
+                            continue
+                        attribute_dicts[dict_name] = {
+                            k: _core._stringify_vff_attr_value(v) for k, v in entries.items()
+                        }
+                        if name_override is None:
+                            for key in name_override_keys:
+                                val = entries.get(key)
+                                if val:
+                                    name_override = str(val)
+                                    break
                 except Exception:
                     logger.debug(
-                        "Failed to extract dynamic properties for instance %r (ref_idx=%r)",
+                        "Failed to extract attribute dictionaries for instance %r (ref_idx=%r)",
                         inst.get("name"), ref_idx, exc_info=True,
                     )
 
-            inst_name = inst["name"] or f"Component_{ref_idx}"
+            # inst_name (never overridden) is what keeps full_path_name -
+            # and so path_updates' own keys - locally unique: a plugin's
+            # "name"/"label" field (used for display_name below) is
+            # frequently a shared type/catalog label ("Profile25" for
+            # every instance of that profile), not a real per-instance
+            # identifier, and using it here would collide different
+            # instances' path_updates entries onto each other.
+            def_name = (defs_dict.get(ref_idx) or {}).get("name") or ""
+            # Same fallback order as openskp.instanced_scene: attribute-dict
+            # override, then the instance's own name, then the definition's
+            # own name if it's not itself an auto-generated "Group#1"-style
+            # placeholder, then finally the internal index.
+            inst_name = inst["name"] or (
+                def_name if def_name and not _is_generic_definition_name(def_name) else ""
+            ) or f"Component_{ref_idx}"
+            display_name = name_override or inst_name
+            name_is_generated = not (name_override or inst["name"] or (
+                def_name and not _is_generic_definition_name(def_name)
+            ))
             full_path_name = f"{path_name} / {inst_name}"
             instance_counter[0] += 1
             if instance_counter[0] % _PROGRESS_INTERVAL == 0:
@@ -452,16 +541,19 @@ def build_scene(parsed: Dict[str, Any]) -> Scene:
             tz = new_matrix[11] * INCHES_TO_MM if len(new_matrix) > 11 else 0.0
 
             inst_info = InstanceNode(
-                name=inst["name"] or "",
-                definition_name=(defs_dict.get(ref_idx) or {}).get("name") or "",
+                name=display_name,
+                name_is_generated=name_is_generated,
+                definition_name=def_name,
                 layer=l_name,
                 position_mm=(round(tx, 2), round(ty, 2), round(tz, 2)),
                 properties=properties,
+                attribute_dictionaries=attribute_dicts,
                 children=child_nodes,
+                path=full_path_name,
             )
             child_instances_info.append(inst_info)
 
-            path_updates[full_path_name] = (properties, inst["name"] or "")
+            path_updates[full_path_name] = (properties, display_name, attribute_dicts)
 
         return child_instances_info
 
@@ -481,7 +573,7 @@ def build_scene(parsed: Dict[str, Any]) -> Scene:
     # was exactly this bug (openskp#240).
     for existing in mesh_index.values():
         if existing.path in path_updates:
-            existing.properties, existing.name = path_updates[existing.path]
+            existing.properties, existing.name, existing.attribute_dictionaries = path_updates[existing.path]
 
     for geom_name, existing in mesh_index.items():
         if existing.path == "ROOT":
@@ -490,6 +582,7 @@ def build_scene(parsed: Dict[str, Any]) -> Scene:
             existing.layer = "Layer0"
             existing.position_mm = (0.0, 0.0, 0.0)
             existing.properties = {}
+            existing.attribute_dictionaries = {}
 
     scene_hierarchy = InstanceNode(
         name="ROOT",
@@ -498,6 +591,7 @@ def build_scene(parsed: Dict[str, Any]) -> Scene:
         position_mm=(0.0, 0.0, 0.0),
         properties={},
         children=root_children,
+        path="ROOT",
     )
 
     logger.info(
@@ -512,4 +606,5 @@ def build_scene(parsed: Dict[str, Any]) -> Scene:
         glb_primitives=glb_primitives,
         gltf_materials=gltf_materials,
         textures=textures,
+        layer_hidden=dict(parsed.get("layer_hidden") or {}),
     )

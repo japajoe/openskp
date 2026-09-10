@@ -73,10 +73,13 @@ static Definition definition(EntityId id, RawDefinition&& r) {
   }
   for (auto& i : r.builder.instances)
     d.instances.push_back({std::move(i.name), i.ref_idx, std::move(i.ref_guid), std::move(i.matrix),
-                           std::move(i.layer), std::move(i.properties), i.material_id, i.hidden});
+                           std::move(i.layer), std::move(i.properties),
+                           std::move(i.attribute_dicts), i.material_id, i.hidden});
   d.section_planes = std::move(r.builder.section_planes);
   d.texts = std::move(r.builder.texts);
   d.dimensions = std::move(r.builder.dimensions);
+  d.construction_lines = std::move(r.builder.construction_lines);
+  d.construction_points = std::move(r.builder.construction_points);
   return d;
 }
 
@@ -99,10 +102,12 @@ SkpModel build_model(RawParsed&& p, const ParseOptions& o) {
   }
   resolve_layers(p.root);
   m.root_ = definition(0, std::move(p.root));
-  for (auto& l : p.layer_colors) {
-    auto hidden_it = p.layer_hidden.find(l.first);
+  for (auto& name : p.layer_order) {
+    auto color_it = p.layer_colors.find(name);
+    if (color_it == p.layer_colors.end()) continue;
+    auto hidden_it = p.layer_hidden.find(name);
     bool hidden = hidden_it != p.layer_hidden.end() && hidden_it->second;
-    m.layers.push_back({l.first, l.second, hidden});
+    m.layers.push_back({name, color_it->second, hidden});
   }
   // Convert pages (saved scenes) - hidden layer ids resolve to names;
   // unknown ids (stale refs) are dropped.

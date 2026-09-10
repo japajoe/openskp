@@ -26,6 +26,7 @@ others, that's stated plainly rather than smoothed over.
 - [Observability: progress and errors](#observability)
 - [Error handling](#error-handling)
 - [Export capabilities](#export-capabilities)
+  - [Fragments export](#fragments-export) — Python only, not on PyPI yet
 - [Write capabilities](#write-capabilities)
 - [The web viewer](#the-web-viewer)
 - [Known cross-language differences](#known-cross-language-differences)
@@ -408,6 +409,102 @@ OBJ variant — say, with per-primitive groups or vertex normals the
 built-in writer omits — is only a short loop over `scene.glbPrimitives`
 away in any language, but the built-in exporters above cover the common
 case without writing that loop yourself.
+
+### Fragments export
+
+> **Python and C++ only, neither on a package registry yet.** See
+> [ROADMAP.md](../ROADMAP.md#cross-language-porting-backlog) for TypeScript/
+> .NET/Dart's status and
+> [docs/LANGUAGE_PARITY.md](LANGUAGE_PARITY.md) for the full parity picture.
+> Install Python with:
+> ```bash
+> pip install "openskp[fragments] @ git+https://github.com/iamahsanmehmood/openskp.git@preview-python-v1.3.2#subdirectory=packages/python"
+> ```
+> Build C++ from the [`preview-cpp-v1.3.1`](https://github.com/iamahsanmehmood/openskp/releases/tag/preview-cpp-v1.3.1)
+> tag — check it out directly and follow the C++17/CMake Quick Start in
+> [README.md](../README.md) (`find_package(OpenSkp CONFIG REQUIRED)`). C++
+> measured roughly 5-9x faster end to end than the Python pipeline on the
+> same real files (parse + scene build + export).
+
+`openskp.export.fragments` / `openskp::to_fragments()` write [ThatOpen's Fragments](https://github.com/ThatOpen/engine_fragment)
+format — a public FlatBuffers-based binary format designed for fast loading
+in BIM web viewers (`@thatopen/fragments`) — directly from an
+`InstancedScene`, with no IFC intermediate step:
+
+```python
+from openskp import SkpFile
+from openskp.export import fragments
+
+skp = SkpFile.open("model.skp")
+scene = skp.build_instanced_scene()
+
+fragments.export(scene, "output.frag")          # writes the file directly
+data = fragments.to_fragments(scene, raw=True)   # or get the raw flatbuffer bytes
+```
+
+Requires the optional `fragments` extra (`pip install openskp[fragments]`,
+pulls in `flatbuffers>=24.0`). `raw=False` (the default) produces the
+zlib-compressed container `@thatopen/fragments` expects from a file on disk;
+`raw=True` returns the uncompressed flatbuffer directly, matching how the
+loader auto-detects either.
+
+```cpp
+#include <openskp/openskp.hpp>
+
+auto skp = openskp::SkpFile::open("model.skp");
+auto scene = skp.build_instanced_scene();
+
+openskp::export_fragments(scene, "output.frag");          // writes the file directly
+auto data = openskp::to_fragments(scene, /*raw=*/true);    // or get the raw flatbuffer bytes
+```
+
+No extra CMake dependency needed — FlatBuffers is already one of the three
+`FetchContent`-fetched dependencies (alongside miniz and TinyGLTF) the C++
+package pulls in for every build. Same `raw` semantics as Python's
+`to_fragments()`.
+
+What's carried through from the source `.skp` file:
+
+- **Real nested spatial hierarchy** — matches the source file's own
+  component nesting (a component with both its own geometry and a nested
+  sub-component instance gets both correctly represented), not a flattened
+  list.
+- **Display names** — the same name-resolution priority
+  `build_instanced_scene()` already uses (third-party plugin attribute
+  dictionaries' `name`/`label`/`code`, falling back to the component
+  definition name), written in the same `["Name", value, "STRING"]`
+  attribute convention the real `IfcImporter` uses for its own name field —
+  so a viewer that already knows how to read an IFC-derived `.frag` file's
+  names reads a directly-exported one the same way.
+- **Per-item GUIDs** — the source file's real per-instance SketchUp GUID
+  when available (VFF/2021+ files' `6819` tag), a stable synthetic GUID
+  otherwise (legacy pre-2021 files have no equivalent field to read).
+- **Non-unit scale and mirrored instances** — baked directly into the
+  geometry (Fragments' `Transform` struct has no scale field at all, unlike
+  glTF), with shells still deduplicated by `(resource, primitive, baked
+  scale)` so instances sharing the same non-unit scale still share geometry.
+- **Per-layer default visibility** — via a `Model.metadata` JSON sidecar
+  (see the callout below — this is *not* part of the public Fragments
+  schema).
+
+**Known limitations, stated plainly, not glossed over:**
+
+- The Fragments schema has no native visibility field anywhere. There is no
+  way to make this "just read the file correctly" — any consumer needs to
+  know to read `Model.metadata`'s JSON for per-layer hidden state, a
+  convention this project defined for this purpose, not a public part of
+  the format.
+- `Model.guid` — the single model-level identifier, distinct from each
+  item's own per-instance guid above — is still an unpopulated placeholder.
+- Python and C++ have this today (both GitHub-only preview tags — see
+  above). A community TypeScript port is open
+  ([PR #276](https://github.com/iamahsanmehmood/openskp/pull/276)) but its
+  required CI lint check is currently failing, so it isn't usable yet.
+  .NET and Dart have no work started on this.
+- C++'s attribute dictionary values are strings only (no native
+  `Point3d`/`Length`/nested-list types like Python has) — matches its
+  existing string-only property handling elsewhere. See
+  [docs/LANGUAGE_PARITY.md](LANGUAGE_PARITY.md).
 
 ## Write capabilities
 

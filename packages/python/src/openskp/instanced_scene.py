@@ -21,10 +21,11 @@ world-space copies.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from array import array
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from . import _core
 from ._face_groups import FaceGroupContext, build_local_face_groups
@@ -43,6 +44,17 @@ IDENTITY_GLTF: Tuple[float, ...] = (
     0.0, 0.0, 1.0, 0.0,
     0.0, 0.0, 0.0, 1.0,
 )
+
+# SketchUp's own auto-generated placeholder pattern for an unnamed
+# component/group definition ("Group#1", "Component#12", "Group86#2" for a
+# nested one) - never something a person actually typed. Used to decide
+# whether a definition's own name is worth falling back to, or just as
+# uninformative as the internal index it would otherwise fall back to.
+_GENERIC_DEFINITION_NAME_RE = re.compile(r"^(?:Group|Component)\d*#\d+$")
+
+
+def _is_generic_definition_name(name: str) -> bool:
+    return bool(_GENERIC_DEFINITION_NAME_RE.match(name))
 
 
 @dataclass
@@ -94,14 +106,31 @@ class InstancedNode:
     """
 
     name: str = ""
+    # True when `name` is a fallback this project generated (no real name
+    # anywhere - no attribute-dict override, no instance name, no
+    # meaningfully-named definition) rather than something a person or a
+    # plugin actually named. A consumer can use this to render such nodes
+    # distinctly (greyed out, routed to an "Uncategorized" bucket) instead
+    # of presenting a synthetic placeholder as if it were real data.
+    name_is_generated: bool = False
     definition_name: str = ""
     layer: str = ""
+    # This instance's own persistent GUID (a real one from the source SKP
+    # file when available - modern/VFF files carry a genuine 16-byte
+    # instance GUID per placement, see openskp._core's '6819' tag; legacy
+    # (pre-2021) files don't currently expose one, so this is "" for them).
+    # Never used for geometry/placement - purely an identity string a
+    # consumer (e.g. a Fragments-format exporter) can carry through so a
+    # clicked/selected element has something stable to key off of.
+    guid: str = ""
     # This node's transform RELATIVE TO ITS PARENT, as a 16-element
     # column-major glTF matrix (metres, Y-up) - directly usable as a glTF
     # node `matrix`. The root node's matrix is the identity.
     matrix: Tuple[float, ...] = IDENTITY_GLTF
     position_mm: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     properties: Dict[str, str] = field(default_factory=dict)
+    # See openskp.scene.InstanceNode.attribute_dictionaries.
+    attribute_dictionaries: Dict[str, Dict[str, str]] = field(default_factory=dict)
     mesh_resource_id: Optional[str] = None
     children: List["InstancedNode"] = field(default_factory=list)
 
@@ -127,6 +156,11 @@ class InstancedScene:
     # Distinct texture images the placed materials use, deduplicated by
     # source bytes - same as Scene.textures.
     textures: List[SceneTexture]
+    # The source file's own per-layer visibility, keyed by layer name -
+    # same shape and source (parsed["layer_hidden"]) as Scene.layer_hidden;
+    # this was never threaded through here even after that fix landed for
+    # the baked path (openskp#272).
+    layer_hidden: Dict[str, bool] = field(default_factory=dict)
 
 
 def _to_gltf_matrix(m: List[float]) -> Tuple[float, ...]:
@@ -170,7 +204,10 @@ def _mul4(a: Tuple[float, ...], b: Tuple[float, ...]) -> Tuple[float, ...]:
     return tuple(out)
 
 
-def build_instanced_scene(parsed: Dict[str, Any]) -> InstancedScene:
+def build_instanced_scene(
+    parsed: Dict[str, Any],
+    name_override_keys: Sequence[str] = ("name", "label", "code"),
+) -> InstancedScene:
     """Build an instanced scene from already-parsed raw data.
 
     Walks the same placed scene graph as :func:`openskp.scene.build_scene`
@@ -181,6 +218,9 @@ def build_instanced_scene(parsed: Dict[str, Any]) -> InstancedScene:
     Args:
         parsed: Output of ``_core.full_parse()`` (same input as
             :func:`openskp.scene.build_scene`).
+        name_override_keys: See :func:`openskp.scene.build_scene` - same
+            meaning, same default, same generic (not tied to any one
+            plugin's own dictionary name) lookup.
 
     Returns:
         A populated :class:`InstancedScene`.
@@ -395,6 +435,8 @@ def build_instanced_scene(parsed: Dict[str, Any]) -> InstancedScene:
             l_name = parent_layer
             inst_color = inherited_color
             properties: Dict[str, str] = dict(inst.get("properties") or {})
+            attribute_dicts: Dict[str, Dict[str, str]] = {}
+            name_override: Optional[str] = None
 
             d007 = next((c for c in inst["children"] if c["tag"] == "D007"), None)
             if d007:
@@ -414,13 +456,44 @@ def build_instanced_scene(parsed: Dict[str, Any]) -> InstancedScene:
                         inst_color = (c["r"], c["g"], c["b"])
 
                 try:
-                    properties = _core.extract_dynamic_properties(d007)
+                    all_dicts = _core.extract_attribute_dictionaries(d007)
+                    dynamic = all_dicts.get("dynamic_attributes", {})
+                    properties = {k: _core._stringify_vff_attr_value(v) for k, v in dynamic.items()}
+                    # See openskp.scene.build_scene's identical loop for why
+                    # SU_InstanceSet is skipped and name/label/code take
+                    # priority as the display-name override.
+                    for dict_name, entries in all_dicts.items():
+                        if dict_name in ("dynamic_attributes", "SU_InstanceSet"):
+                            continue
+                        attribute_dicts[dict_name] = {
+                            k: _core._stringify_vff_attr_value(v) for k, v in entries.items()
+                        }
+                        if name_override is None:
+                            for key in name_override_keys:
+                                val = entries.get(key)
+                                if val:
+                                    name_override = str(val)
+                                    break
                 except Exception:
                     logger.debug(
-                        "Failed to extract dynamic properties for instance %r (ref_idx=%r)",
+                        "Failed to extract attribute dictionaries for instance %r (ref_idx=%r)",
                         inst.get("name"), ref_idx, exc_info=True,
                     )
 
+            def_name = (defs_dict.get(ref_idx) or {}).get("name") or ""
+            # Fallback order: an attribute-dict name/label/code override,
+            # then the instance's own explicit name, then the definition's
+            # own name IF it's not itself just SketchUp's auto-generated
+            # "Group#1"/"Component#12" placeholder (no more meaningful than
+            # the internal index below), then finally the internal index -
+            # the only case with no real name anywhere in the source file.
+            inst_name = inst["name"] or (
+                def_name if def_name and not _is_generic_definition_name(def_name) else ""
+            ) or f"Component_{ref_idx}"
+            display_name = name_override or inst_name
+            name_is_generated = not (name_override or inst["name"] or (
+                def_name and not _is_generic_definition_name(def_name)
+            ))
             instance_counter[0] += 1
             if instance_counter[0] % _PROGRESS_INTERVAL == 0:
                 logger.debug("Processed %d placed instances", instance_counter[0])
@@ -440,12 +513,15 @@ def build_instanced_scene(parsed: Dict[str, Any]) -> InstancedScene:
 
             nodes.append(
                 InstancedNode(
-                    name=inst["name"] or "",
-                    definition_name=(defs_dict.get(ref_idx) or {}).get("name") or "",
+                    name=display_name,
+                    name_is_generated=name_is_generated,
+                    definition_name=def_name,
                     layer=l_name,
                     matrix=_to_gltf_matrix(inst["matrix"]),
                     position_mm=(round(tx, 2), round(ty, 2), round(tz, 2)),
                     properties=properties,
+                    attribute_dictionaries=attribute_dicts,
+                    guid=inst.get("ref_guid") or "",
                     mesh_resource_id=mesh_resource_for(ref_idx, inst_color, l_name),
                     children=children,
                 )
@@ -555,4 +631,5 @@ def build_instanced_scene(parsed: Dict[str, Any]) -> InstancedScene:
         mesh_resources=mesh_resources,
         gltf_materials=gltf_materials,
         textures=textures,
+        layer_hidden=dict(parsed.get("layer_hidden") or {}),
     )

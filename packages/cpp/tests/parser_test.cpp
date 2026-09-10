@@ -118,8 +118,15 @@ TEST(Parser, ModernUntitled) {
   const auto w1 = std::find_if(model.root().instances.begin(), model.root().instances.end(),
                                [](const Instance& i) { return i.name == "W1"; });
   ASSERT_NE(w1, model.root().instances.end());
-  EXPECT_EQ(w1->properties.at("generator"), "SteelFramer::Engine::PanelGenerator");
-  EXPECT_EQ(w1->properties.at("profile"), "362S200-43");
+  // "generator"/"profile" live under this SteelFramer-authored file's own
+  // "steelframer-dict" dictionary, not SketchUp's "dynamic_attributes" -
+  // properties (the backward-compatible dynamic_attributes-only view) is
+  // correctly empty for this instance; attribute_dictionaries exposes
+  // every dictionary by its own name (openskp#254).
+  EXPECT_TRUE(w1->properties.empty());
+  const auto& steelframer = w1->attribute_dictionaries.at("steelframer-dict");
+  EXPECT_EQ(steelframer.at("generator"), "SteelFramer::Engine::PanelGenerator");
+  EXPECT_EQ(steelframer.at("profile"), "362S200-43");
 }
 
 TEST(Parser, ModernRootOnly) {
@@ -185,6 +192,19 @@ TEST(Parser, LegacyMatchesReference) {
   EXPECT_EQ(grada.faces.size(), 11);
   EXPECT_EQ(grada.edges.size(), 30);
   EXPECT_EQ(grada.vertices.size(), 20);
+
+  // Construction (guide) points - real data on this fixture, all on the
+  // root definition. No construction lines on this particular file.
+  // Cross-checked byte-for-byte against Python's own parse of the same
+  // fixture.
+  EXPECT_TRUE(model.root().construction_lines.empty());
+  ASSERT_EQ(model.root().construction_points.size(), 7);
+  EXPECT_NEAR(model.root().construction_points[0].position[0], -44.69836289477159, 1e-9);
+  EXPECT_NEAR(model.root().construction_points[0].position[1], 125.87449928268785, 1e-9);
+  EXPECT_NEAR(model.root().construction_points[0].position[2], 90.15748031496064, 1e-9);
+  EXPECT_NEAR(model.root().construction_points[6].position[0], 183.8551286073387, 1e-9);
+  EXPECT_NEAR(model.root().construction_points[6].position[1], 125.95096929693227, 1e-9);
+  EXPECT_NEAR(model.root().construction_points[6].position[2], 90.15748031496064, 1e-9);
 
   const std::set<std::string> expected_materials{
       "*1",
