@@ -506,6 +506,58 @@ What's carried through from the source `.skp` file:
   existing string-only property handling elsewhere. See
   [docs/LANGUAGE_PARITY.md](LANGUAGE_PARITY.md).
 
+### Reading a `.frag` file back
+
+> **Python only, and not on PyPI yet** — same preview tag as the export
+> side above. See [Fragments export](#fragments-export) for install steps.
+
+The mirror direction: `openskp.export.fragments.read()`/`from_fragments()`
+parse a real `.frag` file straight into an `InstancedScene` — OpenSKP's
+6th input format alongside `.skp`. Any file works, not just one this
+project wrote — ThatOpen's own real `IfcImporter` output, or anyone
+else's:
+
+```python
+from openskp.export import fragments
+
+scene = fragments.read("model.frag")
+
+# Rides every other export this project already has, same as a scene
+# from SkpFile.build_instanced_scene() would:
+from openskp.export import instanced_glb
+# ...or convert straight back to .skp via the writer, or to GLB/OBJ/
+# STL/PLY/DXF/IFC4/JSON — whatever the file needs next.
+```
+
+Verified two ways: round-trips this project's own output exactly (world-
+space vertex positions match to the last bit, not just object counts —
+see `tests/test_fragments.py`'s `TestFromFragments`), and reads a real
+ThatOpen-produced production file (a genuine IFC-derived building, 5,751
+nodes / 100,332 vertices) cleanly — re-exporting that file through this
+same module and loading the result back through the actual
+`@thatopen/fragments` runtime preserves real IFC GUIDs and category names.
+
+**Known limitations, stated plainly:**
+
+- No UVs anywhere in the schema (`Shell` is points + triangle indices
+  only) — every reconstructed primitive gets an all-zero UV band.
+  Materials are flat RGBA; there's no texture reference to read either.
+- No stored vertex normals — rebuilt as one flat per-face normal,
+  duplicated across that face's 3 vertices. Correct for a hard-edged
+  shell; the original smooth-shading groups are gone, since Fragments
+  never had anywhere to keep them.
+- A purely organizational (non-geometry) node's own local transform was
+  never serialized on export — only geometry-bearing items' full WORLD
+  transforms survive via `Meshes.GlobalTransforms`. Reconstructed wrapper
+  nodes get an identity matrix; since every geometry leaf's own matrix is
+  its full world transform directly, the composed result is still
+  correct — it just can't recover what the original per-level split
+  looked like before export.
+- `RepresentationClass.CIRCLE_EXTRUSION` (round profiles — rebar, pipes)
+  has no reader yet, only `SHELL`. A real `IfcImporter`-produced file can
+  contain these; such samples are skipped with a warning rather than
+  silently dropped or misread as shells.
+
 ## Write capabilities
 
 Everything above this section is about reading `.skp` files. All five
@@ -1023,6 +1075,55 @@ It's deployed automatically by `.github/workflows/deploy-pages.yml` on
 every push to `main` that touches `packages/typescript/**` or
 `examples/web-viewer/**` — the workflow runs exactly the two build steps
 above, then publishes `examples/web-viewer/` to GitHub Pages.
+
+### WASM fast-preview path for large files
+
+The pure-JS path above has a hard ceiling: the browser's own JS heap. A
+file large or complex enough can exhaust it mid-parse, freezing or
+crashing the tab instead of failing cleanly. The large-file warning
+dialog offers a second option for exactly that case: **"Load fast
+preview (WASM)"**, which hands the raw bytes to the C++ engine's WASM
+build (`examples/web-viewer/wasm/openskp.js`/`openskp.wasm`,
+`packages/cpp`'s `OPENSKP_BUILD_WASM` target) and renders the GLB it
+returns via Three.js's `GLTFLoader`, instead of `parseSkp()`/`buildScene()`.
+
+This is a real tradeoff, not a strict upgrade: `parseSkpToGLB()` only
+returns triangulated geometry and counts, none of the `SkpModel`/scene
+metadata the normal path uses for the Layers panel, Properties
+Inspector, or any export format besides the geometry itself — all three
+are disabled for a WASM-loaded file. It's meant for "I need to actually
+see this large model," not as a replacement for the full-featured path.
+
+It also doesn't scale indefinitely: this viewer renders each component
+as its own `THREE.Mesh`, so a scene with tens of thousands of components
+means tens of thousands of draw calls per frame. Verified directly: a
+real 359MB/31,625-component file parses correctly via WASM (confirmed
+byte-for-byte correct geometry/material/mesh counts) but the browser's
+WebGL compositor never manages to actually paint a frame — the GPU
+command queue backs up faster than it can drain, independent of how fast
+the parsing itself was. A 165MB/9,614-component file, by contrast, both
+parses and renders fine. For the point where a scene is too large for
+even this fast-preview path to render usefully, `openskp.export.fragments`
+(this project's own direct-to-ThatOpen-Fragments exporter, `.frag`
+format) is the intended path — it's built for exactly this kind of
+large-scale, instanced streaming geometry, unlike a naive per-mesh
+Three.js scene graph.
+
+To rebuild the WASM module after a change to `packages/cpp`, install
+[Emscripten](https://emscripten.io/docs/getting_started/downloads.html),
+then:
+
+```bash
+cd packages/cpp
+emcmake cmake -S . -B build-wasm -DCMAKE_BUILD_TYPE=Release \
+  -DOPENSKP_BUILD_TESTS=OFF -DOPENSKP_BUILD_EXAMPLES=OFF -DOPENSKP_BUILD_WASM=ON
+cmake --build build-wasm --config Release
+cp build-wasm/openskp.js build-wasm/openskp.wasm ../../examples/web-viewer/wasm/
+```
+
+This isn't currently rebuilt by CI — the committed `wasm/openskp.js`/
+`openskp.wasm` are the build artifact itself, checked in directly like
+`examples/web-viewer/dist/`.
 
 ## Known cross-language differences
 

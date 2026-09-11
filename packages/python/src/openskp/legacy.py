@@ -860,7 +860,16 @@ def _skip_typed_ref(ar, r, cls_name, reader_fn):
     if tag & 0x8000:
         cslot = tag & 0x7FFF
         ent = ar.slots.get(cslot)
-        if not (ent and ent[0] == 'class' and ent[1] == cls_name):
+        if ent is None:
+            # A class declared in a part of the file this scan never
+            # visited (this project's writer references CCamera's class
+            # this way, itself declared in the scaffold's own prefix,
+            # well before where the main walk even starts) — same
+            # "learn it from context" fallback _Archive._new_of_class
+            # already uses for the same situation.
+            ent = ('class', cls_name, None)
+            ar.slots[cslot] = ent
+        if not (ent[0] == 'class' and ent[1] == cls_name):
             raise LegacyParseError(f"unexpected {cls_name} class-ref")
         r.u16()
         reader_fn(ar, r)
@@ -1172,7 +1181,6 @@ def _read_definition(ar, r):
 
 
 def _read_instance(ar, r):
-    cls = ar.current_class
     pre = _preamble(ar, r)
     db = _drawbase(ar, r)
     ds, dn, _ = ar.read_object(r, expect='CComponentDefinition')
@@ -1180,12 +1188,30 @@ def _read_instance(ar, r):
         raise LegacyParseError(f"instance definition ref is {dn} {r.ctx()}")
     xf = r.f64s(13)
     name = r.utf16()
-    # the trailing instance GUID arrives with CComponentInstance schema 5 /
-    # CGroup schema 1; SketchUp 2013 writes CComponentInstance schema 4,
-    # which ends at the name
-    schema = ar.class_schema.get(cls)
-    min_schema = 1 if cls == 'CGroup' else 5
-    if schema is None or schema >= min_schema:
+    # The trailing instance GUID is a pre-2014 (ver < 14) thing, full stop -
+    # for BOTH CComponentInstance and CGroup, gated by real file version,
+    # not by the class's own schema number.
+    #
+    # The schema field looked plausible as a gate at first (SketchUp 2013
+    # writes CComponentInstance schema 4, which ends at the name - no
+    # GUID), but it doesn't generalize: a v7 file's root-level
+    # CComponentInstance reports schema 6, and a 2013 file's reports schema
+    # 6 as well - both well above the "5 means GUID present" threshold that
+    # comment assumed, yet neither actually carries one. Forcing the read
+    # anyway silently eats 16 bytes that belong to the START of the next
+    # root-level sibling's own tag, which doesn't raise - it just produces
+    # garbage from that point on, silently truncating the rest of the
+    # root entity list to whatever the corrupted bytes happen to decode as
+    # (confirmed on v7/v8/2013: root instance count dropped from the
+    # correct 18 to 1). CGroup has the same issue and was root-caused the
+    # same way (openskp#284): real files report schema 1 for it on every
+    # version tested (v3 through 2025), so schema can't distinguish old-
+    # from new-format CGroup there either, but forcing the GUID read on a
+    # pre-2014 CGroup eats into the next sibling's class-ref tag, producing
+    # "class-ref to non-class slot N (CAttributeNamed)" deep inside a
+    # nested definition. Both symptoms, one cause, one fix: gate on ver.
+    has_guid = ar.ver >= 14
+    if has_guid:
         guid = r.raw(16)
     else:
         guid = b''

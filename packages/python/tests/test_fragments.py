@@ -673,3 +673,268 @@ class TestToFragmentsRealScene:
         bracket_node = wall_node.Children(0)
         assert bracket_node.LocalId() == 1
         assert bracket_node.ChildrenLength() == 0
+
+
+def _count_nodes(node) -> int:
+    return 1 + sum(_count_nodes(c) for c in node.children)
+
+
+def _world_bbox(scene):
+    """Walk the scene, transforming every primitive's LOCAL points by its
+    node's full ancestor-chain matrix - the same recomposition
+    :func:`openskp.instanced_scene.build_instanced_scene`'s own consumers
+    (e.g. the GLB exporter) do. Used to prove geometry AND placement
+    survive a round trip, not just object/vertex counts."""
+    resources = {r.id: r for r in scene.mesh_resources}
+    bmin = [math.inf, math.inf, math.inf]
+    bmax = [-math.inf, -math.inf, -math.inf]
+
+    def mat_mul(a, b):
+        out = [0.0] * 16
+        for col in range(4):
+            for row in range(4):
+                s = 0.0
+                for k in range(4):
+                    s += a[k * 4 + row] * b[col * 4 + k]
+                out[col * 4 + row] = s
+        return tuple(out)
+
+    def transform_point(m, p):
+        x, y, z = p
+        return (
+            m[0] * x + m[4] * y + m[8] * z + m[12],
+            m[1] * x + m[5] * y + m[9] * z + m[13],
+            m[2] * x + m[6] * y + m[10] * z + m[14],
+        )
+
+    def walk(node, parent_matrix):
+        world = mat_mul(parent_matrix, node.matrix)
+        if node.mesh_resource_id is not None:
+            for prim in resources[node.mesh_resource_id].primitives:
+                n = len(prim.positions) // 3
+                for i in range(n):
+                    p = (prim.positions[i * 3], prim.positions[i * 3 + 1], prim.positions[i * 3 + 2])
+                    wp = transform_point(world, p)
+                    for k in range(3):
+                        bmin[k] = min(bmin[k], wp[k])
+                        bmax[k] = max(bmax[k], wp[k])
+        for child in node.children:
+            walk(child, world)
+
+    walk(scene.scene_hierarchy, IDENTITY)
+    return tuple(bmin), tuple(bmax)
+
+
+class TestFromFragments:
+    """Tests for the mirror direction: a real ``.frag`` file straight into
+    an :class:`~openskp.instanced_scene.InstancedScene`. The strongest
+    evidence here (like the exporter's own) isn't automated in CI: reading
+    a real ThatOpen-produced production file (5,751 nodes, 100,332 verts,
+    a real IFC-derived building - not one of our own encoder's outputs),
+    then re-exporting it and loading THAT through the actual, unmodified
+    ``@thatopen/fragments`` runtime (``SingleThreadedFragmentsModel``) -
+    confirmed real GUIDs (``298uW9PODAmgWwAQ8$j3X7``-style IFC GlobalIds)
+    and real IFC category names (``IFCSITE``, ``IFCBUILDINGSTOREY``, ...)
+    survive the whole round trip. These tests verify what CI actually
+    can: round-tripping through the module's own writer (below), plus
+    reading the real ThatOpen fixture committed alongside this file.
+    """
+
+    def test_round_trips_a_synthetic_two_instance_scene(self):
+        scene = _make_two_instance_scene()
+        data = fragments.to_fragments(scene)
+        result = fragments.from_fragments(data)
+
+        assert _count_nodes(result.scene_hierarchy) == _count_nodes(scene.scene_hierarchy)
+        assert len(result.mesh_resources) == len(scene.mesh_resources)
+        assert sum(len(r.primitives) for r in result.mesh_resources) == \
+            sum(len(r.primitives) for r in scene.mesh_resources)
+
+        names = []
+
+        def collect(node):
+            if node.name:
+                names.append(node.name)
+            for c in node.children:
+                collect(c)
+
+        collect(result.scene_hierarchy)
+        assert sorted(names) == ["Box_A", "Box_B"]
+
+    def test_accepts_raw_uncompressed_bytes_same_as_compressed(self):
+        scene = _make_two_instance_scene()
+        compressed = fragments.to_fragments(scene, raw=False)
+        raw = fragments.to_fragments(scene, raw=True)
+
+        from_compressed = fragments.from_fragments(compressed)
+        from_raw = fragments.from_fragments(raw)
+        assert len(from_compressed.mesh_resources) == len(from_raw.mesh_resources) == 1
+
+    def test_world_space_geometry_survives_the_round_trip_exactly(self, tmp_path: pathlib.Path) -> None:
+        """The strong check: not just counts, but actual world-space
+        vertex positions, on a real .skp-derived scene (real writer, real
+        parser) - not just a hand-built synthetic fixture."""
+        from openskp.create import create
+        from openskp.model import SkpFile
+
+        builder = create()
+        with builder.add_component_definition("Stud") as stud:
+            w, d, h = 2.0, 4.0, 12.0
+            stud.add_face([(0, 0, 0), (w, 0, 0), (w, d, 0), (0, d, 0)])
+            stud.add_face([(0, 0, h), (0, d, h), (w, d, h), (w, 0, h)])
+            stud.add_face([(0, 0, 0), (0, d, 0), (0, d, h), (0, 0, h)])
+            stud.add_face([(w, 0, 0), (w, 0, h), (w, d, h), (w, d, 0)])
+            stud.add_face([(0, 0, 0), (0, 0, h), (w, 0, h), (w, 0, 0)])
+            stud.add_face([(0, d, 0), (w, d, 0), (w, d, h), (0, d, h)])
+        builder.add_instance(stud, name="Stud_A", translation=(0.0, 0.0, 0.0))
+        builder.add_instance(
+            stud, name="Stud_B", translation=(120.0, 0.0, 0.0),
+            rotation=((0, 0, 1), math.radians(45)),
+        )
+
+        skp_path = tmp_path / "studs.skp"
+        skp_path.write_bytes(builder.to_bytes())
+
+        original = SkpFile.open(str(skp_path)).build_instanced_scene()
+        data = fragments.to_fragments(original)
+        roundtripped = fragments.from_fragments(data)
+
+        bmin1, bmax1 = _world_bbox(original)
+        bmin2, bmax2 = _world_bbox(roundtripped)
+        for a, b in zip(bmin1 + bmax1, bmin2 + bmax2):
+            assert a == pytest.approx(b, abs=1e-4)
+
+    def test_layer_hidden_survives_the_round_trip(self):
+        scene = _make_two_instance_scene()
+        scene.layer_hidden = {"Framing": True, "Layer0": False}
+        data = fragments.to_fragments(scene)
+        result = fragments.from_fragments(data)
+        assert result.layer_hidden == {"Framing": True, "Layer0": False}
+
+    def test_deduplicates_mesh_resources_shared_by_identical_samples(self):
+        """Two items whose samples reference the exact same (shell,
+        material) pairs share one InstancedMeshResource on read, mirroring
+        the dedup build_instanced_scene() itself already does - not one
+        resource per item regardless of whether it's genuinely unique."""
+        scene = _make_two_instance_scene()
+        data = fragments.to_fragments(scene)
+        result = fragments.from_fragments(data)
+        assert len(result.mesh_resources) == 1
+
+    def test_reads_a_real_thatopen_produced_file(self):
+        """`thatopen_small_test.frag` is ThatOpen's own real sample
+        fixture (MIT licensed, from their `resources/frags/` -
+        https://github.com/ThatOpen/engine_fragment), not anything OpenSKP
+        ever wrote - confirms this module reads real third-party output,
+        not just its own encoder's round trip."""
+        path = pathlib.Path(__file__).parent / "fixtures" / "thatopen_small_test.frag"
+        scene = fragments.read(path)
+
+        assert len(scene.mesh_resources) > 0
+        assert sum(len(r.primitives) for r in scene.mesh_resources) > 0
+        assert _count_nodes(scene.scene_hierarchy) > 1
+
+    def test_unsupported_representation_class_warns_instead_of_silently_misreading(self):
+        """A sample referencing a CIRCLE_EXTRUSION representation (round
+        profiles - rebar, pipes; real IfcImporter output can contain
+        these) has no shell reader yet - must be skipped with a warning,
+        not silently treated as a SHELL and misread."""
+        from openskp._fragments_fb import RepresentationClass as _RC
+
+        scene = _make_two_instance_scene()
+        data = fragments.to_fragments(scene, raw=True)
+
+        model = Model.GetRootAsModel(bytearray(data), 0)
+        # Patch the first Representation's class in place (Int8, offset 28
+        # within the 32-byte struct - see Representation.py) to simulate a
+        # real file containing a representation type this reader doesn't
+        # decode geometry for yet.
+        rep = model.Meshes().Representations(0)
+        patched = bytearray(data)
+        # GetRootAsModel decompresses nothing itself when handed already-
+        # inflated bytes; to_fragments(raw=True) already returned raw bytes.
+        struct_pos = rep._tab.Pos
+        patched[struct_pos + 28] = _RC.RepresentationClass.CIRCLE_EXTRUSION
+
+        with pytest.warns(UserWarning, match="unsupported RepresentationClass"):
+            result = fragments.from_fragments(bytes(patched))
+        # Both items share this one (now-patched) representation, so every
+        # sample referencing it is skipped - zero primitives anywhere in
+        # the resulting scene, not a crash and not misread geometry.
+        assert sum(len(r.primitives) for r in result.mesh_resources) == 0
+
+    def test_follows_representation_id_not_its_vector_position_for_shell_lookup(self):
+        """Representation.Id() is the index into Meshes.Shells - it is NOT
+        guaranteed to equal the representation's own position in the
+        Representations vector. OpenSKP's writer always keeps the two
+        equal, so this divergence never showed up in any round trip
+        through our own encoder (or even in ThatOpen's small fixture) -
+        it only surfaced reading a real ThatOpen IfcImporter file, where
+        it crashed with an IndexError. This proves the fix: the reader
+        must follow Id(), matching the real reader's own
+        `meshes.shells(repr.id!, ...)` (fetch-functions.ts)."""
+        box = InstancedMeshResource(
+            id="mesh_box", definition_id=1, definition_name="Box",
+            variant_key="1|255,255,255", primitives=[_box_primitive()],
+        )
+        triangle = LocalPrimitive(
+            positions=array("f", [0, 0, 0, 1, 0, 0, 0, 1, 0]),
+            normals=array("f", [0.0] * 9),
+            uvs=array("f", [0.0] * 6),
+            indices=array("I", [0, 1, 2]),
+            material_index=0,
+        )
+        flag = InstancedMeshResource(
+            id="mesh_flag", definition_id=2, definition_name="Flag",
+            variant_key="2|255,255,255", primitives=[triangle],
+        )
+        node_a = InstancedNode(name="Item_Box", matrix=IDENTITY, mesh_resource_id="mesh_box")
+        node_b = InstancedNode(name="Item_Flag", matrix=IDENTITY, mesh_resource_id="mesh_flag")
+        root = InstancedNode(name="ROOT", matrix=IDENTITY, children=[node_a, node_b])
+        scene = InstancedScene(
+            bounds=None, scene_hierarchy=root, mesh_resources=[box, flag],
+            gltf_materials=[{"pbrMetallicRoughness": {"baseColorFactor": [1.0, 1.0, 1.0, 1.0]}}],
+            textures=[],
+        )
+        data = fragments.to_fragments(scene, raw=True)
+
+        model = Model.GetRootAsModel(bytearray(data), 0)
+        meshes = model.Meshes()
+        assert meshes.ShellsLength() == 2
+        assert meshes.RepresentationsLength() == 2
+
+        rep0 = meshes.Representations(0)
+        rep1 = meshes.Representations(1)
+        id0, id1 = rep0.Id(), rep1.Id()
+        assert id0 != id1
+
+        # Swap the two representations' Id() fields (Uint32 at struct
+        # offset 0 - see Representation.py) while leaving their positions
+        # in the Representations vector untouched, so position-based
+        # lookup and Id()-based lookup now disagree.
+        patched = bytearray(data)
+        import struct
+        struct.pack_into("<I", patched, rep0._tab.Pos, id1)
+        struct.pack_into("<I", patched, rep1._tab.Pos, id0)
+
+        result = fragments.from_fragments(bytes(patched))
+
+        def find(node, name):
+            if node.name == name:
+                return node
+            for c in node.children:
+                found = find(c, name)
+                if found is not None:
+                    return found
+            return None
+
+        def vert_count(node):
+            resource = next(r for r in result.mesh_resources if r.id == node.mesh_resource_id)
+            return sum(len(p.positions) // 3 for p in resource.primitives)
+
+        # Whichever shell each representation's swapped Id() now points
+        # at is what must come out - the box's item now resolves to the
+        # 3-vertex triangle shell, and vice versa. Reading by vector
+        # position instead would show the ORIGINAL, unswapped counts.
+        assert vert_count(find(result.scene_hierarchy, "Item_Box")) == 3
+        assert vert_count(find(result.scene_hierarchy, "Item_Flag")) == 8

@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import {
   parseSkp,
   buildScene,
@@ -46,6 +47,22 @@ const sizeWarningOverlay = document.getElementById('size-warning-overlay');
 const sizeWarningMessage = document.getElementById('size-warning-message');
 const btnSizeCancel = document.getElementById('btn-size-cancel');
 const btnSizeProceed = document.getElementById('btn-size-proceed');
+const btnSizeWasm = document.getElementById('btn-size-wasm');
+
+// Lazily-initialized native (Emscripten/WASM) OpenSkp module, used only for
+// the large-file fast-preview path below - loading it eagerly would cost
+// every visitor a ~900KB download even if they never open a large file.
+// parseSkpToGLB() only returns triangulated geometry + counts, not the full
+// SkpModel/scene metadata the normal path renders from, so this path
+// intentionally trades layers/properties/most export formats for a load
+// that actually finishes instead of freezing the tab (openskp#305, #307).
+let wasmModulePromise = null;
+function loadWasmModule() {
+  if (!wasmModulePromise) {
+    wasmModulePromise = import('./wasm/openskp.js').then((mod) => mod.default());
+  }
+  return wasmModulePromise;
+}
 
 // This viewer runs entirely in one browser tab, which has a fixed JS heap
 // ceiling (commonly ~4GB) that can't be raised from a web page the way
@@ -442,8 +459,30 @@ function zoomToFit() {
   const maxDim = Math.max(size.x, size.y, size.z);
   const fov = camera.fov * (Math.PI / 180);
   let cameraZ = Math.abs(maxDim / 2 / Math.tan(fov / 2));
-  
+
   cameraZ *= 1.35; // Add padding
+
+  // The camera's near/far planes and OrbitControls' zoom-out limit were
+  // fixed constants (near=0.1, far=1000, no maxDistance) sized for the
+  // small default sample model. Real models range from centimeter-scale
+  // furniture to buildings hundreds of units across - a fixed far=1000
+  // clips large models as soon as a user zooms out past that distance
+  // (looks like the model vanished, not like a normal clipping edge), and
+  // a fixed near=0.1 loses depth precision at large scale. Both now scale
+  // with the loaded model's own size, computed fresh on every load.
+  camera.near = Math.max(0.01, maxDim / 1000);
+  camera.far = Math.max(1000, cameraZ * 20);
+  camera.updateProjectionMatrix();
+  controls.minDistance = camera.near * 10;
+  controls.maxDistance = cameraZ * 15;
+
+  // FogExp2's falloff distance is roughly 1/density - the fixed 0.015
+  // (a ~65-unit falloff) was tuned for the same small default model and
+  // fogs out anything larger long before its own far plane would, making
+  // a big model look empty even where it isn't clipped. Tied to the far
+  // plane (already scaled above) rather than cameraZ directly, so small
+  // models keep roughly their original look instead of going darker.
+  if (scene.fog) scene.fog.density = 3 / camera.far;
 
   // Animate camera to look at the model center
   camera.position.set(center.x + cameraZ * 0.7, center.y + cameraZ * 0.5, center.z + cameraZ * 0.7);
@@ -586,6 +625,64 @@ function loadSkpBuffer(arrayBuffer, filename) {
   }, 100);
 }
 
+// Fast-preview path for files too large for loadSkpBuffer()'s pure-JS
+// parse to survive: hands the raw bytes to the native (WASM) parser and
+// renders the GLB it returns directly, via Three.js's own GLTFLoader.
+// Trades away layers, the properties inspector, and every export format -
+// none of that metadata exists in parseSkpToGLB()'s return value - for a
+// load of the same file that actually finishes.
+function loadSkpBufferViaWasm(arrayBuffer, filename) {
+  setLoader(true, 'Loading via native WASM parser (fast preview)...');
+
+  setTimeout(async () => {
+    try {
+      clearScene();
+      currentModel = null;
+      currentScene = null;
+      currentLoadedFilename = filename || 'model.skp';
+
+      const startTime = performance.now();
+      const Module = await loadWasmModule();
+      const result = Module.parseSkpToGLB(new Uint8Array(arrayBuffer));
+      if (result.error) {
+        throw new Error(result.error);
+      }
+      const parseTimeMs = performance.now() - startTime;
+      console.log(`WASM parsed in ${parseTimeMs.toFixed(1)}ms:`, result);
+
+      const gltf = await new Promise((resolve, reject) => {
+        new GLTFLoader().parse(result.glbBytes.buffer, '', resolve, reject);
+      });
+      modelGroup.add(gltf.scene);
+
+      statusText.textContent =
+        `Loaded ${filename} (${(arrayBuffer.byteLength / (1024 * 1024)).toFixed(2)} MB) via WASM ` +
+        `fast preview in ${parseTimeMs.toFixed(0)}ms. Layers, properties, and export aren't ` +
+        `available for this load.`;
+
+      populateLayers([]);
+      zoomToFit();
+
+      modelStats.style.visibility = 'visible';
+      statVersion.textContent = 'WASM preview';
+      statMeshes.textContent = `Meshes: ${result.componentCount}`;
+
+      // No SkpModel/scene metadata exists for this load - every export
+      // format in handleExportFormat() needs currentModel/currentScene,
+      // neither of which this path produces.
+      btnExport.disabled = true;
+    } catch (err) {
+      console.error(err);
+      statusText.textContent = `Error parsing ${filename} via WASM: ${err.message}`;
+      alert(`Failed to load file via WASM: ${err.message}`);
+      btnExport.disabled = true;
+      modelStats.style.visibility = 'hidden';
+    } finally {
+      setLoader(false);
+    }
+  }, 100);
+}
+
 // Helper function to trigger browser file download
 function downloadFile(filename, content, mimeType) {
   const blob = content instanceof Blob ? content : new Blob([content], { type: mimeType });
@@ -708,10 +805,10 @@ function handleFile(file) {
   readAndLoad(file);
 }
 
-function readAndLoad(file) {
+function readAndLoad(file, loader = loadSkpBuffer) {
   const reader = new FileReader();
   reader.onload = (event) => {
-    loadSkpBuffer(event.target.result, file.name);
+    loader(event.target.result, file.name);
   };
   reader.readAsArrayBuffer(file);
 }
@@ -740,6 +837,17 @@ btnSizeProceed.addEventListener('click', () => {
     readAndLoad(file);
   }
 });
+
+if (btnSizeWasm) {
+  btnSizeWasm.addEventListener('click', () => {
+    sizeWarningOverlay.classList.add('hidden');
+    const file = pendingFile;
+    pendingFile = null;
+    if (file) {
+      readAndLoad(file, loadSkpBufferViaWasm);
+    }
+  });
+}
 
 const exportDropdown = document.getElementById('export-dropdown');
 const exportMenu = document.getElementById('export-menu');

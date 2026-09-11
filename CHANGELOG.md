@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — Python: pre-2014 legacy files could silently drop most of the root scene, or crash deep in a nested definition (#284)
+
+`_read_instance`'s trailing-GUID read for `CComponentInstance`/`CGroup` was gated on the class's own reported `schema` number (`schema >= 5` implies a GUID), which doesn't hold: a v7 file's `CComponentInstance` reports schema 6 - well above that threshold - yet has no GUID at all. Forcing the 16-byte read anyway silently consumed bytes belonging to the start of the next sibling entity's own tag. Two symptoms turned out to share this one cause: a `"class-ref to non-class slot N (CAttributeNamed)"` crash deep inside a nested `CComponentDefinition` (the originally-reported bug), and - more dangerous, since it never raised - the root-level entity list's own over-declared-count tolerance silently swallowing the resulting corruption and truncating a real scene from 10+ root instances down to 1 with no error at all. Root-caused with a byte-level trace on a real V7 file (not committed, private project content) and fixed by gating the GUID read on the file's own version number instead of schema, then re-verified byte-for-byte against V7/V8/2013 real files and a clean synthetic fixture pair. `is_legacy` detection, `expected a string record` (v3), `texture object is not a dib` (v4), and `definition list misaligned` (v6) remain separate, unrelated pre-existing bugs, still open.
+
+### Added — Web viewer: WASM fast-preview path for files too large for the pure-JS parser
+
+`examples/web-viewer` bundles the C++ engine's WASM build (`wasm/openskp.js`/`openskp.wasm`) and offers it as an additional option on the existing large-file warning dialog - "Load fast preview (WASM)" alongside "Load anyway" and "Cancel". It hands the raw bytes to the native parser and renders the GLB it returns via Three.js's `GLTFLoader`, trading away layers, the properties inspector, and every export format (`parseSkpToGLB()`'s return value carries none of that metadata) for a load that actually finishes instead of freezing the tab.
+
+Verified on a real 41MB production file that the existing pure-JS path cannot load at all (`Array buffer allocation failed` partway through parsing, a real, reproducible failure - not a synthetic edge case): the WASM path loaded it successfully in 14.9s (1,497,547 faces, 2,696 mesh resources, 32 materials), rendered correctly. Confirmed the existing full-featured path is unaffected for files under the warning threshold.
+
+### Fixed — Web viewer: zooming out on a large model could clip the whole scene into nothing
+
+The camera's near/far clipping planes (`0.1`/`1000`) and OrbitControls' zoom distance were fixed constants sized for the small default sample model, with no `maxDistance` limit at all. A real building-scale model comfortably exceeds a 1000-unit far plane, so zooming out past that distance clipped the entire scene - it just vanished, with nothing to indicate why. `zoomToFit()` now computes near/far and `controls.minDistance`/`maxDistance` fresh from the loaded model's own bounding box on every load (also rescales fog density along with the far plane, so a large model doesn't fog out immediately either). Verified across a wide zoom range on a real 165MB production model: no clipping artifacts zoomed in close, and zooming out to the new (bounded) maximum keeps the model visible - small, correctly, at that distance - rather than clipped away. Confirmed the small default sample model's appearance is unaffected.
+
+### Fixed — `to_instanced_glb()` was accidentally quadratic in mesh-resource count (not a WASM-specific issue)
+
+`make_model()`'s shared binary buffer was grown via `append_values()`
+calling `buffer.reserve(buffer.size() + delta)` once per primitive per
+attribute array (positions/normals/uvs/indices) - `std::vector::reserve()`
+has no obligation to over-allocate beyond what's asked, so a size that only
+ever grows by "just enough" forces a full reallocation-and-copy of
+everything appended so far, every single call. On a scene with many mesh
+resources this turned amortized-O(1) appends into O(resource count²)
+copying - **39,016ms → 485ms (an 80x speedup) at 10,000 resources, and
+713s → 12.6s (56.6x) at 65,000**, real numbers from a synthetic 125MB file,
+fixed by reserving the true final buffer size once, upfront (byte-identical
+output, confirmed on the same file before/after).
+
+This corrects a wrong conclusion from the memory-ceiling fix entry just
+below: profiling (not just black-box timing) found the real hot path was
+`to_instanced_glb()` itself, not the legacy parser - the earlier "WASM is
+12-13x slower than native" claim compared WASM's full parse+build+GLB
+pipeline against a native benchmark that never called `to_instanced_glb()`
+at all. Once compared correctly, this bug affected native and WASM
+equally; there was no WASM-specific slowdown. See
+[issue #305](https://github.com/iamahsanmehmood/openskp/issues/305) for
+the full corrected investigation.
+
+### Fixed — C++ WASM build hit an internal memory ceiling well below what a browser tab actually allows
+
+The `OPENSKP_BUILD_WASM` target set `-sALLOW_MEMORY_GROWTH=1` with no explicit
+`-sMAXIMUM_MEMORY`. Without one, the WASM heap hit an internal allocation
+failure - caught generically and surfaced as a misleading `legacy .skp parse
+failed` error, with the real exception type lost - well before a browser's
+own ~4GB ceiling would actually be reached. Confirmed directly: a synthetic
+125MB file with 65,000 component definitions failed outright under the old
+config; adding an explicit `-sMAXIMUM_MEMORY=4GB` (plus a 256MB
+`-sINITIAL_MEMORY` to avoid repeated grow-and-copy on real files) removed the
+failure. See [issue #305](https://github.com/iamahsanmehmood/openskp/issues/305)
+for the fuller investigation, including a separate, still-open WASM-vs-native
+performance gap this fix does not address.
+
+### Fixed — Cross-language codegen textured material round-trip
+
+`to_*_code()` now preserves both `applied_width` and material `opacity` when regenerating textured materials across all 5 language ports (Python, TypeScript, .NET, Dart, C++).
+
 ### Changed — TypeScript writer memory
 
 `ArchiveWriter` keeps the archive in a growable `Uint8Array` instead of a
@@ -443,6 +499,67 @@ against real plugin data on `Untitled.skp` (`steelframer-dict`, 45
 entries); no output shape change for models with no extra dictionaries
 (`attribute_dictionaries` is simply `{}`). Same fix ported to C++, see
 [§ preview-cpp-v1.3.0](#preview-cpp-v130--2026-09-10--c-only-github-only-pre-release).
+
+### Added — Read a `.frag` file back (`openskp.export.fragments.read`/`from_fragments`)
+
+The mirror of this release's own `to_fragments`/`export`: parses a real
+`.frag` file straight into an `InstancedScene`, OpenSKP's 6th input format
+alongside `.skp`. Any file works, not just this project's own encoder's
+output — ThatOpen's real `IfcImporter` output, or anyone else's — and
+rides every other export this project already has (GLB, OBJ, STL, PLY,
+DXF, IFC4, JSON, `.skp` itself via the writer) for free, once parsed.
+
+Verified three ways: round-trips this project's own output exactly (world-
+space vertex positions across a real `.skp`-derived scene match to the
+last bit, not just object/vertex counts); reads a real ThatOpen-produced
+production file cleanly (a genuine IFC-derived building, 5,751 nodes /
+100,332 vertices, not a synthetic fixture) — re-exporting that file
+through this same module and loading the result back through the actual
+`@thatopen/fragments` runtime preserves real IFC GUIDs and category
+names; and, independently of any pre-existing fixture, converts real IFC
+source files (a Revit-exported wall, and a real ~8.6 MB structural model)
+through ThatOpen's own actual `IfcImporter` and reads the freshly-produced
+`.frag` output straight into an `InstancedScene` — correct spatial
+hierarchy, GUIDs, and geometry counts, with `CIRCLE_EXTRUSION` samples
+(present in the structural model) skipped with a warning as documented.
+A smaller real ThatOpen fixture (MIT-licensed, from their own
+`resources/frags/`) is committed at
+`tests/fixtures/thatopen_small_test.frag` for CI.
+
+**Known gaps, stated honestly:**
+- No UVs or stored vertex normals anywhere in the schema — every
+  reconstructed primitive gets an all-zero UV band, and normals are
+  rebuilt as flat per-face (correct for a hard-edged shell, not the
+  original smooth-shading groups). Not a gap in this reader — the format
+  itself never had anywhere to keep either.
+- A purely organizational (non-geometry) node's own local transform was
+  never serialized on export — only geometry-bearing items' full WORLD
+  transforms survive. Reconstructed wrapper nodes get an identity matrix;
+  since every geometry leaf's own matrix is its full world transform
+  directly, the composed placement is still exactly correct, it just
+  can't recover the original per-level transform split.
+- `RepresentationClass.CIRCLE_EXTRUSION` (round profiles — rebar, pipes)
+  has no reader yet, only `SHELL`. A real `IfcImporter`-produced file can
+  contain these; such samples are skipped with a warning, not silently
+  misread as shells.
+
+### Fixed — `.frag` reader crashed on real ThatOpen-produced files (wrong shell lookup)
+
+`from_fragments` resolved each sample's geometry via `Representation`'s
+own position in the `Representations` vector, treating that position as
+the index into `Meshes.Shells`. That's only true of this project's own
+writer, which happens to always keep the two equal — `Representation.Id()`
+is the actual `Shells` index, and a real ThatOpen `IfcImporter`-produced
+file does not keep it equal to the representation's vector position.
+Surfaced as an `IndexError` reading a `.frag` file freshly converted from
+a real structural IFC model via ThatOpen's own `IfcImporter` (not caught
+by any prior test, since every previous fixture — including this
+project's own writer's output — happened not to exercise the divergence).
+Fixed by following `Representation.Id()`, matching the real reader's own
+`meshes.shells(repr.id!, ...)` (`Utils/edit/fetch-functions.ts` in
+`@thatopen/fragments`). Regression test patches a representation's
+`Id()` in place to diverge from its vector position and confirms the
+correct (not merely non-crashing) shell comes back.
 
 ## [1.2.0] — 2026-09-04
 
