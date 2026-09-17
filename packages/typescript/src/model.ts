@@ -1,5 +1,5 @@
 import { transformPoint, multiplyMatrices } from './transforms';
-import { extractDynamicProperties, ParsedDefinition } from './geometry';
+import { extractDynamicProperties, extractAttributeDictionaries, isGenericDefinitionName, findNameOverride, stringifyVffAttrValue, ParsedDefinition, VffAttrValue } from './geometry';
 import { buildLocalFaceGroups } from './face-groups';
 import { SkpParseError } from './errors';
 import { ParseOptions, PROGRESS_INTERVAL, emitLog, emitProgress } from './observability';
@@ -69,6 +69,41 @@ export interface Dimension {
   normal: [number, number, number] | null;
 }
 
+/**
+ * A construction/guide line (SketchUp's Construction Line tool). Legacy
+ * (pre-2021) files only - the VFF (2021+) reader does not currently
+ * recognize this entity.
+ *
+ * Stored internally (and here, unchanged) as a point + normalized
+ * direction + two signed distance parameters along that direction marking
+ * where the visible segment starts/ends - the same shape
+ * `Sketchup::ConstructionLine`'s own `start`/`end`/`direction` properties
+ * expose. A parameter magnitude of `1e30` means unbounded in that
+ * direction (SketchUp draws this as an infinite guide line through
+ * `point`) - `start`/`end` come back null in that case, matching the real
+ * API returning `nil`.
+ */
+export interface ConstructionLine {
+  /** A point on the line, in inches (world space) - matches the bounded
+   * case's own `start`, or the anchor point given for an infinite line. */
+  point: [number, number, number];
+  /** The line's normalized direction vector. */
+  direction: [number, number, number];
+  /** The bounded segment's start point, or null if unbounded in this
+   * direction. */
+  start: [number, number, number] | null;
+  /** The bounded segment's end point, or null if unbounded. */
+  end: [number, number, number] | null;
+}
+
+/** A construction/guide point (SketchUp's Construction Point tool).
+ * Legacy (pre-2021) files only - the VFF (2021+) reader does not
+ * currently recognize this entity. */
+export interface ConstructionPoint {
+  /** The point's position, in inches (world space). */
+  position: [number, number, number];
+}
+
 /** A saved scene (SketchUp's "Scenes" tabs; "pages" in the SDK). */
 export interface Page {
   /** Scene name as shown on its tab. */
@@ -101,6 +136,8 @@ export interface Definition {
   sectionPlanes: SectionPlane[];
   texts: TextEntity[];
   dimensions: Dimension[];
+  constructionLines: ConstructionLine[];
+  constructionPoints: ConstructionPoint[];
   isImage: boolean;
   alwaysFacesCamera: boolean;
   shadowsFaceSun: boolean;
@@ -268,10 +305,27 @@ export interface Material {
 
 export interface InstanceNode {
   name: string;
+  /** Whether `name` is a synthetic fallback (SketchUp's own internal
+   * index, e.g. "Component_5") rather than a real name from the source
+   * file - see InstancedNode.nameIsGenerated (instanced.ts) for the full
+   * fallback-order rationale; both resolve a node's display name
+   * identically. */
+  nameIsGenerated: boolean;
   definitionName: string;
   layer: string;
   positionMm: [number, number, number];
   properties: Record<string, string>;
+  /** Every OTHER attribute dictionary this instance carries, keyed by the
+   * dictionary's own name, values stringified the same way `properties`
+   * already is - `properties` stays exactly SketchUp's own Dynamic
+   * Components data (`dynamic_attributes`) for backward compatibility;
+   * third-party plugins (BIM/steel-detailing tools, etc.) commonly attach
+   * their own richer per-instance data under their own dictionary name
+   * instead, which this project never surfaced before (openskp#285). */
+  attributeDictionaries: Record<string, Record<string, string>>;
+  /** Real SketchUp instance GUID (VFF/2021+ files only), or `''` when the
+   * source file has none - see InstancedNode.guid (instanced.ts). */
+  guid: string;
   children: InstanceNode[];
 }
 
@@ -281,6 +335,8 @@ export interface MeshMetadata {
   layer: string;
   positionMm: [number, number, number];
   properties: Record<string, string>;
+  /** See InstanceNode.attributeDictionaries. */
+  attributeDictionaries: Record<string, Record<string, string>>;
   path: string;
 }
 
@@ -518,7 +574,7 @@ export function buildModelFromParsed(parsed: ParsedRawData): SkpModel {
     // group). Kept out of `definitions` (which is numeric-ID-only, one
     // entry per real component/group definition) and exposed here instead,
     // matching the .NET and Dart ports' `Root`/`root` field.
-    root: rootDefinition ?? { id: 0, guid: 'ROOT', name: 'ROOT_MODEL', vertices: [], edges: [], faces: [], instances: [], sectionPlanes: [], texts: [], dimensions: [], isImage: false, alwaysFacesCamera: false, shadowsFaceSun: false },
+    root: rootDefinition ?? { id: 0, guid: 'ROOT', name: 'ROOT_MODEL', vertices: [], edges: [], faces: [], instances: [], sectionPlanes: [], texts: [], dimensions: [], constructionLines: [], constructionPoints: [], isImage: false, alwaysFacesCamera: false, shadowsFaceSun: false },
     layers: finalLayersList,
     pages: finalPagesList,
     dimensions: finalDimensionsList,
@@ -589,6 +645,15 @@ function buildDefinition(id: number, d: ParsedDefinition, layerIdToName?: Map<nu
     planeX: null,
     normal: null,
   }));
+  const constructionLines: ConstructionLine[] = (d.builder.constructionLines || []).map((cl) => ({
+    point: cl.point,
+    direction: cl.direction,
+    start: cl.start,
+    end: cl.end,
+  }));
+  const constructionPoints: ConstructionPoint[] = (d.builder.constructionPoints || []).map((cp) => ({
+    position: cp.position,
+  }));
 
   return {
     id,
@@ -601,6 +666,8 @@ function buildDefinition(id: number, d: ParsedDefinition, layerIdToName?: Map<nu
     sectionPlanes,
     texts,
     dimensions,
+    constructionLines,
+    constructionPoints,
     isImage: d.isImage,
     alwaysFacesCamera: d.alwaysFacesCamera,
     shadowsFaceSun: d.shadowsFaceSun || false,
@@ -701,7 +768,10 @@ export function buildSceneFromParsed(
   // match the wrong meshes (a shallow instance's path is always a string
   // prefix of every deeper descendant's path too, so `includes()` matched
   // far more than intended - see openskp#240).
-  const pathUpdates = new Map<string, { properties: Record<string, string>; name: string }>();
+  const pathUpdates = new Map<
+    string,
+    { properties: Record<string, string>; name: string; attributeDictionaries: Record<string, Record<string, string>> }
+  >();
 
   const getLayerColor = (name: string) => {
     const c = layerColors.get(name) || [136, 136, 136];
@@ -861,6 +931,7 @@ export function buildSceneFromParsed(
           layer: parentLayer,
           positionMm: [Math.round(tx * 100) / 100, Math.round(ty * 100) / 100, Math.round(tz * 100) / 100],
           properties: {},
+          attributeDictionaries: {},
           path: pathName,
         };
 
@@ -972,9 +1043,11 @@ export function buildSceneFromParsed(
       // legacy instances, so this is a no-op there and the precomputed
       // `properties` seeded above survives unchanged.
       const d007 = inst.children.find((c) => c.tag === 'D007');
+      let attributeDicts: Record<string, Record<string, VffAttrValue>> | null = null;
       if (d007) {
         try {
           properties = extractDynamicProperties(d007, options);
+          attributeDicts = extractAttributeDictionaries(d007, options);
         } catch (e) {
           emitLog(
             options, 'debug',
@@ -1004,9 +1077,43 @@ export function buildSceneFromParsed(
       const ty = (newMatrix[10] ?? 0) * 25.4;
       const tz = (newMatrix[11] ?? 0) * 25.4;
 
+      // Fallback order: an attribute-dict name/label/code override, then
+      // the instance's own explicit name, then the definition's own name
+      // IF it's not itself just SketchUp's auto-generated
+      // "Group#1"/"Component#12" placeholder, then finally the internal
+      // index. Mirrors instanced.ts's identical resolution (and Python's/
+      // C++'s own scene.py/instanced_scene.py) - see
+      // instanced-fixture-parity.test.ts, which depends on both trees
+      // resolving display names identically.
+      const childDefName = defsDict.get(refIdx)?.name || '';
+      const defNameIsReal = !!childDefName && !isGenericDefinitionName(childDefName);
+      const nameOverride = findNameOverride(attributeDicts);
+      const instNameNonEmpty = !!inst.name;
+      const fallbackName = instNameNonEmpty ? inst.name : (defNameIsReal ? childDefName : `Component_${refIdx}`);
+      const displayName = nameOverride ?? fallbackName;
+      const nameIsGenerated = nameOverride === null && !instNameNonEmpty && !defNameIsReal;
+
+      // Every OTHER attribute dictionary this instance carries -
+      // dynamic_attributes is already surfaced separately as `properties`
+      // above, and SU_InstanceSet is SketchUp's own always-present,
+      // always-empty Owner/Status boilerplate, not worth surfacing.
+      // Mirrors Python's own attribute_dictionaries construction in
+      // scene.py exactly (openskp#285).
+      const attributeDictionaries: Record<string, Record<string, string>> = {};
+      if (attributeDicts) {
+        for (const dictName of Object.keys(attributeDicts)) {
+          if (dictName === 'dynamic_attributes' || dictName === 'SU_InstanceSet') continue;
+          const entries = attributeDicts[dictName];
+          const stringified: Record<string, string> = {};
+          for (const key of Object.keys(entries)) stringified[key] = stringifyVffAttrValue(entries[key]);
+          attributeDictionaries[dictName] = stringified;
+        }
+      }
+
       const instInfo: InstanceNode = {
-        name: inst.name || '',
-        definitionName: defsDict.get(refIdx)?.name || '',
+        name: displayName,
+        nameIsGenerated,
+        definitionName: childDefName,
         layer: lName,
         positionMm: [
           Math.round(tx * 100) / 100,
@@ -1014,11 +1121,13 @@ export function buildSceneFromParsed(
           Math.round(tz * 100) / 100,
         ],
         properties: properties,
+        attributeDictionaries,
+        guid: inst.refGuid || '',
         children: childNodes,
       };
       childInstancesInfo.push(instInfo);
 
-      pathUpdates.set(fullPathName, { properties, name: inst.name || '' });
+      pathUpdates.set(fullPathName, { properties, name: inst.name || '', attributeDictionaries });
     }
 
     return childInstancesInfo;
@@ -1041,6 +1150,7 @@ export function buildSceneFromParsed(
     if (existing && update) {
       existing.properties = update.properties;
       existing.name = update.name;
+      existing.attributeDictionaries = update.attributeDictionaries;
     }
   }
 
@@ -1053,15 +1163,19 @@ export function buildSceneFromParsed(
       existing.layer = 'Layer0';
       existing.positionMm = [0, 0, 0];
       existing.properties = {};
+      existing.attributeDictionaries = {};
     }
   }
 
   const sceneHierarchy: InstanceNode = {
     name: 'ROOT',
+    nameIsGenerated: false,
     definitionName: 'ROOT_MODEL',
     layer: 'Layer0',
     positionMm: [0, 0, 0],
     properties: {},
+    attributeDictionaries: {},
+    guid: '',
     children: rootChildren,
   };
 

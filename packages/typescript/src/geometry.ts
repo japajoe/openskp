@@ -1,4 +1,4 @@
-import { TlvNode, readF64, readU32, parseVarInt, parseTlvRecursive } from './parser';
+import { TlvNode, readF64, readI32, readU32, parseVarInt, parseTlvRecursive } from './parser';
 import { ParseOptions, emitLog } from './observability';
 import { EdgeFlagStore } from './edge-flags';
 import { DefaultVertexStore, type VertexStore } from './vertex-store';
@@ -47,6 +47,13 @@ export class GeometryBuilder {
   sectionPlanes: { plane: [number, number, number, number]; name: string; label: string; hidden: boolean }[] = [];
   texts: { text: string; hidden: boolean }[] = [];
   dimensions: { text: string; hidden: boolean }[] = [];
+  constructionLines: {
+    point: [number, number, number];
+    direction: [number, number, number];
+    start: [number, number, number] | null;
+    end: [number, number, number] | null;
+  }[] = [];
+  constructionPoints: { position: [number, number, number] }[] = [];
 }
 
 export interface ParsedDefinition {
@@ -58,6 +65,13 @@ export interface ParsedDefinition {
   sectionPlanes?: { plane: [number, number, number, number]; name: string; label: string; hidden: boolean }[];
   texts?: { text: string; hidden: boolean }[];
   dimensions?: { text: string; hidden: boolean }[];
+  constructionLines?: {
+    point: [number, number, number];
+    direction: [number, number, number];
+    start: [number, number, number] | null;
+    end: [number, number, number] | null;
+  }[];
+  constructionPoints?: { position: [number, number, number] }[];
   builder: GeometryBuilder;
 }
 
@@ -387,7 +401,8 @@ export function extractGeometryFromNodes(
 export function collectLayers(
   nodes: TlvNode[],
   layerIdToName: Map<number, string> = new Map(),
-  options?: ParseOptions
+  options?: ParseOptions,
+  layerHidden?: Map<string, boolean>
 ): Map<number, string> {
   for (const el of nodes) {
     if (el.tag === '993A') {
@@ -412,12 +427,27 @@ export function collectLayers(
               emitLog(options, 'debug', `Failed to decode layer name for id ${lId}: ${(e as Error).message}`);
             }
             layerIdToName.set(lId, lName);
+
+            // 8E3C: a single byte, 1 = hidden / 0 = visible - confirmed
+            // byte-for-byte against a real production file's own Tags
+            // panel (openskp FrameSmart pipeline report, 2026-09-08):
+            // every layer showing a hollow (hidden) eye icon had
+            // 8E3C=01, every visible one had 8E3C=00. Mirrors Python's
+            // own collect_layers exactly (openskp#285) - the VFF-format
+            // counterpart of the legacy format's already-known
+            // layer-hidden flag.
+            if (layerHidden) {
+              const hiddenNode = findChildTag(child.children, '8E3C');
+              if (hiddenNode && hiddenNode.payload.length > 0) {
+                layerHidden.set(lName, hiddenNode.payload[0] === 1);
+              }
+            }
           }
         }
       }
     }
     if (el.children && el.children.length > 0) {
-      collectLayers(el.children, layerIdToName, options);
+      collectLayers(el.children, layerIdToName, options, layerHidden);
     }
   }
   return layerIdToName;
@@ -561,6 +591,201 @@ export function extractDynamicProperties(d007: TlvNode, options?: ParseOptions):
 
   extractProps(propElements);
   return properties;
+}
+
+// A decoded VFF attribute value - whichever of the 7 documented types
+// (of 9 total; no native bool/time_t tag has ever been observed in real
+// data, so 7/9 is Python's own real ceiling) `decodeVffAttrValue` below
+// recognized: string (AD38), number (AF38/A938 double, A738 int32), a
+// flat 3-tuple (B438 Point3d / B538 Vector3d), a recursively-decoded
+// array (AE38), or null (an unrecognized tag, or an A438 with no value
+// child at all).
+export type VffAttrValue = string | number | [number, number, number] | VffAttrValue[] | null;
+
+// AF38 (Length) and A938 (plain Float) both encode as a flat 8-byte
+// float64 but are genuinely different tags - real SketchUp/FrameBuilder
+// data uses both for different keys.
+const VFF_ATTR_DOUBLE_TAGS = new Set<string>(['AF38', 'A938']);
+
+/**
+ * Decode one A438-wrapped attribute value node into a native JS value.
+ * A438 with no children is null; otherwise it has exactly one child
+ * holding the value's own type tag. An unrecognized type tag (or a
+ * payload of the wrong size for its tag) is left undecoded (returns
+ * null) rather than guessed at - matching this project's standing rule
+ * to never assume an unverified binary layout. Mirrors Python's
+ * `_decode_vff_attr_value` exactly.
+ */
+export function decodeVffAttrValue(a438Node: TlvNode): VffAttrValue {
+  if (!a438Node.children || a438Node.children.length === 0) return null;
+  const child = a438Node.children[0];
+  const tag = child.tag;
+  const payload = child.payload;
+  if (tag === 'AD38') {
+    try {
+      return new TextDecoder('utf-8').decode(payload).replace(/\0/g, '').trim();
+    } catch {
+      return null;
+    }
+  }
+  if (VFF_ATTR_DOUBLE_TAGS.has(tag) && payload.length === 8) return readF64(payload, 0);
+  if (tag === 'A738' && payload.length === 4) return readI32(payload, 0);
+  if ((tag === 'B438' || tag === 'B538') && payload.length === 24) {
+    return [readF64(payload, 0), readF64(payload, 8), readF64(payload, 16)];
+  }
+  if (tag === 'AE38') {
+    return (child.children ?? []).map(decodeVffAttrValue);
+  }
+  return null;
+}
+
+/**
+ * Render an already-typed VFF attribute value as a string, matching
+ * `extractDynamicProperties`'s pre-existing `Record<string, string>`
+ * contract - mirrors Python's `_stringify_vff_attr_value` exactly.
+ */
+export function stringifyVffAttrValue(value: VffAttrValue): string {
+  if (value === null || value === undefined) return '';
+  if (Array.isArray(value)) {
+    return value.map((v) => stringifyVffAttrValue(v)).join(',');
+  }
+  return String(value);
+}
+
+/**
+ * Extract EVERY attribute dictionary attached to a D007 container node,
+ * keyed by the dictionary's own declared name (tag B436) rather than
+ * merged into one flat dict - mirrors Python's
+ * `_core.extract_attribute_dictionaries` exactly (openskp#254), decoding
+ * every value type the format carries rather than only strings
+ * (openskp#285) - see `decodeVffAttrValue` for the full type table this
+ * project has ground-truthed.
+ *
+ * Each dictionary is a B436 (name) node immediately followed by a sibling
+ * entries container (typically B536) holding that dictionary's own B636
+ * (key name) / A438 (type-tagged value) pairs. Returns `{}` when the
+ * entity carries no DC05 subtree at all.
+ *
+ * NOT the same view as `extractDynamicProperties` above, which flattens
+ * every dictionary's entries into one bag regardless of which named
+ * dictionary each pair came from - that established, if non-canonically-
+ * named, contract is left untouched since real callers depend on it.
+ */
+export function extractAttributeDictionaries(
+  d007: TlvNode,
+  options?: ParseOptions
+): Record<string, Record<string, VffAttrValue>> {
+  const dictionaries: Record<string, Record<string, VffAttrValue>> = {};
+  const dc05 = d007.children.find((c) => c.tag === 'DC05');
+  if (!dc05) {
+    return dictionaries;
+  }
+  const propContainerTags = new Set<string>([
+    'DD05',
+    'B536',
+    'B136',
+    'B236',
+    'B336',
+    'B036',
+    'A438',
+    'AE38',
+  ]);
+  const propElements = parseTlvRecursive(dc05.payload, 0, dc05.payload.length, propContainerTags);
+
+  // currentKey lives OUTSIDE extractEntries (reset per dictionary right
+  // before each call, in walk below) rather than as a local inside it -
+  // kept for the same defensive reason as extractDynamicProperties's own
+  // extractProps: a real file's exact nesting isn't something to assume
+  // beyond what's been ground-truthed, even though B636/A438 are direct
+  // siblings here (unlike that function's B636/AD38, which can be split
+  // across a recursion level).
+  let currentKey: string | null = null;
+  function extractEntries(nodes: TlvNode[], entries: Record<string, VffAttrValue>) {
+    for (const n of nodes) {
+      const tag = n.tag;
+      if (tag === 'B636') {
+        try {
+          const decoder = new TextDecoder('utf-8');
+          currentKey = decoder.decode(n.payload).replace(/\0/g, '').trim();
+        } catch (e) {
+          currentKey = null;
+          emitLog(options, 'debug', `Failed to decode attribute dictionary key: ${(e as Error).message}`);
+        }
+      } else if (tag === 'A438' && currentKey) {
+        entries[currentKey] = decodeVffAttrValue(n);
+        currentKey = null;
+      } else if (n.children && n.children.length > 0) {
+        extractEntries(n.children, entries);
+      }
+    }
+  }
+
+  function walk(nodes: TlvNode[]) {
+    for (let i = 0; i < nodes.length; i++) {
+      if (nodes[i].tag === 'B436') {
+        let name = '';
+        try {
+          const decoder = new TextDecoder('utf-8');
+          name = decoder.decode(nodes[i].payload).replace(/\0/g, '').trim();
+        } catch (e) {
+          emitLog(options, 'debug', `Failed to decode attribute dictionary name: ${(e as Error).message}`);
+        }
+        const entries: Record<string, VffAttrValue> = {};
+        currentKey = null;
+        if (i + 1 < nodes.length && nodes[i + 1].children) {
+          extractEntries(nodes[i + 1].children, entries);
+        }
+        dictionaries[name] = entries;
+      } else if (nodes[i].children && nodes[i].children.length > 0) {
+        walk(nodes[i].children);
+      }
+    }
+  }
+
+  walk(propElements);
+  return dictionaries;
+}
+
+// Matches SketchUp's own auto-generated placeholder definition names
+// ("Group#1", "Component#12"), which carry no more meaning than the
+// internal index they'd otherwise fall back to - mirrors Python's
+// _is_generic_definition_name()/C++'s is_generic_definition_name() exactly
+// (same pattern, same purpose). Shared by model.ts's and instanced.ts's own
+// display-name resolution.
+const GENERIC_DEFINITION_NAME_PATTERN = /^(?:Group|Component)\d*#\d+$/;
+
+export function isGenericDefinitionName(name: string): boolean {
+  return GENERIC_DEFINITION_NAME_PATTERN.test(name);
+}
+
+// "name"/"label"/"code" checked in this order, first dictionary (other
+// than dynamic_attributes/SU_InstanceSet) and first key found wins -
+// mirrors Python's/C++'s own name_override_keys default.
+const NAME_OVERRIDE_KEYS = ['name', 'label', 'code'];
+
+/**
+ * Look for a display-name override in any attribute dictionary the
+ * instance carries OTHER than "dynamic_attributes" (SketchUp's own Dynamic
+ * Components dictionary, already surfaced separately as `properties`) or
+ * "SU_InstanceSet" - whichever third-party plugin wrote it (FrameBuilder's
+ * "name", TechSteel's "label", etc.), same fallback order and exclusions
+ * as Python's/C++'s own instanced_scene/scene name-resolution. Returns
+ * `null` when no override is present.
+ */
+export function findNameOverride(
+  attributeDicts: Record<string, Record<string, VffAttrValue>> | null | undefined
+): string | null {
+  if (!attributeDicts) return null;
+  for (const dictName of Object.keys(attributeDicts)) {
+    if (dictName === 'dynamic_attributes' || dictName === 'SU_InstanceSet') continue;
+    const entries = attributeDicts[dictName];
+    for (const key of NAME_OVERRIDE_KEYS) {
+      if (!(key in entries)) continue;
+      const val = stringifyVffAttrValue(entries[key]);
+      if (val) return val;
+    }
+  }
+  return null;
 }
 
 export function reconstructLoopVertices(

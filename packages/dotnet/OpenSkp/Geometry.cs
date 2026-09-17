@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO.Compression;
 using System.Linq;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Xml.Linq;
 
 namespace OpenSkp
@@ -41,6 +42,15 @@ namespace OpenSkp
         /// (via ExtractDynamicProperties on this instance's own D007/DC05
         /// children).</summary>
         public Dictionary<string, string>? Properties;
+
+        /// <summary>Every attribute dictionary attached to this instance
+        /// (VFF only), keyed by the dictionary's own declared name, not just
+        /// the one "dynamic_attributes" dictionary Properties above covers -
+        /// see Geometry.ExtractAttributeDictionaries. Populated eagerly at
+        /// the same site as Properties, for the same reason (name-override
+        /// resolution in InstancedScene.cs needs to inspect whichever OTHER
+        /// dictionary a third-party plugin wrote, e.g. "FrameBuilder").</summary>
+        public Dictionary<string, Dictionary<string, object?>>? AttributeDicts;
     }
 
     /// <summary>Accumulates the raw geometry extracted for one component
@@ -56,6 +66,8 @@ namespace OpenSkp
         public List<SectionPlane> SectionPlanes = new List<SectionPlane>();
         public List<TextEntity> Texts = new List<TextEntity>();
         public List<Dimension> Dimensions = new List<Dimension>();
+        public List<ConstructionLine> ConstructionLines = new List<ConstructionLine>();
+        public List<ConstructionPoint> ConstructionPoints = new List<ConstructionPoint>();
     }
 
     internal static class Geometry
@@ -163,9 +175,167 @@ namespace OpenSkp
         /// value.</summary>
         private static readonly HashSet<string> PropContainerTags = new HashSet<string>
         {
-            "DD05", "B536", "B136", "B236", "B336", "B036", "A438",
+            // AE38 (array-of-values wrapper) added alongside the VFF
+            // multi-value-type decode below (openskp#285) - without it,
+            // Tlv.ParseRecursive never descends into an array attribute's
+            // own elements, so ExtractAttributeDictionaries has nothing to
+            // recurse into regardless of DecodeVffAttrValue's own AE38
+            // handling. Matches Python's own _PROP_CONTAINER_TAGS exactly.
+            "DD05", "B536", "B136", "B236", "B336", "B036", "A438", "AE38",
         };
 
+        // Attribute value type tags found inside an A438 wrapper - the
+        // VFF-format counterpart of legacy's own type table, verified the
+        // same way (real bytes, not guessed): AD38 string, AF38 Length,
+        // A938 plain double - SketchUp genuinely uses two different tags
+        // for the same 8-byte float64 encoding depending on whether the
+        // value is a Length or a plain Float - A738 int32, B438 Point3d,
+        // B538 Vector3d (each 3 x f64, 24 bytes flat, no per-component
+        // tags). No native bool/time_t tag has been observed in real data
+        // yet - FrameBuilder itself stores booleans as the literal strings
+        // "true"/"false" - so those two of the format's 9 documented types
+        // are not decoded here either, matching Python's own
+        // _decode_vff_attr_value exactly (7/9, not 9/9 - the ceiling is
+        // real ground truth, not an arbitrary stopping point).
+        private static readonly HashSet<string> VffAttrDoubleTags = new HashSet<string> { "AF38", "A938" };
+
+        /// <summary>Decode one A438-wrapped attribute value node into a
+        /// native .NET value. A438 with no children is null; otherwise it
+        /// has exactly one child holding the value's own type tag. An
+        /// unrecognized type tag (or a payload of the wrong size for its
+        /// tag) is left undecoded (returns null) rather than guessed at -
+        /// matching this project's standing rule to never assume an
+        /// unverified binary layout. Mirrors Python's
+        /// <c>_decode_vff_attr_value</c> exactly.</summary>
+        private static object? DecodeVffAttrValue(TlvNode a438Node)
+        {
+            if (a438Node.Children.Count == 0) return null;
+            var child = a438Node.Children[0];
+            var tag = child.Tag;
+            var payload = child.Payload;
+            if (tag == "AD38") return Encoding.UTF8.GetString(payload);
+            if (VffAttrDoubleTags.Contains(tag) && payload.Length == 8) return Tlv.ReadF64(payload, 0);
+            if (tag == "A738" && payload.Length == 4) return Tlv.ReadI32(payload, 0);
+            if ((tag == "B438" || tag == "B538") && payload.Length == 24)
+            {
+                return new double[] { Tlv.ReadF64(payload, 0), Tlv.ReadF64(payload, 8), Tlv.ReadF64(payload, 16) };
+            }
+            if (tag == "AE38")
+            {
+                return child.Children.Select(DecodeVffAttrValue).ToList();
+            }
+            return null;
+        }
+
+        /// <summary>Render an already-typed VFF attribute value as a
+        /// string, matching <see cref="ExtractDynamicProperties"/>'s
+        /// pre-existing <c>Dictionary&lt;string, string&gt;</c> contract -
+        /// mirrors Python's <c>_stringify_vff_attr_value</c> exactly.</summary>
+        public static string StringifyVffAttrValue(object? value)
+        {
+            if (value == null) return "";
+            if (value is System.Collections.IEnumerable enumerable && value is not string)
+            {
+                var parts = new List<string>();
+                foreach (var v in enumerable) parts.Add(StringifyVffAttrValue(v));
+                return string.Join(",", parts);
+            }
+            return Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture) ?? "";
+        }
+
+        /// <summary>Extract EVERY attribute dictionary attached to a D007
+        /// container node, keyed by the dictionary's own declared name (tag
+        /// B436) rather than merged into one flat dict - mirrors Python's
+        /// <c>_core.extract_attribute_dictionaries</c> exactly (openskp#254),
+        /// decoding every value type the format carries rather than only
+        /// strings (openskp#255) - see <see cref="DecodeVffAttrValue"/> for
+        /// the full type table this project has ground-truthed.
+        ///
+        /// Each dictionary is a B436 (name) node immediately followed by a
+        /// sibling entries container (typically B536) holding that
+        /// dictionary's own B636 (key name) / A438 (type-tagged value)
+        /// pairs. Returns an empty dict when the entity carries no DC05
+        /// subtree at all.</summary>
+        public static Dictionary<string, Dictionary<string, object?>> ExtractAttributeDictionaries(TlvNode d007)
+        {
+            var dictionaries = new Dictionary<string, Dictionary<string, object?>>();
+            var dc05 = d007.Children.FirstOrDefault(c => c.Tag == "DC05");
+            if (dc05 == null) return dictionaries;
+            var buffer = ChunkedBuffer.FromArray(dc05.Payload);
+            var propElements = Tlv.ParseRecursive(buffer, 0, buffer.Length, PropContainerTags);
+
+            // currentKey lives OUTSIDE ExtractEntries (reset per dictionary
+            // by Walk below, right before each call) rather than as a local
+            // inside it, mirroring ExtractDynamicProperties's own
+            // ExtractProps - a still-in-scope-across-recursion requirement,
+            // even though B636/A438 are direct siblings here (unlike that
+            // function's B636/AD38, which can be split across a recursion
+            // level) - kept for the same defensive reason: a real file's
+            // exact nesting isn't something to assume beyond what's been
+            // ground-truthed.
+            string? currentKey = null;
+            void ExtractEntries(List<TlvNode> nodes, Dictionary<string, object?> entries)
+            {
+                foreach (var n in nodes)
+                {
+                    if (n.Tag == "B636")
+                    {
+                        // Property key name (UTF-8 string)
+                        currentKey = Encoding.UTF8.GetString(n.Payload);
+                    }
+                    else if (n.Tag == "A438" && currentKey != null)
+                    {
+                        // Type-tagged property value matching preceding key
+                        entries[currentKey] = DecodeVffAttrValue(n);
+                        currentKey = null;
+                    }
+                    else
+                    {
+                        ExtractEntries(n.Children, entries);
+                    }
+                }
+            }
+
+            void Walk(List<TlvNode> nodes)
+            {
+                for (int i = 0; i < nodes.Count; i++)
+                {
+                    if (nodes[i].Tag == "B436")
+                    {
+                        var name = Encoding.UTF8.GetString(nodes[i].Payload);
+                        var entries = new Dictionary<string, object?>();
+                        currentKey = null;
+                        if (i + 1 < nodes.Count)
+                        {
+                            ExtractEntries(nodes[i + 1].Children, entries);
+                        }
+                        dictionaries[name] = entries;
+                    }
+                    else
+                    {
+                        Walk(nodes[i].Children);
+                    }
+                }
+            }
+
+            Walk(propElements);
+            return dictionaries;
+        }
+
+        /// <summary>Extracts every B636 (key)/AD38 (string value) pair
+        /// found anywhere under a D007 node's DC05 subtree, merged into one
+        /// flat dict regardless of which named attribute dictionary (if
+        /// any) each pair belongs to - this is InstancedNode.Properties'/
+        /// Instance.Properties' own established contract (real-fixture
+        /// tests depend on it seeing entries from plugin-authored
+        /// dictionaries too, e.g. a SteelFramer-authored "generator" key
+        /// living under that plugin's own named dictionary, not
+        /// SketchUp's "dynamic_attributes"). NOT the same view as Python's
+        /// like-named extract_dynamic_properties, which isolates just
+        /// "dynamic_attributes" - seeing every dictionary's entries here
+        /// unfiltered predates this project's own dictionary-name-aware
+        /// ExtractAttributeDictionaries (below) and changing it now would
+        /// be a real behavior break for existing callers, not a fix.</summary>
         public static Dictionary<string, string> ExtractDynamicProperties(TlvNode d007)
         {
             var dc05 = d007.Children.FirstOrDefault(c => c.Tag == "DC05");
@@ -194,6 +364,54 @@ namespace OpenSkp
             }
             ExtractProps(propElements);
             return properties;
+        }
+
+        // Matches SketchUp's own auto-generated placeholder definition names
+        // ("Group#1", "Component#12"), which carry no more meaning than the
+        // internal index they'd otherwise fall back to - mirrors Python's
+        // _is_generic_definition_name()/C++'s is_generic_definition_name()
+        // exactly (same pattern, same purpose). Shared by Scene.cs's and
+        // InstancedScene.cs's own display-name resolution.
+        private static readonly Regex GenericDefinitionNamePattern =
+            new Regex(@"^(?:Group|Component)\d*#\d+$", RegexOptions.Compiled);
+
+        public static bool IsGenericDefinitionName(string name) =>
+            GenericDefinitionNamePattern.IsMatch(name);
+
+        // "name"/"label"/"code" checked in this order, first dictionary
+        // (other than dynamic_attributes/SU_InstanceSet) and first key found
+        // wins - mirrors Python's/C++'s own name_override_keys default.
+        private static readonly string[] NameOverrideKeys = { "name", "label", "code" };
+
+        /// <summary>Look for a display-name override in any attribute
+        /// dictionary the instance carries OTHER than "dynamic_attributes"
+        /// (SketchUp's own Dynamic Components dictionary, already surfaced
+        /// separately as Properties) or "SU_InstanceSet" - whichever
+        /// third-party plugin wrote it (FrameBuilder's "name", TechSteel's
+        /// "label", etc.), same fallback order and exclusions as Python's/
+        /// C++'s own instanced_scene/scene name-resolution. Returns null
+        /// when no override is present.</summary>
+        public static string? FindNameOverride(Dictionary<string, Dictionary<string, object?>>? attributeDicts)
+        {
+            if (attributeDicts == null) return null;
+            foreach (var pair in attributeDicts)
+            {
+                if (pair.Key == "dynamic_attributes" || pair.Key == "SU_InstanceSet") continue;
+                foreach (var key in NameOverrideKeys)
+                {
+                    if (pair.Value.TryGetValue(key, out var raw) && raw != null)
+                    {
+                        // A real override is always a string in practice
+                        // (SketchUp attribute-dictionary name/label/code
+                        // entries), but stringify whatever's there anyway -
+                        // matches Python's own `str(val)` on the override,
+                        // rather than assuming the type.
+                        var val = StringifyVffAttrValue(raw);
+                        if (!string.IsNullOrEmpty(val)) return val;
+                    }
+                }
+            }
+            return null;
         }
 
         public static void ExtractGeometryFromNodes(List<TlvNode> elements, GeometryBuilder builder)
@@ -372,6 +590,7 @@ namespace OpenSkp
                     bool instHidden = false;
                     long? instLayerId = null;
                     Dictionary<string, string>? instProperties = null;
+                    Dictionary<string, Dictionary<string, object?>>? instAttributeDicts = null;
                     var instD007 = el.Children.FirstOrDefault(c => c.Tag == "D007");
                     if (instD007 != null)
                     {
@@ -386,6 +605,7 @@ namespace OpenSkp
                             instLayerId = Tlv.ParseVarInt(d207.Payload, 0, d207.Payload.Length);
                         }
                         instProperties = ExtractDynamicProperties(instD007);
+                        instAttributeDicts = ExtractAttributeDictionaries(instD007);
                         // D307 = display flags, same record edges/faces already
                         // read (base 0x06, +0x01 hidden).
                         var instD307 = instD007.Children.FirstOrDefault(c => c.Tag == "D307");
@@ -406,6 +626,7 @@ namespace OpenSkp
                         Hidden = instHidden,
                         LayerId = instLayerId,
                         Properties = instProperties,
+                        AttributeDicts = instAttributeDicts,
                         Children = el.Children,
                     });
                 }
@@ -418,7 +639,7 @@ namespace OpenSkp
 
         // ── Layer / material ID lookups (used by Core.FullParse) ──────────
 
-        public static void CollectLayers(List<TlvNode> nodes, Dictionary<long, string> layerIdToName)
+        public static void CollectLayers(List<TlvNode> nodes, Dictionary<long, string> layerIdToName, Dictionary<string, bool>? layerHidden = null)
         {
             foreach (var el in nodes)
             {
@@ -435,11 +656,30 @@ namespace OpenSkp
                                 long lId = ParseIdFromDc05(dc05.Payload);
                                 string lName = Encoding.UTF8.GetString(nameNode.Payload);
                                 layerIdToName[lId] = lName;
+
+                                // 8E3C: a single byte, 1 = hidden / 0 = visible -
+                                // confirmed byte-for-byte against a real
+                                // production file's own Tags panel (openskp
+                                // FrameSmart pipeline report, 2026-09-08): every
+                                // layer showing a hollow (hidden) eye icon had
+                                // 8E3C=01, every visible one had 8E3C=00. Mirrors
+                                // Python's own collect_layers exactly
+                                // (openskp#285) - the VFF-format counterpart of
+                                // the legacy format's already-known layer-hidden
+                                // flag (see LegacyReaders' own LayerRec.Hidden).
+                                if (layerHidden != null)
+                                {
+                                    var hiddenNode = FindChildTag(child.Children, "8E3C");
+                                    if (hiddenNode != null && hiddenNode.Payload.Length > 0)
+                                    {
+                                        layerHidden[lName] = hiddenNode.Payload[0] == 1;
+                                    }
+                                }
                             }
                         }
                     }
                 }
-                CollectLayers(el.Children, layerIdToName);
+                CollectLayers(el.Children, layerIdToName, layerHidden);
             }
         }
 

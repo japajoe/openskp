@@ -87,31 +87,37 @@ function makeTwoInstanceScene(secondMatrix?: number[]): InstancedScene {
   };
   const nodeA: InstancedNode = {
     name: 'Box_A',
+    nameIsGenerated: false,
     definitionName: 'Box',
     layer: 'Framing',
     matrix: IDENTITY,
     positionMm: [0, 0, 0],
     properties: {},
+    guid: '',
     meshResourceId: 'mesh_0',
     children: [],
   };
   const nodeB: InstancedNode = {
     name: 'Box_B',
+    nameIsGenerated: false,
     definitionName: 'Box',
     layer: 'Framing',
     matrix: m2,
     positionMm: [5000, 0, 0],
     properties: {},
+    guid: '',
     meshResourceId: 'mesh_0',
     children: [],
   };
   const root: InstancedNode = {
     name: 'ROOT',
+    nameIsGenerated: false,
     definitionName: 'ROOT_MODEL',
     layer: 'Layer0',
     matrix: IDENTITY,
     positionMm: [0, 0, 0],
     properties: {},
+    guid: '',
     children: [nodeA, nodeB],
   };
 
@@ -121,6 +127,7 @@ function makeTwoInstanceScene(secondMatrix?: number[]): InstancedScene {
     meshResources: [resource],
     gltfMaterials: [{ pbrMetallicRoughness: { baseColorFactor: [0.8, 0.2, 0.2, 1.0] } }],
     textures: [],
+    layerHidden: {},
   };
 }
 
@@ -134,21 +141,25 @@ function makeOneInstanceScene(matrix: number[], name = 'Instance'): InstancedSce
   };
   const node: InstancedNode = {
     name,
+    nameIsGenerated: false,
     definitionName: 'Box',
     layer: 'Layer0',
     matrix,
     positionMm: [0, 0, 0],
     properties: {},
+    guid: '',
     meshResourceId: 'mesh_0',
     children: [],
   };
   const root: InstancedNode = {
     name: 'ROOT',
+    nameIsGenerated: false,
     definitionName: 'ROOT_MODEL',
     layer: 'Layer0',
     matrix: IDENTITY,
     positionMm: [0, 0, 0],
     properties: {},
+    guid: '',
     children: [node],
   };
   return {
@@ -157,6 +168,7 @@ function makeOneInstanceScene(matrix: number[], name = 'Instance'): InstancedSce
     meshResources: [resource],
     gltfMaterials: [{ pbrMetallicRoughness: { baseColorFactor: [1, 1, 1, 1] } }],
     textures: [],
+    layerHidden: {},
   };
 }
 
@@ -520,13 +532,155 @@ describe('Metadata and Attributes', () => {
 
   it('metadata preserves layer_hidden dictionary', () => {
     const scene = makeTwoInstanceScene();
-    (scene as any).layerHidden = { Framing: false, Cladding: true };
+    scene.layerHidden = { Framing: false, Cladding: true };
     const rawBytes = toFragments(scene, { raw: true });
 
     const bb = new flatbuffers.ByteBuffer(rawBytes);
     const model = Model.getRootAsModel(bb);
     const meta = JSON.parse(model.metadata()!);
     expect(meta.layer_hidden).toEqual({ Framing: false, Cladding: true });
+  });
+
+  it('items without a source guid get a unique synthetic one', () => {
+    const scene = makeTwoInstanceScene();
+    const rawBytes = toFragments(scene, { raw: true });
+
+    const bb = new flatbuffers.ByteBuffer(rawBytes);
+    const model = Model.getRootAsModel(bb);
+    const guids: string[] = [];
+    for (let i = 0; i < model.guidsLength(); i++) {
+      const g = model.guids(i)!;
+      expect(g.length).toBeGreaterThan(0);
+      guids.push(g);
+    }
+    expect(new Set(guids).size).toBe(guids.length);
+  });
+
+  it('a real source guid is preserved exactly', () => {
+    const scene = makeTwoInstanceScene();
+    scene.sceneHierarchy.children[0].guid = 'F160C36229782F47A9857FC88DD1F2CB';
+    const rawBytes = toFragments(scene, { raw: true });
+
+    const bb = new flatbuffers.ByteBuffer(rawBytes);
+    const model = Model.getRootAsModel(bb);
+    expect(model.guids(0)).toBe('F160C36229782F47A9857FC88DD1F2CB');
+  });
+
+  // openskp#290: SketchUp's own native Copy/Move+Copy/Array tools carry an
+  // instance's attribute dictionaries - and whatever GUID a framing plugin
+  // wrote into one - to every copy verbatim, so a real file can have
+  // several DIFFERENT physical instances all sharing the exact same
+  // non-empty InstancedNode.guid. The first instance to claim a real GUID
+  // keeps it; every later instance sharing that same value must fall back
+  // to a synthetic one instead of silently colliding.
+  it('a duplicated source guid does not collide', () => {
+    const scene = makeTwoInstanceScene();
+    const duplicatedGuid = 'F160C36229782F47A9857FC88DD1F2CB';
+    scene.sceneHierarchy.children[0].guid = duplicatedGuid;
+    scene.sceneHierarchy.children[1].guid = duplicatedGuid;
+    const rawBytes = toFragments(scene, { raw: true });
+
+    const bb = new flatbuffers.ByteBuffer(rawBytes);
+    const model = Model.getRootAsModel(bb);
+    expect(model.guidsLength()).toBe(2);
+    const g0 = model.guids(0)!;
+    const g1 = model.guids(1)!;
+    expect(g0).not.toBe(g1);
+    const realGuidCount = [g0, g1].filter((g) => g === duplicatedGuid).length;
+    expect(realGuidCount).toBe(1);
+  });
+
+  it('a named organizational wrapper with no geometry gets a tracked item; a generic one does not', () => {
+    const stud: InstancedNode = {
+      name: 'Stud1',
+      nameIsGenerated: false,
+      definitionName: 'Stud',
+      layer: 'Layer0',
+      matrix: IDENTITY,
+      positionMm: [0, 0, 0],
+      properties: {},
+      guid: '',
+      meshResourceId: 'mesh_0',
+      children: [],
+    };
+    const wrapper: InstancedNode = {
+      name: 'W-2',
+      nameIsGenerated: false,
+      definitionName: '',
+      layer: 'Layer0',
+      matrix: IDENTITY,
+      positionMm: [0, 0, 0],
+      properties: {},
+      guid: '',
+      children: [stud],
+    };
+    const genericChild: InstancedNode = { ...stud, name: 'Stud2' };
+    const genericWrapper: InstancedNode = {
+      name: 'Component_5',
+      nameIsGenerated: true,
+      definitionName: '',
+      layer: 'Layer0',
+      matrix: IDENTITY,
+      positionMm: [0, 0, 0],
+      properties: {},
+      guid: '',
+      children: [genericChild],
+    };
+    const root: InstancedNode = {
+      name: 'ROOT',
+      nameIsGenerated: false,
+      definitionName: 'ROOT_MODEL',
+      layer: 'Layer0',
+      matrix: IDENTITY,
+      positionMm: [0, 0, 0],
+      properties: {},
+      guid: '',
+      children: [wrapper, genericWrapper],
+    };
+    const scene: InstancedScene = {
+      bounds: null,
+      sceneHierarchy: root,
+      meshResources: [
+        {
+          id: 'mesh_0',
+          definitionId: 1,
+          definitionName: 'Box',
+          variantKey: '1|x',
+          primitives: [boxPrimitive()],
+        },
+      ],
+      gltfMaterials: [{ pbrMetallicRoughness: { baseColorFactor: [1, 1, 1, 1] } }],
+      textures: [],
+      layerHidden: {},
+    };
+
+    const rawBytes = toFragments(scene, { raw: true });
+    const bb = new flatbuffers.ByteBuffer(rawBytes);
+    const model = Model.getRootAsModel(bb);
+    // wrapper (W-2, named, no geometry) + Stud1 + Stud2 = 3 tracked items;
+    // genericWrapper itself (nameIsGenerated) is NOT tracked.
+    expect(model.localIdsLength()).toBe(3);
+
+    let foundW2 = false;
+    for (let i = 0; i < model.attributesLength(); i++) {
+      const attr = model.attributes(i)!;
+      for (let j = 0; j < attr.dataLength(); j++) {
+        if (attr.data(j).includes('W-2')) foundW2 = true;
+      }
+    }
+    expect(foundW2).toBe(true);
+  });
+
+  it('generated-name guids are listed in metadata', () => {
+    const scene = makeOneInstanceScene(IDENTITY, 'Component_7');
+    scene.sceneHierarchy.children[0].nameIsGenerated = true;
+    const rawBytes = toFragments(scene, { raw: true });
+
+    const bb = new flatbuffers.ByteBuffer(rawBytes);
+    const model = Model.getRootAsModel(bb);
+    const guid = model.guids(0)!;
+    const meta = JSON.parse(model.metadata()!);
+    expect(meta.generated_name_guids).toContain(guid);
   });
 });
 
@@ -679,7 +833,15 @@ describe('Real @thatopen/fragments npm package interop (SingleThreadedFragmentsM
 
     const model = new SingleThreadedFragmentsModel('test-gondola', fragBytes);
     const itemsIds = model.getItemsIds();
-    expect(itemsIds.length).toBe(81);
+    // 84, not the previous 81: collectLeaves now tracks a named
+    // organizational wrapper using the real nameIsGenerated flag (matching
+    // Python's/C++'s own instanced_scene name resolution) instead of a
+    // "has some non-empty name" approximation - a wrapper whose only name
+    // is a real (non-generic) DEFINITION name, with no instance-level name
+    // of its own, now correctly counts as named too. Cross-checked directly
+    // against Python's own to_fragments() output for this exact fixture:
+    // byte-for-byte the same 84 tracked items.
+    expect(itemsIds.length).toBe(84);
 
     // Retrieve multiple geometry chunks
     const sampleIds = itemsIds.slice(0, 10);
@@ -698,6 +860,144 @@ describe('Real @thatopen/fragments npm package interop (SingleThreadedFragmentsM
     expect(itemsData[0]._category?.value).toBe('Gondulas Laterais');
 
     model.dispose();
+  });
+});
+
+describe('oversized shell splitting (openskp#285 / PR #355)', () => {
+  // A single shell (Fragments' term for one baked triangle mesh) has no
+  // representation for more than 65535 triangles: profilesFaceIds is a
+  // plain ushort array in the real schema (index.fbs), with no uint32
+  // escape hatch the way POINTS get past 65535 via BigShellProfile. A real
+  // production model with one 222,000+-triangle primitive (a large
+  // flattened/dense mesh) hit this in practice on the Python port - see
+  // PR #355 for the full incident. Unlike Python (which threw at write
+  // time), this port's old `faceIds[i] = i & 0xffff` silently WRAPPED
+  // instead of throwing - a worse bug in one sense: it wrote wrong/
+  // colliding face ids instead of failing loudly. getOrBakeShell now
+  // splits an oversized primitive's triangles into multiple shells
+  // instead, each within the ushort limit.
+
+  function gridPrimitive(cols: number, rows: number): LocalPrimitive {
+    const positions = new Float32Array(cols * rows * 3);
+    for (let j = 0; j < rows; j++) {
+      for (let i = 0; i < cols; i++) {
+        const v = j * cols + i;
+        positions[v * 3] = i;
+        positions[v * 3 + 1] = j;
+        positions[v * 3 + 2] = 0;
+      }
+    }
+    const triCells = (cols - 1) * (rows - 1);
+    const indices = new Uint32Array(triCells * 6);
+    let k = 0;
+    for (let j = 0; j < rows - 1; j++) {
+      for (let i = 0; i < cols - 1; i++) {
+        const a = j * cols + i;
+        const b = a + 1;
+        const c = a + cols;
+        const d = c + 1;
+        indices[k++] = a; indices[k++] = b; indices[k++] = d;
+        indices[k++] = a; indices[k++] = d; indices[k++] = c;
+      }
+    }
+    return {
+      positions,
+      normals: new Float32Array(cols * rows * 3),
+      uvs: new Float32Array(cols * rows * 2),
+      indices,
+      materialIndex: 0,
+    };
+  }
+
+  function sceneWithOnePrimitive(prim: LocalPrimitive, meshId: string): InstancedScene {
+    const resource: InstancedMeshResource = {
+      id: meshId,
+      definitionId: 1,
+      definitionName: 'BigMesh',
+      variantKey: '1|255,255,255',
+      primitives: [prim],
+    };
+    const node: InstancedNode = {
+      name: 'Big',
+      nameIsGenerated: false,
+      definitionName: 'BigMesh',
+      layer: 'Framing',
+      matrix: IDENTITY,
+      positionMm: [0, 0, 0],
+      properties: {},
+      guid: '',
+      meshResourceId: meshId,
+      children: [],
+    };
+    const root: InstancedNode = {
+      name: 'ROOT',
+      nameIsGenerated: false,
+      definitionName: 'ROOT_MODEL',
+      layer: 'Layer0',
+      matrix: IDENTITY,
+      positionMm: [0, 0, 0],
+      properties: {},
+      guid: '',
+      children: [node],
+    };
+    return {
+      bounds: null,
+      sceneHierarchy: root,
+      meshResources: [resource],
+      gltfMaterials: [{ pbrMetallicRoughness: { baseColorFactor: [1.0, 1.0, 1.0, 1.0] } }],
+      textures: [],
+      layerHidden: {},
+    };
+  }
+
+  it('splits an oversized primitive and every face id across every sub-shell is correct and sequential', () => {
+    const cols = 210, rows = 165;
+    const expectedTriangles = (cols - 1) * (rows - 1) * 2;
+    expect(expectedTriangles).toBeGreaterThan(65535); // sanity-check the fixture itself exceeds the limit under test
+
+    const scene = sceneWithOnePrimitive(gridPrimitive(cols, rows), 'mesh_big');
+
+    // This is the exact shape of call that, before the fix, silently wrote
+    // wrapped-around (wrong) face ids via `i & 0xffff` - the primary
+    // regression check is that the result is now actually correct, not
+    // just that it doesn't throw (unlike Python's own crash-shaped version
+    // of this bug).
+    const rawBytes = toFragments(scene, { raw: true });
+    const bb = new flatbuffers.ByteBuffer(rawBytes);
+    const model = Model.getRootAsModel(bb);
+    const meshes = model.meshes()!;
+
+    expect(meshes.shellsLength()).toBeGreaterThan(1); // confirms the split actually happened, not a no-op
+    expect(meshes.samplesLength()).toBe(meshes.shellsLength()); // one sample per split shell, same item/material
+
+    let totalTriangles = 0;
+    for (let i = 0; i < meshes.shellsLength(); i++) {
+      const shell = meshes.shells(i)!;
+      expect(shell.profilesFaceIdsLength()).toBeLessThanOrEqual(65535); // every sub-shell stays within the ushort limit
+      expect(shell.profilesLength()).toBe(shell.profilesFaceIdsLength());
+      // Every face id in a shell is a small, sequential, non-wrapped 0..N-1
+      // run - the exact thing the old `i & 0xffff` mask could silently
+      // violate once a shell's own triangle count exceeded 65535.
+      for (let j = 0; j < shell.profilesFaceIdsLength(); j++) {
+        expect(shell.profilesFaceIds(j)).toBe(j);
+      }
+      totalTriangles += shell.profilesFaceIdsLength();
+    }
+    expect(totalTriangles).toBe(expectedTriangles);
+  });
+
+  it('a primitive within the limit still produces exactly one shell', () => {
+    // Regression guard on the split path itself: a normal, non-huge
+    // primitive must not be needlessly split into multiple shells.
+    const scene = sceneWithOnePrimitive(gridPrimitive(50, 50), 'mesh_small'); // 49*49*2 = 4802 triangles
+
+    const rawBytes = toFragments(scene, { raw: true });
+    const bb = new flatbuffers.ByteBuffer(rawBytes);
+    const model = Model.getRootAsModel(bb);
+    const meshes = model.meshes()!;
+
+    expect(meshes.shellsLength()).toBe(1);
+    expect(meshes.samplesLength()).toBe(1);
   });
 });
 

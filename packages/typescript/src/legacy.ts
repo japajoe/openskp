@@ -937,9 +937,15 @@ function strictNextTag(ar: Archive, data: Uint8Array, at: number, allowNull = tr
 function readConstructionLine(ar: Archive, r: R): any {
   preamble(ar, r);
   drawbase(ar, r);
-  r.f64s(3);
-  r.f64s(3);
-  r.f64s(2); // line params (+-~4.4e29 = infinite)
+  const point = r.f64s(3);
+  const direction = r.f64s(3);
+  // Signed distance along `direction` from `point` marking where the visible segment
+  // starts/ends - ground truth (real SketchUp 2025, SDK/Ruby cross-checked): a bounded
+  // segment's start/end exactly equal point/direction scaled by these two parameters
+  // (verified against Sketchup::ConstructionLine#start/#end/#direction byte-for-byte,
+  // including the segment LENGTH as end_param); an unbounded direction uses a +-1e30
+  // sentinel, matching Sketchup::ConstructionLine#start/#end returning nil for that side.
+  const [startParam, endParam] = r.f64s(2); // line params (+-~4.4e29 = infinite)
   // The trailing block varies by the WRITING BUILD, not cleanly by
   // version: 7 bytes on the v17 calibration corpus, 4 on v16 and on a real
   // v18, 0 on another real v17. Self-calibrate on the first guide line of
@@ -964,7 +970,15 @@ function readConstructionLine(ar: Archive, r: R): any {
     ar.clineTail = k;
   }
   r.raw(k);
-  return { k: 'cline' };
+
+  const huge = 1e20; // well below the real +-1e30 sentinel, far above any real geometry extent
+  const start = Math.abs(startParam) >= huge
+    ? null
+    : [point[0] + direction[0] * startParam, point[1] + direction[1] * startParam, point[2] + direction[2] * startParam];
+  const end = Math.abs(endParam) >= huge
+    ? null
+    : [point[0] + direction[0] * endParam, point[1] + direction[1] * endParam, point[2] + direction[2] * endParam];
+  return { k: 'cline', point: [point[0], point[1], point[2]], direction: [direction[0], direction[1], direction[2]], start, end };
 }
 
 function readConstructionPoint(ar: Archive, r: R): any {
@@ -978,7 +992,7 @@ function readConstructionPoint(ar: Archive, r: R): any {
 
 function readSectionPlane(ar: Archive, r: R): any {
   preamble(ar, r);
-  drawbase(ar, r);
+  const db = drawbase(ar, r);
   // optional object pointer before the plane; a real plane starts with a
   // unit-normal component (|x| <= 1) - a tag word does not decode as one
   const view = new DataView(r.data.buffer, r.data.byteOffset, r.data.byteLength);
@@ -986,13 +1000,15 @@ function readSectionPlane(ar: Archive, r: R): any {
   if (!(Math.abs(first) <= 1.0001)) {
     ar.readObject(r);
   }
-  r.f64s(4);
+  const plane = r.f64s(4);
+  let name = '';
+  let label = '';
   if (bytesEqual(r.peek(3), STR_MARKER)) {
     // v18: name + short label
-    r.utf16();
-    r.utf16();
+    name = r.utf16();
+    label = r.utf16();
   }
-  return { k: 'sectionplane' };
+  return { k: 'sectionplane', plane, name, label, db };
 }
 
 function readSkFont(ar: Archive, r: R): any {
@@ -1564,6 +1580,13 @@ class LegacyBuilder {
   sectionPlanes: { plane: [number, number, number, number]; name: string; label: string; hidden: boolean }[] = [];
   texts: { text: string; hidden: boolean }[] = [];
   dimensions: { text: string; hidden: boolean }[] = [];
+  constructionLines: {
+    point: [number, number, number];
+    direction: [number, number, number];
+    start: [number, number, number] | null;
+    end: [number, number, number] | null;
+  }[] = [];
+  constructionPoints: { position: [number, number, number] }[] = [];
 }
 
 function addEdge(builder: LegacyBuilder, slot: number, e: any, slots: Map<number, SlotEntry>): void {
@@ -1682,6 +1705,17 @@ function fillBuilder(builder: LegacyBuilder, ents: [number, string | null, any][
       builder.dimensions.push({
         text: v.text || '',
         hidden: Boolean(v.db && v.db.hidden),
+      });
+    } else if (k === 'cline') {
+      builder.constructionLines.push({
+        point: v.point,
+        direction: v.direction,
+        start: v.start,
+        end: v.end,
+      });
+    } else if (k === 'cpoint') {
+      builder.constructionPoints.push({
+        position: [v.pos[0], v.pos[1], v.pos[2]],
       });
     }
   }

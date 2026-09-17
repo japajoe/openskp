@@ -3,7 +3,17 @@ import { validateHeader, readVersion } from '../src/vff';
 import { readU32, readF64, parseVarInt, parseTlvRecursive } from '../src/parser';
 import { transformPoint, multiplyMatrices, isIdentity } from '../src/transforms';
 import { computeFaceNormal, triangulateFace3D } from '../src/triangulator';
-import { GeometryBuilder, extractGeometryFromNodes, extractUvTransforms, collectDefs, parseMaterialXml } from '../src/geometry';
+import {
+  GeometryBuilder,
+  extractGeometryFromNodes,
+  extractUvTransforms,
+  collectDefs,
+  collectLayers,
+  parseMaterialXml,
+  extractAttributeDictionaries,
+  isGenericDefinitionName,
+  findNameOverride,
+} from '../src/geometry';
 
 /** Build a single TLV element: 2-byte tag (hex) + 4-byte LE size + payload. */
 function tlv(tagHex: string, payload: Uint8Array): Uint8Array {
@@ -405,5 +415,227 @@ describe('Section plane, text entity, and dimension defaults', () => {
     expect(builder.sectionPlanes).toEqual([]);
     expect(builder.texts).toEqual([]);
     expect(builder.dimensions).toEqual([]);
+  });
+});
+
+describe('extractAttributeDictionaries - dictionary-name-aware TLV walk (openskp#254/#285)', () => {
+  // Real B436(name)/B536(entries) dictionary-boundary shape - the TLV
+  // structure extractAttributeDictionaries needs but extractDynamicProperties
+  // never required, since it flattens regardless of dictionary boundaries.
+  // Confirmed byte-for-byte against a real FrameBuilder-authored production
+  // file (see Python's TestVffAttributeDictionaries for the full
+  // verification history this mirrors).
+  const enc = (s: string) => new TextEncoder().encode(s);
+
+  function entry(key: string, value: string): Uint8Array {
+    return concatBytes(tlv('B636', enc(key)), tlv('A438', tlv('AD38', enc(value))));
+  }
+
+  function namedDict(name: string, entriesBytes: Uint8Array): Uint8Array {
+    return concatBytes(tlv('B436', enc(name)), tlv('B536', entriesBytes));
+  }
+
+  function makeD007(dc05Payload: Uint8Array): ReturnType<typeof parseTlvRecursive>[number] {
+    const bytes = tlv('D007', tlv('DC05', dc05Payload));
+    const elements = parseTlvRecursive(bytes, 0, bytes.length);
+    return elements[0];
+  }
+
+  it('groups entries by their dictionary name', () => {
+    const d007 = makeD007(namedDict('fbd-einfo', entry('code', 'Ks')));
+    const dicts = extractAttributeDictionaries(d007);
+    expect(dicts['fbd-einfo']).toEqual({ code: 'Ks' });
+  });
+
+  it('keeps two dictionaries distinct', () => {
+    const dc05 = concatBytes(
+      namedDict('dynamic_attributes', entry('width', '10')),
+      namedDict('FrameBuilder', entry('name', 'W-2'))
+    );
+    const dicts = extractAttributeDictionaries(makeD007(dc05));
+    expect(dicts['dynamic_attributes']).toEqual({ width: '10' });
+    expect(dicts['FrameBuilder']).toEqual({ name: 'W-2' });
+    expect(dicts['dynamic_attributes']['name']).toBeUndefined();
+  });
+
+  it('returns {} when there is no DC05 child', () => {
+    const d007Bytes = tlv('D007', new Uint8Array(0));
+    const elements = parseTlvRecursive(d007Bytes, 0, d007Bytes.length);
+    expect(extractAttributeDictionaries(elements[0])).toEqual({});
+  });
+
+  // Multi-value-type decoding (openskp#285's VFF 9-value-type item). Byte
+  // shapes mirror Python's TestVffAttributeDictionaries exactly - same
+  // fixture-construction approach, same real tag pairings, ground-truthed
+  // there first (also mirrored in .NET's DynamicPropertiesTests).
+  function f64(n: number): Uint8Array {
+    const b = new Uint8Array(8);
+    new DataView(b.buffer).setFloat64(0, n, true);
+    return b;
+  }
+  function i32(n: number): Uint8Array {
+    const b = new Uint8Array(4);
+    new DataView(b.buffer).setInt32(0, n, true);
+    return b;
+  }
+  function entryValue(innerTlv: Uint8Array): Uint8Array {
+    return tlv('A438', innerTlv);
+  }
+  function entryRaw(key: string, innerValueTlv: Uint8Array): Uint8Array {
+    return concatBytes(tlv('B636', enc(key)), entryValue(innerValueTlv));
+  }
+
+  it('decodes AF38 (Length) and A938 (plain Float) as distinct tags, both f64', () => {
+    const entries = concatBytes(
+      entryRaw('depth', tlv('AF38', f64(15.5))),
+      entryRaw('price', tlv('A938', f64(120.0)))
+    );
+    const dicts = extractAttributeDictionaries(makeD007(namedDict('fbd-einfo', entries)));
+    expect(dicts['fbd-einfo']).toEqual({ depth: 15.5, price: 120.0 });
+  });
+
+  it('decodes A738 as a round-tripped integer', () => {
+    const entries = entryRaw('angle', tlv('A738', i32(-7)));
+    const dicts = extractAttributeDictionaries(makeD007(namedDict('fbd-einfo', entries)));
+    expect(dicts['fbd-einfo']).toEqual({ angle: -7 });
+  });
+
+  it('decodes an A438 with no children as null', () => {
+    const entries = entryRaw('child_thickness', new Uint8Array(0));
+    const dicts = extractAttributeDictionaries(makeD007(namedDict('fbd-einfo', entries)));
+    expect(dicts['fbd-einfo']).toEqual({ child_thickness: null });
+  });
+
+  it('decodes B438 Point3d and B538 Vector3d as flat 3-tuples', () => {
+    const pointBytes = tlv('B438', concatBytes(f64(0.0), f64(0.807085), f64(14.6551)));
+    const vectorBytes = tlv('B538', concatBytes(f64(1.0), f64(0.0), f64(0.0)));
+    const entries = concatBytes(entryRaw('end_pos', pointBytes), entryRaw('vector_new', vectorBytes));
+    const dicts = extractAttributeDictionaries(makeD007(namedDict('fbd-einfo', entries)));
+    expect(dicts['fbd-einfo']).toEqual({
+      end_pos: [0.0, 0.807085, 14.6551],
+      vector_new: [1.0, 0.0, 0.0],
+    });
+  });
+
+  it('decodes an empty AE38 array as []', () => {
+    const entries = entryRaw('added_bolt_holes', tlv('AE38', new Uint8Array(0)));
+    const dicts = extractAttributeDictionaries(makeD007(namedDict('fbd-einfo', entries)));
+    expect(dicts['fbd-einfo']).toEqual({ added_bolt_holes: [] });
+  });
+
+  it('decodes an AE38 array of floats', () => {
+    const elems = concatBytes(
+      entryValue(tlv('A938', f64(0.728))),
+      entryValue(tlv('A938', f64(11.358))),
+      entryValue(tlv('A938', f64(14.655)))
+    );
+    const entries = entryRaw('flangeholes', tlv('AE38', elems));
+    const dicts = extractAttributeDictionaries(makeD007(namedDict('fbd-einfo', entries)));
+    expect(dicts['fbd-einfo']).toEqual({ flangeholes: [0.728, 11.358, 14.655] });
+  });
+
+  it('decodes a nested AE38 array (openskp#253 mirrored on the read side)', () => {
+    const inner1 = concatBytes(entryValue(tlv('A938', f64(25.17))), entryValue(tlv('A938', f64(0.07))));
+    const inner2 = concatBytes(entryValue(tlv('A938', f64(25.17))), entryValue(tlv('A938', f64(15.35))));
+    const outer = concatBytes(entryValue(tlv('AE38', inner1)), entryValue(tlv('AE38', inner2)));
+    const entries = entryRaw('lip_side1_cords', tlv('AE38', outer));
+    const dicts = extractAttributeDictionaries(makeD007(namedDict('fbd-einfo', entries)));
+    expect(dicts['fbd-einfo']).toEqual({
+      lip_side1_cords: [
+        [25.17, 0.07],
+        [25.17, 15.35],
+      ],
+    });
+  });
+
+  it('leaves an unrecognized value tag as null rather than guessing', () => {
+    const entries = entryRaw('mystery', tlv('EE99', new Uint8Array([0x01, 0x02])));
+    const dicts = extractAttributeDictionaries(makeD007(namedDict('fbd-einfo', entries)));
+    expect(dicts['fbd-einfo']).toEqual({ mystery: null });
+  });
+});
+
+describe('isGenericDefinitionName', () => {
+  it.each([
+    ['Group#1', true],
+    ['Component#12', true],
+    ['W-2', false],
+    ['Truss1', false],
+    ['', false],
+  ])('%s -> %s', (name, expected) => {
+    expect(isGenericDefinitionName(name)).toBe(expected);
+  });
+});
+
+describe('findNameOverride', () => {
+  it('skips dynamic_attributes and SU_InstanceSet', () => {
+    const dicts = {
+      dynamic_attributes: { name: 'should-be-ignored' },
+      SU_InstanceSet: { label: 'also-ignored' },
+      FrameBuilder: { name: 'W-2' },
+    };
+    expect(findNameOverride(dicts)).toBe('W-2');
+  });
+
+  it('returns null when no override is present', () => {
+    expect(findNameOverride(null)).toBeNull();
+    expect(findNameOverride({ dynamic_attributes: { width: '10' } })).toBeNull();
+  });
+});
+
+describe('collectLayers - VFF per-layer-hidden flag (openskp#285)', () => {
+  // VFF layers derive their COLOR from Layer_<name>-prefixed materials,
+  // which carry no visibility flag of their own - real visibility lives on
+  // the model.dat layer manager's own 993A/8C3C node, as a single-byte
+  // 8E3C child sibling to the already-read DC05 (id) and 8D3C (name):
+  // 1 = hidden, 0 = visible. Byte shapes mirror Python's own
+  // TestVffLayerHidden exactly (confirmed against a real production file's
+  // Tags panel), also mirrored in the .NET port's LayerHiddenTests.cs.
+  const enc = (s: string) => new TextEncoder().encode(s);
+
+  function layerNode(id: number, name: string, hidden: boolean | null): Uint8Array {
+    const parts = [tlv('DC05', new Uint8Array([id])), tlv('8D3C', enc(name))];
+    if (hidden !== null) parts.push(tlv('8E3C', new Uint8Array([hidden ? 1 : 0])));
+    return tlv('8C3C', concatBytes(...parts));
+  }
+
+  function layerManager(...layers: Uint8Array[]): ReturnType<typeof parseTlvRecursive>[number] {
+    const bytes = tlv('993A', concatBytes(...layers));
+    return parseTlvRecursive(bytes, 0, bytes.length)[0];
+  }
+
+  it('reads hidden and visible layers correctly', () => {
+    const root = layerManager(
+      layerNode(5, 'wall_external_cladding_1', true),
+      layerNode(6, 'wall', false)
+    );
+
+    const layerIdToName = new Map<number, string>();
+    const layerHidden = new Map<string, boolean>();
+    collectLayers([root], layerIdToName, undefined, layerHidden);
+
+    expect(layerIdToName.get(5)).toBe('wall_external_cladding_1');
+    expect(layerIdToName.get(6)).toBe('wall');
+    expect(layerHidden.get('wall_external_cladding_1')).toBe(true);
+    expect(layerHidden.get('wall')).toBe(false);
+  });
+
+  it('leaves layerHidden unset when there is no 8E3C tag', () => {
+    const root = layerManager(layerNode(1, 'Layer0', null));
+
+    const layerIdToName = new Map<number, string>();
+    const layerHidden = new Map<string, boolean>();
+    collectLayers([root], layerIdToName, undefined, layerHidden);
+
+    expect(layerIdToName.get(1)).toBe('Layer0');
+    expect(layerHidden.has('Layer0')).toBe(false);
+  });
+
+  it('the layerHidden parameter is optional', () => {
+    const root = layerManager(layerNode(1, 'Layer0', true));
+
+    const layerIdToName = new Map<number, string>();
+    expect(() => collectLayers([root], layerIdToName)).not.toThrow();
+    expect(layerIdToName.get(1)).toBe('Layer0');
   });
 });

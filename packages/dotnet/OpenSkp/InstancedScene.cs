@@ -48,6 +48,16 @@ namespace OpenSkp
     public sealed class InstancedNode
     {
         public string Name { get; set; } = "";
+
+        /// <summary>Whether <see cref="Name"/> is a synthetic fallback
+        /// (SketchUp's own internal index, e.g. "Component_5") rather than a
+        /// real name from the source file - no attribute-dictionary
+        /// name/label/code override, no explicit instance name, and no
+        /// non-generic definition name were found. Lets a consumer (e.g.
+        /// Fragments export) avoid presenting a placeholder as if it were
+        /// real data. Mirrors Python's/C++'s own field of the same name.</summary>
+        public bool NameIsGenerated { get; set; }
+
         public string DefinitionName { get; set; } = "";
         public string Layer { get; set; } = "";
 
@@ -59,6 +69,21 @@ namespace OpenSkp
 
         public (double X, double Y, double Z) PositionMm { get; set; }
         public Dictionary<string, string> Properties { get; set; } = new Dictionary<string, string>();
+
+        /// <summary>See Scene.cs's InstanceNode.AttributeDictionaries -
+        /// every OTHER attribute dictionary this instance carries, keyed by
+        /// the dictionary's own name (openskp#285).</summary>
+        public Dictionary<string, Dictionary<string, string>> AttributeDictionaries { get; set; } = new Dictionary<string, Dictionary<string, string>>();
+
+        /// <summary>Real SketchUp instance GUID (VFF/2021+ files only -
+        /// legacy pre-2021 files carry no per-instance GUID here), or ""
+        /// when the source file has none. Mirrors Python's/C++'s own field;
+        /// a consumer keying on this (e.g. Fragments export) is responsible
+        /// for its own collision handling - see openskp#290's rationale in
+        /// export/fragments.py for why a duplicated real GUID needs the
+        /// same synthetic-fallback treatment as a missing one.</summary>
+        public string Guid { get; set; } = "";
+
         public string? MeshResourceId { get; set; }
         public List<InstancedNode> Children { get; set; } = new List<InstancedNode>();
     }
@@ -84,6 +109,13 @@ namespace OpenSkp
         /// <summary>Distinct texture images the placed materials use,
         /// deduplicated by source bytes - same as Scene.Textures.</summary>
         public List<SceneTexture> Textures { get; set; } = new List<SceneTexture>();
+
+        /// <summary>The source file's own per-layer visibility (VFF/2021+
+        /// only - see Core.RawParsed.LayerHidden's own comment on why
+        /// legacy files default every layer to visible), read straight from
+        /// the raw parse. Mirrors Python's/C++'s own field of the same
+        /// name.</summary>
+        public Dictionary<string, bool> LayerHidden { get; set; } = new Dictionary<string, bool>();
     }
 
     /// <summary>Builds the placed scene graph with SketchUp's
@@ -116,6 +148,7 @@ namespace OpenSkp
             0, 0, 1, 0,
             0, 0, 0, 1,
         };
+
 
         /// <summary>Convert one instance's 13-element SketchUp matrix
         /// (inches, Z-up) into a 16-element column-major glTF matrix
@@ -457,14 +490,51 @@ namespace OpenSkp
                     string childDefName = refIdx.HasValue && defsDict.TryGetValue(refIdx.Value, out var childDef)
                         ? (childDef.Name ?? "") : "";
 
+                    // Fallback order: an attribute-dict name/label/code
+                    // override, then the instance's own explicit name, then
+                    // the definition's own name IF it's not itself just
+                    // SketchUp's auto-generated "Group#1"/"Component#12"
+                    // placeholder, then finally the internal index - the
+                    // only case with no real name anywhere in the source
+                    // file. Mirrors Python's/C++'s own instanced_scene name
+                    // resolution exactly.
+                    bool defNameIsReal = !string.IsNullOrEmpty(childDefName) && !Geometry.IsGenericDefinitionName(childDefName);
+                    string? nameOverride = Geometry.FindNameOverride(inst.AttributeDicts);
+                    bool instNameNonEmpty = !string.IsNullOrEmpty(inst.Name);
+                    string instName = instNameNonEmpty ? inst.Name! : (defNameIsReal ? childDefName : $"Component_{refIdx ?? 0}");
+                    string displayName = nameOverride ?? instName;
+                    bool nameIsGenerated = nameOverride == null && !instNameNonEmpty && !defNameIsReal;
+
+                    // Every OTHER attribute dictionary this instance carries -
+                    // dynamic_attributes is already surfaced separately as
+                    // Properties above, and SU_InstanceSet is SketchUp's own
+                    // always-present, always-empty Owner/Status boilerplate,
+                    // not worth surfacing. Mirrors Scene.cs's InstanceNode
+                    // (and Python's own attribute_dictionaries) exactly
+                    // (openskp#285).
+                    var attributeDictionaries = new Dictionary<string, Dictionary<string, string>>();
+                    if (inst.AttributeDicts != null)
+                    {
+                        foreach (var kv in inst.AttributeDicts)
+                        {
+                            if (kv.Key == "dynamic_attributes" || kv.Key == "SU_InstanceSet") continue;
+                            var stringified = new Dictionary<string, string>();
+                            foreach (var entry in kv.Value) stringified[entry.Key] = Geometry.StringifyVffAttrValue(entry.Value);
+                            attributeDictionaries[kv.Key] = stringified;
+                        }
+                    }
+
                     nodes.Add(new InstancedNode
                     {
-                        Name = inst.Name ?? "",
+                        Name = displayName,
+                        NameIsGenerated = nameIsGenerated,
                         DefinitionName = childDefName,
                         Layer = lName,
                         Matrix = ToGltfMatrix(inst.Matrix),
                         PositionMm = (Math.Round(itx, 2), Math.Round(ity, 2), Math.Round(itz, 2)),
                         Properties = properties,
+                        AttributeDictionaries = attributeDictionaries,
+                        Guid = inst.RefGuid ?? "",
                         MeshResourceId = refIdx.HasValue ? MeshResourceFor(refIdx.Value, instColor, lName) : null,
                         Children = children,
                     });
@@ -584,6 +654,7 @@ namespace OpenSkp
                 MeshResources = meshResources,
                 GltfMaterials = gltfMaterials,
                 Textures = textures,
+                LayerHidden = new Dictionary<string, bool>(parsed.LayerHidden),
             };
         }
 

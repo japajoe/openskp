@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Loose-edge grouping/layer on the public typed model (`Edge.layer`, `Edge.curve_id`, `Face.layer`, `loose_edge_runs()`)
+
+`SkpFile.parse()`'s typed `Definition`/`Edge`/`Face` model had no way to read a face's or edge's own layer, or SketchUp's own `Edge#curve` grouping - only `build_scene()`/`build_instanced_scene()` could reach that data, and only internally, since both bake it straight into triangulated mesh output. A consumer building real B-rep geometry rather than a render mesh (exactly what the FreeCAD addon needs for loose-edge/structural-framing import) had no way to get there at all.
+
+Added `Edge.layer`/`Edge.curve_id` and `Face.layer` (all `Optional[int]`, `None` when the file has no override), and a new public `openskp.loose_edge_runs(definition)` function that groups a definition's loose edges (edges no face uses) into ordered `(edge_ids, vertex_ids, closed)` runs - the same file-driven grouping `build_scene()`'s `curve_sets` and `build_instanced_scene()`'s `curve_resources` already use, now exposed for typed-model consumers directly, returning raw ids rather than baked/triangulated coordinates.
+
+Also exports `InstancedCurveResource`/`LocalCurve` from the package's top level (`import openskp`) - added alongside `build_instanced_scene()`'s curve-resource support earlier but never actually added to `__init__.py`'s public exports.
+
+Verified by cross-validating against `build_instanced_scene()`'s own (already-tested) `curve_resources` on every fixture on hand: the same run count, in the same order, with matching coordinates, comes out of both the baked-mesh path and this new raw-typed-model path for the same definition.
+
+Python-only. TypeScript/.NET/Dart/C++ don't have this on the typed model, or the underlying edge-layer/curve-grouping read at all - tracked with the rest in [#285](https://github.com/iamahsanmehmood/openskp/issues/285).
+
+### Added — Loose-edge/curve support in `build_instanced_scene()` (structural framing, light-gauge steel)
+
+`build_scene()` gained loose-edge curve sets in the entry below (openskp#316) - `build_instanced_scene()` had no equivalent at all, so a definition made entirely of loose edges (a light-gauge-steel or timber-framing member drawn as a construction line rather than a solid - exactly how a structural model routinely represents studs, king studs, header jack studs) contributed nothing to the instanced scene whatsoever. Found by a real user testing the [Blender addon](https://github.com/iamahsanmehmood/blender-openskp) against a real structural-framing file: 93 of the file's 145 definitions were entirely or partly loose-edge, invisible on import.
+
+Two new types mirror the existing mesh-resource shape: `InstancedCurveResource` (a definition's loose-edge runs, local space, built once) and `LocalCurve` (one run's points/closed flag/layer/arc), referenced from `InstancedNode.curve_resource_id` the same way `mesh_resource_id` already works. The underlying curve-chaining and analytic-arc-recovery logic (`_order_curve`/`_chain_loose_edges`/`_solve_run_arc`) was extracted from `scene.py` into a new internal `_curves.py` module rather than duplicated - both paths need the exact same math, none of it baked-vs-instanced-specific.
+
+Verified against real fixture files by cross-validating both code paths against each other: flattening the instanced output (composing node transforms) has to reproduce `build_scene()`'s own `curve_sets` exactly, on every fixture on hand (`test_reproduces_build_scenes_curve_sets`), the same strategy the existing triangle-equivalence test already uses. That cross-check caught a real bug before it shipped: a definition with BOTH faces and loose edges resolved the loose edges' fallback layer from the *calling instance's* inherited layer instead of the definition's own dominant face layer (scene.py's `instantiate()` reassigns its local `parent_layer` from the definition's own faces before its loose-edge block runs - a step this port initially missed). Confirmed on `gondola_v20.skp`: run 12 onward resolved `'Layer0'` where the baked path correctly resolved `'Gondulas Laterais'`, fixed, then re-verified point-for-point across all fixtures.
+
+Python-only. TypeScript/.NET/Dart/C++ have neither `build_instanced_scene()`'s curve support nor `build_scene()`'s (from #316) - tracked in [#285](https://github.com/iamahsanmehmood/openskp/issues/285).
+
+### Added — Curve-only models reach the IFC: loose-edge runs as `IfcAnnotation`, proven arcs as `IfcIndexedPolyCurve`
+
+A drawing-style model - a facade elevation, a section outline - is loose edges only, with no faces anywhere. `build_scene()` had nothing to bake, so the IFC export came out as a spatial skeleton with no elements in it at all: real line work, present in the file, absent from the output.
+
+Both places the information was dropped are fixed. `legacy.py` and `_core.py` now surface four values they were reading and then discarding: the edge's own layer (VFF `D207`, the classic drawbase - the *only* layer signal a curve-only model carries, since it has no faces to carry one), the file's own `Edge#curve` grouping (`BB0B`, the classic `CCurve` pointer), the 14 doubles of a classic `CArcCurve` (center, normal, x-axis, start, end, y-axis), and each face's own layer - the classic walker parsed the face drawbase and copied only material/hidden out of it, so every face arrived on whichever layer it happened to inherit. `scene.py` chains loose edges into world-space runs along the file's own curves rather than by a vertex-adjacency heuristic, and `export/ifc.py` writes each run as an `IfcAnnotation` holding an `IfcGeometricCurveSet` in an `Annotation` sub-context, with the layer assignment carrying the curve, so the layer the author drew on survives into the file.
+
+A run that is provably one whole circular arc stays an arc instead of its tessellation. Three things have to hold before a run is called one - it is the entire curve, its frame is a circle and not an ellipse (`|normal × x_axis - y_axis|` within tolerance), and every vertex lies on that circle - and the result goes out as an `IfcIndexedPolyCurve` with `IfcArcIndex` segments. A run that fails any of the three keeps the chords the file stores; the real case is gondola's 16 non-uniformly-scaled arc frames out of 30, which are genuinely elliptical. That is a floor rather than a gap: IFC4 has no elliptical-arc expression in this shape, so the chords are the file's own evidence, and inventing something else would be worse than keeping them.
+
+The extra geometry is opt-out via `build_scene(include_curve_sets=False)`, measured at +5.7% of the IFC on one model carrying both solids and curves. On a curve-only model there is nothing to opt out of - the curve sets are the entire content.
+
+Known limit, asserted in the tests rather than left implicit: a closed full turn goes out as two half-turn segments, and a run whose arc cannot be closed that way is conservatively left as chords rather than guessed at.
+
+Python-only. TypeScript/.NET/Dart/C++ have neither these reads nor the annotation path - no `IfcAnnotation`, no `IfcArcIndex`, no edge-layer surfacing in any of the four - tracked with the rest in [#285](https://github.com/iamahsanmehmood/openskp/issues/285).
+
+### Fixed — Python: the IFC4 writer emitted STEP that a conforming reader rejects (360 problems across 10 files → 0)
+
+Four independent defects, each found by reading what a real reader said about a real export rather than by guessing, and each verified afterwards against `ifcopenshell` 0.8.5 `validate(express_rules=True)`, which type-checks every attribute against the schema. Re-exporting the same ten files with the four fixes reverted and then in place gives 360 problems → 0.
+
+- **Non-ASCII text went out as raw UTF-8.** ISO 10303-21's default character set is ISO 8859-1, so anything outside it has to be escaped as `\X2\<UTF-16BE uppercase hex>\X0\`. A real model with Chinese element names (楼梯间, 楼板, 外墙…) exported 35 raw non-ASCII characters and 0 escapes before, 0 and 19 after. The trap is that nothing complains: `ifcopenshell` opens the file happily and silently drops the characters, so the names come back missing their text and no diagnostic anywhere says so.
+- **`.TRUE.`/`.FALSE.` are IFC2x spellings** - IFC4 is `.T.`/`.F.`. Same class of error in two more places: `.READWRITE.` is not a valid `IfcChangeActionEnum` (`NOCHANGE` is), and `.STERADIANUNIT.` is not a valid `IfcUnitEnum` (`SOLIDANGLEUNIT` is - the *unit name* stays `.STERADIAN.`). These two spellings put at least two problems into every one of the ten files.
+- **Every product line was written with 9 attributes.** IFC entity types do not share one attribute count - `IfcDoor` declares 13, `IfcWall` 9 - so shorter types were over-long and longer ones lost their trailing attributes. `export/ifc_attr_counts.json` now carries the count per type, generated from the schema rather than typed by hand.
+- **`IfcTriangulatedFaceSet.Closed` was a hardcoded claim.** It is now computed: coordinates welded at 6dp, then every undirected edge has to be used by exactly two triangles. A mesh with a boundary is reported open, as is one with an edge used three times; the previous value asserted closure about meshes that were not closed.
+
+The same class of silent failure bit the arc work above, and is worth recording because it is exactly how a writer's bug survives: `IfcArcIndex` is a *defined type*, not an entity, so a standalone `#n=IFCARCINDEX(...)` line is a syntax error - and `ifcopenshell` 0.8.5 answers a syntax error by truncating the file at that line without a word, its `validate()` still reporting "0 problems", because the entities it never read cannot be wrong. The segment is therefore emitted inline, and a test opens the file with an actual reader and counts what came back.
+
+Python-only, and all four are worth checking in the other four ports' IFC writers - tracked in [#285](https://github.com/iamahsanmehmood/openskp/issues/285).
+
 ### Fixed — Overlapping face holes triangulated to an arbitrary, undefined triangle count (#285)
 
 Root-caused the ".NET vs Python triangle/vertex-count divergence on a real file" item: a real fixture (`Untitled.skp`) has faces with two circular holes close enough together (centers 0.33" apart, radius 0.69" each — evidently one slotted/oval cutout recorded as two overlapping full circles) that they genuinely overlap. Feeding two overlapping rings to a hole-based earcut triangulator is undefined - there's no single well-defined triangulation of self-intersecting boundary input, so this project's own `mapbox_earcut` call and the independently-implemented .NET port each picked *some* triangle count for it, never the same one. It was never a case of one implementation needing to copy the other's number; neither was computing anything well-defined.

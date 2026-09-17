@@ -54,6 +54,8 @@ class GeometryBuilder {
   final List<SectionPlane> sectionPlanes = [];
   final List<TextEntity> texts = [];
   final List<Dimension> dimensions = [];
+  final List<ConstructionLine> constructionLines = [];
+  final List<ConstructionPoint> constructionPoints = [];
 }
 
 class RawTexture {
@@ -201,7 +203,7 @@ class Geometry {
   /// - within that tree, a B636 tag carries a property key and the AD38
   /// tag immediately after it carries that property's value.
   static const Set<String> _propContainerTags = {
-    'DD05', 'B536', 'B136', 'B236', 'B336', 'B036', 'A438',
+    'DD05', 'B536', 'B136', 'B236', 'B336', 'B036', 'A438', 'AE38',
   };
 
   static Map<String, String> extractDynamicProperties(TlvNode d007) {
@@ -227,6 +229,152 @@ class Geometry {
 
     extractProps(propElements);
     return properties;
+  }
+
+  // AF38 (Length) and A938 (plain Float) both encode as a flat 8-byte
+  // float64 but are genuinely different tags - real SketchUp/FrameBuilder
+  // data uses both for different keys.
+  static const Set<String> _vffAttrDoubleTags = {'AF38', 'A938'};
+
+  /// Decode one A438-wrapped attribute value node into a native Dart
+  /// value. A438 with no children is null; otherwise it has exactly one
+  /// child holding the value's own type tag. An unrecognized type tag (or
+  /// a payload of the wrong size for its tag) is left undecoded (returns
+  /// null) rather than guessed at - matching this project's standing rule
+  /// to never assume an unverified binary layout. Mirrors Python's
+  /// `_decode_vff_attr_value` exactly (7 of the format's 9 documented
+  /// types - no native bool/time_t tag has ever been observed in real
+  /// data, so 7/9 is the real ceiling, not an arbitrary stopping point).
+  static Object? _decodeVffAttrValue(TlvNode a438Node) {
+    if (a438Node.children.isEmpty) return null;
+    final child = a438Node.children.first;
+    final tag = child.tag;
+    final payload = child.payload;
+    if (tag == 'AD38') return utf8.decode(payload, allowMalformed: true);
+    if (_vffAttrDoubleTags.contains(tag) && payload.length == 8) {
+      return Tlv.readF64(payload, 0);
+    }
+    if (tag == 'A738' && payload.length == 4) return Tlv.readI32(payload, 0);
+    if ((tag == 'B438' || tag == 'B538') && payload.length == 24) {
+      return [Tlv.readF64(payload, 0), Tlv.readF64(payload, 8), Tlv.readF64(payload, 16)];
+    }
+    if (tag == 'AE38') {
+      return child.children.map(_decodeVffAttrValue).toList();
+    }
+    return null;
+  }
+
+  /// Render an already-typed VFF attribute value as a string, matching
+  /// [extractDynamicProperties]'s pre-existing `Map<String, String>`
+  /// contract - mirrors Python's `_stringify_vff_attr_value` exactly.
+  static String stringifyVffAttrValue(Object? value) {
+    if (value == null) return '';
+    if (value is List) {
+      return value.map(stringifyVffAttrValue).join(',');
+    }
+    return value.toString();
+  }
+
+  /// Extract EVERY attribute dictionary attached to a D007 container node,
+  /// keyed by the dictionary's own declared name (tag B436) rather than
+  /// merged into one flat dict - mirrors Python's
+  /// `_core.extract_attribute_dictionaries` exactly (openskp#254), decoding
+  /// every value type the format carries rather than only strings
+  /// (openskp#285) - see [_decodeVffAttrValue] for the full type table
+  /// this project has ground-truthed.
+  ///
+  /// Each dictionary is a B436 (name) node immediately followed by a
+  /// sibling entries container (typically B536) holding that dictionary's
+  /// own B636 (key name) / A438 (type-tagged value) pairs. Returns `{}`
+  /// when the entity carries no DC05 subtree at all.
+  ///
+  /// NOT the same view as [extractDynamicProperties] above, which flattens
+  /// every dictionary's entries into one bag regardless of which named
+  /// dictionary each pair came from - that established, if non-
+  /// canonically-named, contract is left untouched since real callers
+  /// depend on it.
+  static Map<String, Map<String, Object?>> extractAttributeDictionaries(TlvNode d007) {
+    final dictionaries = <String, Map<String, Object?>>{};
+    final dc05 = d007.children.where((c) => c.tag == 'DC05').firstOrNull;
+    if (dc05 == null) return dictionaries;
+    final propElements =
+        Tlv.parseRecursive(dc05.payload, 0, dc05.payload.length, _propContainerTags);
+
+    // currentKey lives OUTSIDE extractEntries (reset per dictionary right
+    // before each call, in walk below) rather than as a local inside it -
+    // kept for the same defensive reason as extractDynamicProperties's own
+    // extractProps: a real file's exact nesting isn't something to assume
+    // beyond what's been ground-truthed, even though B636/A438 are direct
+    // siblings here (unlike that function's B636/AD38, which can be split
+    // across a recursion level).
+    String? currentKey;
+    void extractEntries(List<TlvNode> nodes, Map<String, Object?> entries) {
+      for (final n in nodes) {
+        if (n.tag == 'B636') {
+          currentKey = utf8.decode(n.payload, allowMalformed: true);
+        } else if (n.tag == 'A438' && currentKey != null) {
+          entries[currentKey!] = _decodeVffAttrValue(n);
+          currentKey = null;
+        } else {
+          extractEntries(n.children, entries);
+        }
+      }
+    }
+
+    void walk(List<TlvNode> nodes) {
+      for (var i = 0; i < nodes.length; i++) {
+        if (nodes[i].tag == 'B436') {
+          final name = utf8.decode(nodes[i].payload, allowMalformed: true);
+          final entries = <String, Object?>{};
+          currentKey = null;
+          if (i + 1 < nodes.length) {
+            extractEntries(nodes[i + 1].children, entries);
+          }
+          dictionaries[name] = entries;
+        } else {
+          walk(nodes[i].children);
+        }
+      }
+    }
+
+    walk(propElements);
+    return dictionaries;
+  }
+
+  // Matches SketchUp's own auto-generated placeholder definition names
+  // ("Group#1", "Component#12"), which carry no more meaning than the
+  // internal index they'd otherwise fall back to - mirrors Python's
+  // _is_generic_definition_name()/C++'s is_generic_definition_name()
+  // exactly (same pattern, same purpose). Shared by scene.dart's and
+  // instanced_scene.dart's own display-name resolution.
+  static final RegExp _genericDefinitionNamePattern = RegExp(r'^(?:Group|Component)\d*#\d+$');
+
+  static bool isGenericDefinitionName(String name) => _genericDefinitionNamePattern.hasMatch(name);
+
+  // "name"/"label"/"code" checked in this order, first dictionary (other
+  // than dynamic_attributes/SU_InstanceSet) and first key found wins -
+  // mirrors Python's/C++'s own name_override_keys default.
+  static const List<String> _nameOverrideKeys = ['name', 'label', 'code'];
+
+  /// Look for a display-name override in any attribute dictionary the
+  /// instance carries OTHER than "dynamic_attributes" (SketchUp's own
+  /// Dynamic Components dictionary, already surfaced separately as
+  /// `properties`) or "SU_InstanceSet" - whichever third-party plugin
+  /// wrote it (FrameBuilder's "name", TechSteel's "label", etc.), same
+  /// fallback order and exclusions as Python's/C++'s own instanced_scene/
+  /// scene name-resolution. Returns `null` when no override is present.
+  static String? findNameOverride(Map<String, Map<String, Object?>>? attributeDicts) {
+    if (attributeDicts == null) return null;
+    for (final dictName in attributeDicts.keys) {
+      if (dictName == 'dynamic_attributes' || dictName == 'SU_InstanceSet') continue;
+      final entries = attributeDicts[dictName]!;
+      for (final key in _nameOverrideKeys) {
+        if (!entries.containsKey(key)) continue;
+        final val = stringifyVffAttrValue(entries[key]);
+        if (val.isNotEmpty) return val;
+      }
+    }
+    return null;
   }
 
   static void extractGeometryFromNodes(
@@ -433,7 +581,8 @@ class Geometry {
   // ── Layer / material ID lookups (used by Core.fullParse) ────────────────
 
   static void collectLayers(
-      List<TlvNode> nodes, Map<int, String> layerIdToName) {
+      List<TlvNode> nodes, Map<int, String> layerIdToName,
+      [Map<String, bool>? layerHidden]) {
     for (final el in nodes) {
       if (el.tag == '993A') {
         for (final child in el.children) {
@@ -444,11 +593,26 @@ class Geometry {
               final lId = _parseIdFromDc05(dc05.payload);
               final lName = Tlv.decodeUtf8(nameNode.payload);
               layerIdToName[lId] = lName;
+
+              // 8E3C: a single byte, 1 = hidden / 0 = visible - confirmed
+              // byte-for-byte against a real production file's own Tags
+              // panel (openskp FrameSmart pipeline report, 2026-09-08):
+              // every layer showing a hollow (hidden) eye icon had
+              // 8E3C=01, every visible one had 8E3C=00. Mirrors Python's
+              // own collect_layers exactly (openskp#285) - the VFF-format
+              // counterpart of the legacy format's already-known
+              // layer-hidden flag.
+              if (layerHidden != null) {
+                final hiddenNode = findChildTag(child.children, '8E3C');
+                if (hiddenNode != null && hiddenNode.payload.isNotEmpty) {
+                  layerHidden[lName] = hiddenNode.payload[0] == 1;
+                }
+              }
             }
           }
         }
       }
-      collectLayers(el.children, layerIdToName);
+      collectLayers(el.children, layerIdToName, layerHidden);
     }
   }
 
