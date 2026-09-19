@@ -26,7 +26,7 @@ others, that's stated plainly rather than smoothed over.
 - [Observability: progress and errors](#observability)
 - [Error handling](#error-handling)
 - [Export capabilities](#export-capabilities)
-  - [Fragments export](#fragments-export) — Python only, not on PyPI yet
+  - [Fragments export](#fragments-export)
 - [Write capabilities](#write-capabilities)
 - [The web viewer](#the-web-viewer)
 - [Known cross-language differences](#known-cross-language-differences)
@@ -412,19 +412,14 @@ case without writing that loop yourself.
 
 ### Fragments export
 
-> **Python and C++ only, neither on a package registry yet.** See
-> [ROADMAP.md](../ROADMAP.md#cross-language-porting-backlog) for TypeScript/
-> .NET/Dart's status and
-> [docs/LANGUAGE_PARITY.md](LANGUAGE_PARITY.md) for the full parity picture.
-> Install Python with:
-> ```bash
-> pip install "openskp[fragments] @ git+https://github.com/iamahsanmehmood/openskp.git@preview-python-v1.3.2#subdirectory=packages/python"
-> ```
-> Build C++ from the [`preview-cpp-v1.3.1`](https://github.com/iamahsanmehmood/openskp/releases/tag/preview-cpp-v1.3.1)
-> tag — check it out directly and follow the C++17/CMake Quick Start in
-> [README.md](../README.md) (`find_package(OpenSkp CONFIG REQUIRED)`). C++
-> measured roughly 5-9x faster end to end than the Python pipeline on the
-> same real files (parse + scene build + export).
+> **Available in all 5 languages as of 1.3.0** (`pip install openskp`,
+> `npm install openskp`, `dotnet add package OpenSkp`, `dart pub add
+> openskp`, or the C++17/CMake Quick Start in [README.md](../README.md)).
+> See [docs/LANGUAGE_PARITY.md](LANGUAGE_PARITY.md) for the full parity
+> picture, including the one thing not yet ported anywhere but Python:
+> reading a `.frag` file back. C++ measured roughly 5-9x faster end to end
+> than the Python pipeline on the same real files (parse + scene build +
+> export).
 
 `openskp.export.fragments` / `openskp::to_fragments()` write [ThatOpen's Fragments](https://github.com/ThatOpen/engine_fragment)
 format — a public FlatBuffers-based binary format designed for fast loading
@@ -496,15 +491,12 @@ What's carried through from the source `.skp` file:
   the format.
 - `Model.guid` — the single model-level identifier, distinct from each
   item's own per-instance guid above — is still an unpopulated placeholder.
-- Python and C++ have this today (both GitHub-only preview tags — see
-  above). TypeScript now has it too
-  ([#276](https://github.com/iamahsanmehmood/openskp/pull/276), merged on
-  `main`, not npm-published yet) — the real, canonical ThatOpen FlatBuffers
-  schema (not hand-rolled), TRS decomposition and scale/mirror baking
-  matching Python/C++, and verified via a real round-trip through the
-  `@thatopen/fragments` npm package's own `SingleThreadedFragmentsModel`,
-  not just this project's own generated bindings. .NET and Dart have no
-  work started on this.
+- All 5 languages have this as of 1.3.0. TypeScript uses the real,
+  canonical ThatOpen FlatBuffers schema (not hand-rolled), with TRS
+  decomposition and scale/mirror baking matching Python/C++, verified via
+  a real round-trip through the `@thatopen/fragments` npm package's own
+  `SingleThreadedFragmentsModel`, not just this project's own generated
+  bindings.
 - C++'s attribute dictionary values are strings only (no native
   `Point3d`/`Length`/nested-list types like Python has) — matches its
   existing string-only property handling elsewhere. See
@@ -512,13 +504,16 @@ What's carried through from the source `.skp` file:
 
 ### Reading a `.frag` file back
 
-> **Python only, and not on PyPI yet** — same preview tag as the export
-> side above. See [Fragments export](#fragments-export) for install steps.
+> **All five languages.** The last remaining cross-language gap from the
+> 1.3.0 synchronized release - see
+> [docs/LANGUAGE_PARITY.md](LANGUAGE_PARITY.md).
 
 The mirror direction: `openskp.export.fragments.read()`/`from_fragments()`
-parse a real `.frag` file straight into an `InstancedScene` — OpenSKP's
-6th input format alongside `.skp`. Any file works, not just one this
-project wrote — ThatOpen's own real `IfcImporter` output, or anyone
+(Python), `fromFragments()` (TypeScript and Dart, same name in both),
+`FragmentsExport.FromFragments()` (.NET), or `openskp::from_fragments()`
+(C++) parse a real `.frag` file straight into an `InstancedScene` —
+OpenSKP's 6th input format alongside `.skp`. Any file works, not just one
+this project wrote — ThatOpen's own real `IfcImporter` output, or anyone
 else's:
 
 ```python
@@ -533,15 +528,73 @@ from openskp.export import instanced_glb
 # STL/PLY/DXF/IFC4/JSON — whatever the file needs next.
 ```
 
-Verified two ways: round-trips this project's own output exactly (world-
-space vertex positions match to the last bit, not just object counts —
-see `tests/test_fragments.py`'s `TestFromFragments`), and reads a real
-ThatOpen-produced production file (a genuine IFC-derived building, 5,751
-nodes / 100,332 vertices) cleanly — re-exporting that file through this
-same module and loading the result back through the actual
-`@thatopen/fragments` runtime preserves real IFC GUIDs and category names.
+```typescript
+import { fromFragments, toInstancedGLB } from 'openskp';
+import * as fs from 'fs';
 
-**Known limitations, stated plainly:**
+const scene = fromFragments(fs.readFileSync('model.frag'));
+// Rides every other export this project already has, same as a scene
+// from buildInstancedScene() would.
+```
+
+```csharp
+using OpenSkp.Fragments;
+
+var scene = FragmentsExport.ReadFragments("model.frag");
+// ...or FragmentsExport.FromFragments(bytes) directly from an in-memory
+// buffer. Rides every other export this project already has.
+```
+
+```dart
+import 'package:openskp_fragments/openskp_fragments.dart';
+
+final scene = readFragments('model.frag');
+// ...or fromFragments(bytes) directly from an in-memory buffer. Rides
+// every other export this project already has.
+```
+
+```cpp
+#include <openskp/fragments_export.hpp>
+
+auto scene = openskp::read_fragments("model.frag");
+// ...or openskp::from_fragments(data) directly from an in-memory
+// std::vector<std::uint8_t>. Rides every other export this project
+// already has.
+```
+
+**Python** verified two ways: round-trips this project's own output
+exactly (world-space vertex positions match to the last bit, not just
+object counts — see `tests/test_fragments.py`'s `TestFromFragments`), and
+reads a real ThatOpen-produced production file (a genuine IFC-derived
+building, 5,751 nodes / 100,332 vertices) cleanly — re-exporting that
+file through this same module and loading the result back through the
+actual `@thatopen/fragments` runtime preserves real IFC GUIDs and
+category names.
+
+**TypeScript, .NET, Dart, and C++** all verified round-trips this
+project's own output exactly (including a primitive large enough to
+force the export side to split across multiple shells — the read side
+has to walk every sample for an item and reassemble them, not just read
+the first one) — not yet tested against a real ThatOpen-produced file
+the way Python's port was, stated honestly rather than implied
+equivalent. Two ports additionally found and fixed real, previously-
+undetected bugs their own write sides had:
+
+- **Dart's writer**: an odd number of distinct materials silently
+  corrupted the materials vector on export (a `package:flat_buffers`
+  struct-vector alignment quirk - `Material` is the only struct in this
+  schema whose size isn't a multiple of 4 bytes, so this never surfaced
+  until something finally read materials back). See
+  `fragments_export.dart`'s own comment on the fix.
+- **C++'s new reader itself**: a dangling-reference bug in a hand-written
+  JSON parser (`MinimalJsonParser` stored a `const std::string&` member,
+  which one call site fed a temporary that was destroyed before the
+  parser ever read it - silently came back empty instead of crashing).
+  See `fragments_export.cpp`'s own comment on the fix.
+
+**Known limitations, stated plainly** (apply identically across all 5
+languages — every port mirrors Python's exact read-side behavior, not an
+independently-improved version):
 
 - No UVs anywhere in the schema (`Shell` is points + triangle indices
   only) — every reconstructed primitive gets an all-zero UV band.
@@ -561,6 +614,12 @@ same module and loading the result back through the actual
   has no reader yet, only `SHELL`. A real `IfcImporter`-produced file can
   contain these; such samples are skipped with a warning rather than
   silently dropped or misread as shells.
+- **Not previously documented here**: `positionMm`/`properties`/
+  `attributeDictionaries` on each reconstructed node are left at their
+  defaults (`[0,0,0]`/`{}`/`{}`) — the Fragments format doesn't carry
+  these separately from the `Name` attribute this function does extract
+  (see `from_fragments`'s source directly; Python's own dataclass
+  defaults confirm this isn't overridden anywhere in the read path).
 
 ## Write capabilities
 

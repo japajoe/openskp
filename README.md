@@ -61,8 +61,8 @@ OpenSKP is the **first and only** open-source, cross-platform toolkit for Sketch
 | **Dynamic Components** | ✅ | Extracts dynamic component attribute key-value pairs for both modern (2021+) and legacy (2013–2020) files, in all five languages |
 | **Observability** | ✅ | Opt-in progress reporting + structured, location-carrying parse errors — see [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) |
 | **Convert to GLB / OBJ / STL / PLY / DXF 3D / IFC4 / JSON** | ✅ | Native, from-scratch conversion to glTF (GLB), Wavefront OBJ, STL, PLY, DXF 3D (AutoCAD Polyface Mesh), IFC4 (BIM), and JSON metadata — available in all five languages, no third-party CAD/BIM SDK involved — see [Export capabilities](docs/DEVELOPER_GUIDE.md#export-capabilities) |
-| **Convert to Fragments (.frag)** | 🐍⚙️ | Direct SketchUp → [ThatOpen Fragments](https://github.com/ThatOpen/engine_fragment) export for BIM web viewers, no IFC intermediate. **Python and C++, neither on a package registry yet** — install from the tagged GitHub release ([Python](https://github.com/iamahsanmehmood/openskp/releases/tag/preview-python-v1.3.2), [C++](https://github.com/iamahsanmehmood/openskp/releases/tag/preview-cpp-v1.3.1)). See [Fragments export](docs/DEVELOPER_GUIDE.md#fragments-export) and [ROADMAP.md](ROADMAP.md) for what's still outstanding |
-| **Read a Fragments (.frag) file back** | 🐍 | OpenSKP's 6th input format alongside `.skp` — parses any real `.frag` file (this project's own output, ThatOpen's real `IfcImporter` output, or anyone else's) into a scene that rides every other export above for free. **Python only, on `main`, not tagged yet.** See [Reading a .frag file back](docs/DEVELOPER_GUIDE.md#reading-a-frag-file-back) |
+| **Convert to Fragments (.frag)** | ✅ | Direct SketchUp → [ThatOpen Fragments](https://github.com/ThatOpen/engine_fragment) export for BIM web viewers, no IFC intermediate. Available in all five languages as of 1.3.0. See [Fragments export](docs/DEVELOPER_GUIDE.md#fragments-export) |
+| **Read a Fragments (.frag) file back** | ✅ | OpenSKP's 6th input format alongside `.skp` — parses any real `.frag` file (this project's own output, ThatOpen's real `IfcImporter` output, or anyone else's) into a scene that rides every other export above for free. Available in **all five languages**. See [Reading a .frag file back](docs/DEVELOPER_GUIDE.md#reading-a-frag-file-back) |
 | **Write native `.skp` files** | ✅ | Build new `.skp` files from scratch — geometry (including genuine circular/arc curves, freeform polylines, faces with holes cut out, and non-planar auto-triangulation), solid/textured materials, layers, nested component definitions and groups, instance rotation/visibility, and custom attribute dictionaries. No SDK involved — every feature validated against the real SketchUp SDK, in all five languages. See [Write capabilities](docs/DEVELOPER_GUIDE.md#write-capabilities) |
 | **Edit existing `.skp` files** | ✅ | Load an existing legacy-format file and extend it — reuses its materials, layers, and component definitions, adds new geometry or instances, and saves a new file. All five languages. See [Editing an existing file](docs/DEVELOPER_GUIDE.md#editing-an-existing-file) |
 | **Generate rebuild code from a file** | ✅ | Turn a parsed `.skp` file into a human-readable, re-runnable source-code transcript that calls the same language's own writer API to rebuild it — materials, textures, layers, nested definitions, holes, instance-level paint and names. All five languages. See [Generating code from a file](docs/DEVELOPER_GUIDE.md#generating-code-from-a-file) |
@@ -105,50 +105,52 @@ for anything specific to FreeCAD/Blender behavior.
 
 ## 🖥️ Platform Support
 
-| Platform | Version | Status | Install | Unreleased on `main`? |
-|:---------|:--------|:------:|:--------|:-------------|
-| 🐍 **Python** | [![PyPI](https://img.shields.io/pypi/v/openskp.svg?label=)](https://pypi.org/project/openskp/) | ✅ Available | `pip install openskp` | **Yes** — [`preview-python-v1.3.2`](https://github.com/iamahsanmehmood/openskp/releases/tag/preview-python-v1.3.2), GitHub-only, not on PyPI yet |
-| 📘 **TypeScript / JS** | [![npm](https://img.shields.io/npm/v/openskp.svg?label=)](https://www.npmjs.com/package/openskp) | ✅ Available | `npm install openskp` | **Yes** — writer memory fix (`GrowableBytes`), see [CHANGELOG.md](CHANGELOG.md) |
-| 🚀 **.NET / C#** | [![NuGet](https://img.shields.io/nuget/v/OpenSkp.svg?label=)](https://www.nuget.org/packages/OpenSkp) | ✅ Available | `dotnet add package OpenSkp` | No |
-| 🎯 **Dart / Flutter** | [![Pub](https://img.shields.io/pub/v/openskp.svg?label=)](https://pub.dev/packages/openskp) | ✅ Available | `dart pub add openskp` | No |
-| ⚙️ **C++17** | [![C++](https://img.shields.io/github/v/release/iamahsanmehmood/openskp?filter=cpp-v*&label=)](https://github.com/iamahsanmehmood/openskp/releases?q=cpp-) | ✅ Source package | `find_package(OpenSkp CONFIG REQUIRED)` | **Yes** — [`preview-cpp-v1.3.1`](https://github.com/iamahsanmehmood/openskp/releases/tag/preview-cpp-v1.3.1), GitHub-only preview |
+| Platform | Version | Status | Install |
+|:---------|:--------|:------:|:--------|
+| 🐍 **Python** | [![PyPI](https://img.shields.io/pypi/v/openskp.svg?label=)](https://pypi.org/project/openskp/) | ✅ Available | `pip install openskp` |
+| 📘 **TypeScript / JS** | [![npm](https://img.shields.io/npm/v/openskp.svg?label=)](https://www.npmjs.com/package/openskp) | ✅ Available | `npm install openskp` |
+| 🚀 **.NET / C#** | [![NuGet](https://img.shields.io/nuget/v/OpenSkp.svg?label=)](https://www.nuget.org/packages/OpenSkp) | ✅ Available | `dotnet add package OpenSkp` |
+| 🎯 **Dart / Flutter** | [![Pub](https://img.shields.io/pub/v/openskp.svg?label=)](https://pub.dev/packages/openskp) | ✅ Available | `dart pub add openskp` |
+| ⚙️ **C++17** | [![C++](https://img.shields.io/github/v/release/iamahsanmehmood/openskp?filter=cpp-v*&label=)](https://github.com/iamahsanmehmood/openskp/releases?q=cpp-) | ✅ Source package | `find_package(OpenSkp CONFIG REQUIRED)` |
 
-All five languages parse both the modern VFF (2021+) and classic MFC
-(2013–2020) `.skp` containers, and support the same opt-in scene-baking
-(`buildScene()`) and observability APIs. Full detail on what's unreleased,
-what differs between languages, and which real SketchUp file versions
-actually parse today is in the section right below.
+All five languages are on **1.3.0** as of the 2026-09-18 synchronized
+release — same version number, not identical capability: Python and C++
+carry a few things (Fragments reading, loose-edge/curve support) the
+other three don't have yet. All five parse both the modern VFF (2021+)
+and classic MFC (2013–2020) `.skp` containers, and support the same
+opt-in scene-baking (`buildScene()`) and observability APIs. Full detail
+on what differs between languages, and which real SketchUp file versions
+actually parse today, is in the section right below.
 
 ---
 
 ## 🔀 Feature Support by Language
 
-Every feature, across all 5 languages — ✅ shipped & released, 🔶 shipped on
-`main` but not released yet, ❌ not yet ported. Full detail (including
-`n/a`/"not independently checked" nuance) in
-**[docs/LANGUAGE_PARITY.md](docs/LANGUAGE_PARITY.md)** — this is the
+Every feature, across all 5 languages — ✅ shipped & released, ❌ not yet
+ported. Full detail (including `n/a`/"not independently checked" nuance)
+in **[docs/LANGUAGE_PARITY.md](docs/LANGUAGE_PARITY.md)** — this is the
 condensed version.
 
 | Feature | Python | TypeScript | .NET | Dart | C++ |
 |:---|:---:|:---:|:---:|:---:|:---:|
 | Parse VFF (2021+) & legacy MFC (2013–2020) | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Geometry, layers, materials/textures, styles, Dynamic Components | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Single attribute dictionary per entity | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Attribute dicts: multiple dictionaries per entity | ✅ | ❌ | ❌ | ❌ | ✅ 🔶 GitHub-only |
+| Attribute dicts: multiple dictionaries per entity | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Attribute dicts: full 9-value-type support (`Point3d`/`Length`/nested lists) | ✅ | ❌ | ❌ | ❌ | ❌ str only |
-| Attribute dicts surfaced in GLB/JSON metadata export (not just IFC Psets) | 🔶 GitHub-only | n/a | n/a | n/a | 🔶 GitHub-only |
+| Attribute dicts surfaced in GLB/JSON metadata export (not just IFC Psets) | ✅ | n/a | n/a | n/a | ✅ |
 | VFF pages/scenes + dimension parsing | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Legacy (pre-2021) pages/scenes reading | ✅ | ❌ | ❌ | ❌ | 🔶 GitHub-only |
-| Construction lines/points reading | ✅ | ❌ | ❌ | ❌ | 🔶 legacy only, GitHub-only |
+| Legacy (pre-2021) pages/scenes reading | ✅ | ❌ | ❌ | ❌ | ✅ |
+| Construction lines/points reading | ✅ | ✅ | ✅ | ✅ | ✅ legacy only |
 | Scene baking, instancing-preserving scene output | ✅ | ✅ | ✅ | ✅ | ✅ |
-| earcut triangulation (perf + correctness fix) | 🔶 | n/a | n/a | n/a | n/a |
+| Loose-edge curve support (structural framing) | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Writer: materials/layers/definitions/groups/faces/curves/images | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Writer: dimensions, section planes, construction geometry | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Writer: dimensions, section planes, construction geometry | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Editor (`open_existing()`), code generator | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Export: GLB / OBJ / STL / PLY / DXF / IFC4 / JSON | ✅ | ✅ | ✅ | ✅ | ✅ |
-| IFC export correctness fixes (units, layer visibility, Psets, classification) | 🔶 | not checked | not checked | not checked | 🔶 GitHub-only |
-| **Fragments (`.frag`) export** | 🔶 GitHub-only | 🔶 on `main`, npm-only pending | ❌ not started | ❌ not started | 🔶 GitHub-only |
-| **Fragments (`.frag`) import** — 6th input format | 🔶 on `main` | ❌ not started | ❌ not started | ❌ not started | ❌ not started |
+| IFC export correctness fixes (units, layer visibility, Psets, classification) | ✅ | not checked | not checked | not checked | ✅ |
+| IFC curve/arc annotations (`IfcAnnotation`/`IfcArcIndex`) | ✅ | ❌ | ❌ | ❌ | ❌ |
+| **Fragments (`.frag`) export** | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Fragments (`.frag`) import** — 6th input format | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 ### Real SketchUp file version support
 

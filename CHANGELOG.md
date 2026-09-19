@@ -7,7 +7,124 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Read a `.frag` file back (TypeScript, .NET, Dart, C++) - all 5 languages now
+
+Ports Python's `from_fragments()`/`read()` to TypeScript (`fromFragments()`,
+#362), .NET (`FragmentsExport.FromFragments()`/`ReadFragments()`, #363),
+Dart (`fromFragments()`/`readFragments()`, same package as the writer, #364),
+and C++ (`openskp::from_fragments()`/`read_fragments()`, #365) - closing out
+the last remaining cross-language gap tracked since the 1.3.0 synchronized
+release. Materials, shell/big-shell geometry (including the multi-shell case
+for oversized primitives), per-item name/guid/layer, and the
+spatial-structure tree - matching Python's own known gaps exactly
+(`positionMm`/`properties`/`attributeDictionaries` left at defaults, no
+UVs/stored normals, only `RepresentationClass.SHELL` read), not
+independently improved on. Verified via self-round-trip for all four (basic
+scene, both wire formats, real guids/`layer_hidden`, the multi-shell read
+path) - not yet tested against a real externally-produced `.frag` file the
+way Python's own read side was. See
+[docs/LANGUAGE_PARITY.md](docs/LANGUAGE_PARITY.md).
+
+### Fixed — Dart: odd material counts silently corrupted the Fragments materials vector
+
+Found while adding Dart's Fragments reader above - nothing previously read
+the materials vector back, so this went undetected. `Material` (6 bytes:
+r/g/b/a + renderedFaces + stroke) is the only struct in the Fragments schema
+whose size isn't a multiple of 4 bytes; `package:flat_buffers`'s
+`writeListOfStructs`+`endStructVector` writes struct elements first and the
+length-prefix uint32 last, so aligning that final uint32 write can insert
+padding between the length prefix and element 0 - invisible for every other
+struct type in this schema (all already 4-byte multiples regardless of
+count), but a real, silent corruption whenever the material count was odd
+- any real file with an odd number of distinct materials would have been
+affected, though export-only consumers (the only ones that existed before
+this fix) never noticed since nothing decoded the bytes back to check.
+Fixed by pre-padding to the correct alignment before the elements are
+written, closing the gap; regression test confirmed to fail without the fix
+and pass with it.
+
+### Fixed — C++: dangling-reference bug in the new Fragments JSON parser
+
+Found while writing C++'s Fragments reader above, in the new code itself
+rather than something pre-existing: `MinimalJsonParser` (a small
+dependency-free JSON reader, needed since this package takes on no JSON
+library beyond FlatBuffers/miniz) stored its input as a `const
+std::string&` member. The metadata-parsing call site passed
+`model->metadata()->str()` directly - a temporary `std::string` returned
+by value - which is destroyed at the end of that full expression, the
+instant the constructor returns; a reference *member* (unlike a local
+`const std::string&` variable) does nothing to extend a temporary's
+lifetime. Every subsequent read through that dangling reference was
+undefined behavior, which manifested here as `layer_hidden` silently
+coming back empty instead of crashing outright - exactly the kind of UB
+that doesn't reliably announce itself. Caught by the real round-trip
+test for that exact field, not by inspection. Fixed by having the parser
+own a copy (`std::string`, constructed by value and moved in) instead of
+referencing the caller's.
+
+## [1.3.0] — 2026-09-18 — synchronized release, all 5 languages
+
+> **Same version number across all 5 languages, not identical capability.**
+> This release folds `preview-python-v1.3.2` and `preview-cpp-v1.3.1` into
+> real, published `python-v1.3.0`/`cpp-v1.3.0` releases as-is — Python and
+> C++ carry real capability (Fragments reading, loose-edge/curve support,
+> IFC curve annotations, legacy pages/scenes reading) that TypeScript,
+> .NET, and Dart do not yet have. Rather than hold that already-tested work
+> back purely to keep every language byte-for-byte equal, it ships now,
+> honestly tracked as still-open in
+> [docs/LANGUAGE_PARITY.md](docs/LANGUAGE_PARITY.md) and
+> [issue #285](https://github.com/iamahsanmehmood/openskp/issues/285)
+> rather than silently implied as closed by the shared version number.
+> Everything below the sections tagged Python-only/C++-only IS aligned
+> across all 5 languages, verified directly against each language's
+> current `main` source (not just commit messages) before release.
+
+### Fixed — Fragments export crash on shells with more than 65535 triangles (all 5 languages)
+
+A single Fragments "shell" (triangulated mesh) can't exceed 65,535
+triangles in the real format - none of the 5 exporters split an oversized
+one, so a sufficiently large, densely-triangulated mesh crashed the
+export outright (Python: a loud `TypeError`; C++/TypeScript/.NET/Dart:
+silent index truncation/wrap, a worse failure mode with no error at all).
+Fixed identically across all 5 by splitting an oversized primitive's
+triangles into multiple shells, each an additional Fragments Sample
+referencing the same item/material/transform. Python #355, .NET #356,
+TypeScript #357, Dart #358, C++ #359.
+
+### Added — Writer support for section planes, dimensions, and leader text (all 5 languages)
+
+Section planes, linear dimensions with leader text, and construction
+lines/points are now writable from all 5 languages, not just readable.
+C++ #351, TypeScript #349, .NET #348, Dart #350.
+
+### Fixed — Construction line/point reader discarding parsed geometry (TypeScript, .NET, Dart)
+
+TypeScript #353, .NET #352, Dart #354.
+
+### Fixed — Overlapping face holes triangulated to an arbitrary, undefined triangle count (all 5 languages, #285)
+
+See the detailed root-cause writeup below (Python/.NET sections) - a real
+fixture with two overlapping circular holes had no well-defined
+triangulation; each independent earcut implementation now detects real
+hole-hole overlap and resolves it to a well-defined boundary before
+triangulating. C++ #343, TypeScript #340, Dart #341.
+
+### Added — Multiple attribute dictionaries, VFF per-layer-hidden flag, real per-instance GUID/name-resolution Fragments export (all 5 languages)
+
+Every attribute dictionary an instance carries is now exposed (not just
+SketchUp's own `dynamic_attributes`), the real per-layer visibility flag
+is read from VFF (2021+) files, and Fragments export uses real
+per-instance GUIDs/name-resolution/layer-hidden state at full
+cross-language parity. TypeScript #329/#332/#335/#338, .NET
+#328/#331/#334/#337, Dart #330/#333/#336/#339, C++ (folded into its own
+preview cycle, see below).
+
 ### Added — Loose-edge grouping/layer on the public typed model (`Edge.layer`, `Edge.curve_id`, `Face.layer`, `loose_edge_runs()`)
+
+**Python-only.** TypeScript/.NET/Dart don't have this on the typed model,
+or the underlying edge-layer/curve-grouping read at all. C++ doesn't
+either, outside its own preview cycle. Tracked in
+[#285](https://github.com/iamahsanmehmood/openskp/issues/285). (`Edge.layer`, `Edge.curve_id`, `Face.layer`, `loose_edge_runs()`)
 
 `SkpFile.parse()`'s typed `Definition`/`Edge`/`Face` model had no way to read a face's or edge's own layer, or SketchUp's own `Edge#curve` grouping - only `build_scene()`/`build_instanced_scene()` could reach that data, and only internally, since both bake it straight into triangulated mesh output. A consumer building real B-rep geometry rather than a render mesh (exactly what the FreeCAD addon needs for loose-edge/structural-framing import) had no way to get there at all.
 
@@ -136,14 +253,10 @@ tests).
 
 ## [preview-cpp-v1.3.0] — 2026-09-10 — C++ only, GitHub-only pre-release
 
-> **This is a preview tag, not the numbered `cpp-v1.3.0` release.** It's a
-> real, tested, tagged release (full suite passing, real-file-verified) —
-> build it by checking out this tag directly and following
-> [DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md)'s C++ install steps
-> (build/install `packages/cpp`, then `find_package(OpenSkp CONFIG
-> REQUIRED)`). It folds into a proper numbered `cpp-v1.3.0` release once
-> the known gaps below are closed and cross-language parity work catches
-> up — tracked in [docs/LANGUAGE_PARITY.md](docs/LANGUAGE_PARITY.md) and
+> **Folded into the real [1.3.0](#130--2026-09-18--synchronized-release-all-5-languages)
+> release above** (2026-09-18), as-is - not held back for cross-language
+> parity, which is instead tracked honestly in
+> [docs/LANGUAGE_PARITY.md](docs/LANGUAGE_PARITY.md) and
 > [issue #285](https://github.com/iamahsanmehmood/openskp/issues/285).
 
 ### Added — C++: Direct SketchUp → Fragments (.frag) export
@@ -352,16 +465,13 @@ fix ported to Python's `export/glb.py`, `export/json_export.py`, and
 Verified against real plugin data on `Untitled.skp` (`steelframer-dict`,
 45 entries); full suite green (217/217).
 
-## [1.3.0] — 2026-09-09 — Python only, GitHub-only pre-release
+## [preview-python-v1.3.0] — 2026-09-09 — Python only, GitHub-only pre-release
 
-> **This tag is not published to PyPI.** It's a real, tested, tagged release
-> — install it with:
-> ```
-> pip install "openskp[fragments] @ git+https://github.com/iamahsanmehmood/openskp.git@python-v1.3.0#subdirectory=packages/python"
-> ```
-> It will fold into a PyPI release once cross-language parity work below
-> catches up across the other 4 languages. Everything in this section is
-> Python-only unless stated otherwise.
+> **Folded into the real [1.3.0](#130--2026-09-18--synchronized-release-all-5-languages)
+> release above** (2026-09-18), as-is - not held back for cross-language
+> parity, which is instead tracked honestly in
+> [docs/LANGUAGE_PARITY.md](docs/LANGUAGE_PARITY.md). Everything in this
+> section is Python-only unless stated otherwise.
 
 ### Added — Direct SketchUp → Fragments (.frag) export
 
