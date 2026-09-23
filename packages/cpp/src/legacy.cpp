@@ -431,6 +431,73 @@ struct Archive {
     }
   }
 
+  // 0xffff CLayer, a class-ref to a CLayer already in class_slot, or — when
+  // `unmatched_class_ref` — any short 0x8000 class-ref. The last form is
+  // only for the throwaway slot-base probe, which numbers from 1<<20 so
+  // the file's 0x8000|real_slot will not match class_slot.
+  bool clayer_record_at(size_t at, bool unmatched_class_ref = false) const {
+    if (at + 2 > r.d.size()) return false;
+    auto tag = read_u16(r.d, at);
+    if (tag == 0xffff && at + 12 <= r.d.size() && read_u16(r.d, at + 4) == 6 &&
+        std::equal(r.d.begin() + at + 6, r.d.begin() + at + 12, "CLayer"))
+      return true;
+    auto lay_cs = class_slot.find("CLayer");
+    if (lay_cs != class_slot.end() && is_class_ref(r.d, at, lay_cs->second)) return true;
+    return unmatched_class_ref && (tag & 0x8000) && tag != 0xffff;
+  }
+
+  // Colour CLayer ends in a 21-byte tail. Some v18 zero-material files
+  // (custom tag listed first, then Layer0) write 12 zero bytes + u32 after
+  // that, then another CLayer. Skip those 16 bytes only when they precede
+  // a CLayer; leave a definition-list back-ref alone.
+  void skip_clayer_colour_ext() {
+    constexpr size_t kPad = 12;
+    constexpr size_t kExt = 16;
+    if (r.p + kExt + 2 > r.d.size()) return;
+    for (size_t i = 0; i < kPad; ++i) {
+      if (r.d[r.p + i] != 0) return;
+    }
+    if (clayer_record_at(r.p + kExt, true)) r.p += kExt;
+  }
+
+  // v18 template Layer0 after a custom tag: <parent u16><active u16><dc u32>.
+  // Consume parent only when both u16s are already CLayer objects. A lone
+  // back-ref then a definition count (usual layout) stays put.
+  void skip_clayer_parent_ref(uint64_t self) {
+    if (r.p + 4 > r.d.size()) return;
+    auto a = read_u16(r.d, r.p);
+    auto b = read_u16(r.d, r.p + 2);
+    if (!a || (a & 0x8000) || a == 0x7fff || a == self) return;
+    if (!b || (b & 0x8000) || b == 0x7fff) return;
+    auto ia = slots.find(a);
+    auto ib = slots.find(b);
+    if (ia == slots.end() || ib == slots.end()) return;
+    if (ia->second.cls || ib->second.cls) return;
+    if (ia->second.name != "CLayer" || ib->second.name != "CLayer") return;
+    r.p += 2;
+  }
+
+  // Extra CLayer records past declared layer_count (v18: count=1 custom
+  // tag, then Layer0). Skip null separators; stop at the definition-list
+  // anchor. `unmatched_class_ref` only on the throwaway probe.
+  void collect_trailing_layers(std::vector<uint64_t>* slots_out,
+                               std::vector<std::pair<uint64_t, std::shared_ptr<V>>>* layers_out,
+                               bool unmatched_class_ref = false) {
+    while (r.p + 2 <= r.d.size()) {
+      auto tag = read_u16(r.d, r.p);
+      if (tag == 0) {
+        r.p += 2;
+        continue;
+      }
+      if (!clayer_record_at(r.p, unmatched_class_ref)) break;
+      auto q = object("CLayer");
+      if (std::get<2>(q)) {
+        if (slots_out) slots_out->push_back(std::get<0>(q));
+        if (layers_out) layers_out->push_back({std::get<0>(q), std::get<2>(q)});
+      }
+    }
+  }
+
   std::tuple<uint64_t, std::string, std::shared_ptr<V>> new_obj(const std::string& n) {
     auto slot = alloc({false, n, 0, {}});
     auto v = read(n, slot);
@@ -538,7 +605,7 @@ struct Archive {
       }
       r.u32();
     } else if (n == "CLayer") {
-      preamble();
+      v->attrs = preamble();
       v->k = "layer";
       v->name = r.utf16();
       ByteBuffer mid;
@@ -562,6 +629,8 @@ struct Archive {
         v->b = c[2];
         r.utf16();
         r.raw(21);
+        skip_clayer_colour_ext();
+        skip_clayer_parent_ref(self);
       }
     } else if (n == "CMaterial") {
       preamble();
@@ -682,21 +751,31 @@ struct Archive {
         std::vector<size_t> order{dflt};
         for (size_t c : {size_t(0), size_t(4), size_t(7)})
           if (c != dflt) order.push_back(c);
-        // two passes: a zero tail full of padding can mimic a null tag,
-        // so only accept a null-anchored candidate when no candidate
-        // lands on a STRONG form (escape / known class / class
-        // definition)
+        // Strong tags first (escape / known class / class definition). A
+        // following entity at +4 or +7 is unambiguous. The weak (null)
+        // pass is the last-in-list case: a construction line that is the
+        // last entity in a CComponentDefinition is followed by nrel=0,
+        // which looks like a null tag at every candidate including v17's
+        // preferred 7. Preferring 7 there swallows three bytes of the
+        // definition tail and then caches that 7 for every later guide
+        // in the file - this project's own writer (and real SketchUp
+        // 2025) uses a 4-byte trailer, so the weak pass prefers 4.
         std::optional<size_t> k;
-        for (bool allow_null : {false, true}) {
-          for (size_t cand : order) {
-            if (strict_next_tag(r.p + cand, allow_null)) {
+        for (size_t cand : order) {
+          if (strict_next_tag(r.p + cand, false)) {
+            k = cand;
+            break;
+          }
+        }
+        if (!k) {
+          for (size_t cand : {size_t(4), size_t(0), size_t(7)}) {
+            if (strict_next_tag(r.p + cand, true)) {
               k = cand;
               break;
             }
           }
-          if (k) break;
         }
-        cline_tail = k ? *k : dflt;
+        cline_tail = k ? *k : size_t(4);
       }
       r.raw(*cline_tail);
     } else if (n == "CConstructionPoint") {
@@ -894,42 +973,40 @@ struct Archive {
     return v;
   }
 
-  // Reads one typed CAttributeNamed value off the stream and returns its
-  // string representation, matching the string-valued properties contract
-  // extract_legacy_dynamic_properties() (below) produces.
-  std::string typed(uint8_t t) {
+  // Reads one typed CAttributeNamed value off the stream. Matches Python's
+  // `_read_attr_named.read_typed` - int/float/str/None/3-tuple/list, not a
+  // stringified view. `properties` still stringifies via stringify_attr_dict.
+  ParsedAttribute typed(uint8_t t) {
     switch (t) {
       case 0:
-        return "";
+        return ParsedAttribute::null();
       case 4:
-        return std::to_string(read_i32(r.raw(4), 0));
+        return ParsedAttribute::from_integer(read_i32(r.raw(4), 0));
       case 6:
-        return std::to_string(r.f64());
+        return ParsedAttribute::from_float(r.f64());
       case 7:
-        return std::to_string(r.u8());
+        return ParsedAttribute::from_integer(r.u8());
       case 9:
-        return std::to_string(r.u32());
+        return ParsedAttribute::from_integer(static_cast<std::int64_t>(r.u32()));
       case 10:
-        return r.utf16();
+        return ParsedAttribute::from_string(r.utf16());
       case 12:
-        return std::to_string(r.f64());  // Length (a double, inches)
+        return ParsedAttribute::from_float(r.f64());  // Length (a double, inches)
       case 11: {
         auto n = r.u32();
         if (n > 100000) throw std::runtime_error("attr array too large");
-        std::string joined;
-        while (n--) {
-          if (!joined.empty()) joined += ",";
-          joined += typed(r.u8());
-        }
-        return joined;
+        std::vector<ParsedAttribute> items;
+        items.reserve(n);
+        while (n--) items.push_back(typed(r.u8()));
+        return ParsedAttribute::from_array(std::move(items));
       }
       case 17: {  // 3D point (Geom::Point3d)
         auto v = r.f64s(3);
-        return std::to_string(v[0]) + "," + std::to_string(v[1]) + "," + std::to_string(v[2]);
+        return ParsedAttribute::from_vec({v[0], v[1], v[2]});
       }
       case 18: {  // 3D vector (Geom::Vector3d)
         auto v = r.f64s(3);
-        return std::to_string(v[0]) + "," + std::to_string(v[1]) + "," + std::to_string(v[2]);
+        return ParsedAttribute::from_vec({v[0], v[1], v[2]});
       }
       default:
         throw std::runtime_error("unknown legacy attribute type");
@@ -1074,6 +1151,7 @@ std::vector<uint64_t> probe_layer_anchor_bases(const ByteBuffer& data, int ver, 
     auto q = boot.object("CLayer");
     layer_slots.push_back(std::get<0>(q));
   }
+  boot.collect_trailing_layers(&layer_slots, nullptr, true);
   auto anchor = boot.object();
   if (std::get<1>(anchor) != "premodel")
     // under the throwaway base every absolute back-ref classifies as
@@ -1143,22 +1221,7 @@ WalkResult walk_model(const ByteBuffer& data, int ver, size_t start, uint32_t ma
     layers.push_back({std::get<0>(q), std::get<2>(q)});
   }
   // trailing separators (and any layer records past the declared count)
-  {
-    auto lay_cs = ar.class_slot.find("CLayer");
-    while (ar.r.p + 2 <= data.size()) {
-      auto tag = read_u16(data, ar.r.p);
-      if (tag == 0) {
-        ar.r.p += 2;
-        continue;
-      }
-      if (lay_cs != ar.class_slot.end() && tag == (0x8000 | lay_cs->second)) {
-        auto q = ar.object("CLayer");
-        if (std::get<2>(q)) layers.push_back({std::get<0>(q), std::get<2>(q)});
-        continue;
-      }
-      break;
-    }
-  }
+  ar.collect_trailing_layers(nullptr, &layers);
   auto anchor = ar.object();
   if (std::get<1>(anchor) != "CLayer") throw std::runtime_error("definition anchor is not a layer");
   auto dc = ar.r.u32();
@@ -1210,16 +1273,18 @@ void add_edge(GeometryBuilder& b, uint64_t s, const V& e,
 // faces) - this just looks up that one dictionary by name, mirroring what
 // the VFF path's dynamic-properties extraction does for D007/DC05 TLV
 // data.
-std::map<std::string, std::string> extract_legacy_dynamic_properties(
+ParsedAttrDictionaries extract_legacy_attribute_dictionaries(
     std::optional<uint64_t> attrs_slot, const std::unordered_map<uint64_t, Entry>& slots) {
-  if (!attrs_slot) return {};
+  ParsedAttrDictionaries out;
+  if (!attrs_slot) return out;
   auto ai = slots.find(*attrs_slot);
-  if (ai == slots.end() || !ai->second.v) return {};
+  if (ai == slots.end() || !ai->second.v) return out;
   for (auto& ent : ai->second.v->ents) {
     auto& ev = std::get<2>(ent);
-    if (ev && ev->k == "dict" && ev->name == "dynamic_attributes") return ev->entries;
+    if (!ev || ev->k != "dict" || ev->name.empty()) continue;
+    out[ev->name] = ev->entries;
   }
-  return {};
+  return out;
 }
 
 void fill(GeometryBuilder& b,
@@ -1283,7 +1348,10 @@ void fill(GeometryBuilder& b,
       if (v->mat) i.material_id = v->mat;
       if (v->layer) i.layer = std::to_string(v->layer);
       i.hidden = v->hidden != 0;
-      i.properties = extract_legacy_dynamic_properties(v->attrs, slots);
+      auto dicts = extract_legacy_attribute_dictionaries(v->attrs, slots);
+      auto dc = dicts.find("dynamic_attributes");
+      if (dc != dicts.end()) i.properties = stringify_attr_dict(dc->second);
+      i.attribute_dicts = std::move(dicts);
       b.instances.push_back(std::move(i));
     } else if (v->k == "image") {
       // Placed exactly like an ordinary component instance - same
@@ -1611,6 +1679,14 @@ RawParsed parse_legacy(const ByteBuffer& data, const ParseOptions& o) {
       out.layer_colors[l.second->name] = {uint8_t(l.second->r), uint8_t(l.second->g),
                                           uint8_t(l.second->b)};
       out.layer_hidden[l.second->name] = l.second->hidden != 0;
+      auto dicts = extract_legacy_attribute_dictionaries(l.second->attrs, ar.slots);
+      // Layer::attribute_dictionaries stays string-typed by design (matches
+      // Instance's own pre-#368 contract for the model-level scene/JSON/IFC
+      // consumers PR #369 wired it into) - the shared extraction above
+      // returns typed ParsedAttrDictionaries now, so stringify here rather
+      // than keeping a second, near-duplicate string-typed extractor.
+      if (!dicts.empty())
+        out.layer_attribute_dictionaries[l.second->name] = stringify_attr_dictionaries(dicts);
     }
     if (!out.layer_colors.count("Layer0")) {
       out.layer_order.push_back("Layer0");
