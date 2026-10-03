@@ -141,6 +141,8 @@ constexpr int kAttributeNamedSlot = 5;
 
 constexpr std::uint8_t kAttrTypeInt32 = 0x04;
 constexpr std::uint8_t kAttrTypeDouble = 0x06;
+constexpr std::uint8_t kAttrTypeBool = 0x07;
+constexpr std::uint8_t kAttrTypeLength = 0x0C;
 constexpr std::uint8_t kAttrTypeString = 0x0A;
 
 // Byte pattern found in one SDK-authored textured-material sample's "applied height" field,
@@ -1409,9 +1411,9 @@ void ArchiveWriter::write_attribute_dict(const std::string& dict_name,
                3);     // null attrs (2) + mask=0 (1), pid=0
   append_u32(buf, 0);  // ground truth: read and discarded by the reader too
   write_str(dict_name);
-  // AttributeValue's 3 alternatives (string/int32/double) are exactly the 3 types this writer
-  // supports, and std::int32_t is already range-bounded by its type - so unlike Python's
-  // runtime _validate_attribute_entries, no extra validation is needed here.
+  // Each AttributeValue alternative maps to exactly one type tag (Python's _write_attr_value),
+  // and std::int32_t is already range-bounded by its type - so unlike Python's runtime
+  // _validate_attribute_entries, no extra validation is needed here.
   for (const auto& [key, value] : entries) {
     write_str(key);
     if (const auto* s = std::get_if<std::string>(&value)) {
@@ -1420,6 +1422,12 @@ void ArchiveWriter::write_attribute_dict(const std::string& dict_name,
     } else if (const auto* i = std::get_if<std::int32_t>(&value)) {
       buf.push_back(kAttrTypeInt32);
       append_i32(buf, *i);
+    } else if (const auto* b = std::get_if<AttributeBool>(&value)) {
+      buf.push_back(kAttrTypeBool);
+      buf.push_back(b->value ? 1 : 0);
+    } else if (const auto* l = std::get_if<AttributeLength>(&value)) {
+      buf.push_back(kAttrTypeLength);
+      append_f64(buf, l->value);
     } else {
       buf.push_back(kAttrTypeDouble);
       append_f64(buf, std::get<double>(value));

@@ -132,11 +132,13 @@ static bool is_prop_container_tag(const std::string& t) {
 }
 
 // A438 wraps exactly one attribute value: its payload holds a single
-// nested span whose OWN tag says the real type (AD38 string, A938/AF38
-// double, A738 int32, B438/B538 a 3xf64 point/vector, AE38 a nested
-// array) - matching Python's _decode_vff_attr_value exactly (openskp#285).
-// No native bool/time_t tag has ever been observed in real VFF data, so
-// 7/9 is the real ceiling, not an arbitrary stopping point.
+// nested span whose OWN tag says the real type (AD38 string, A938 Float /
+// AF38 Length double, A738 int32, B438/B538 a 3xf64 point/vector, AE38 a
+// nested array) - matching Python's _decode_vff_attr_value (openskp#285).
+// AA38 is a native boolean: one byte, 0/1. It was not in that table, but a
+// SketchUp 2024 file with `face.set_attribute("d", "k", true)` stores exactly
+// that (`A438 { AA38 01 }`); it used to decode as Null. Length keeps its own
+// kind so it can be written back as a Length. No time_t tag has been seen.
 //
 // Python's SkpModel.Instance.attribute_dictionaries keeps these native
 // types (`int`/`float`/`None`/3-tuple/list). C++ used to decode AND
@@ -155,7 +157,13 @@ static ParsedAttribute decode_a438_value(const ByteBuffer& p, size_t a, size_t z
     return ParsedAttribute::from_string(
         std::string(reinterpret_cast<const char*>(p.data() + sa), sz - sa));
   }
-  if ((tag == "AF38" || tag == "A938") && sz - sa == 8) {
+  if (tag == "AA38" && sz - sa == 1) {
+    return ParsedAttribute::from_boolean(p[sa] != 0);
+  }
+  if (tag == "AF38" && sz - sa == 8) {
+    return ParsedAttribute::from_length(read_f64(p, sa));
+  }
+  if (tag == "A938" && sz - sa == 8) {
     return ParsedAttribute::from_float(read_f64(p, sa));
   }
   if (tag == "A738" && sz - sa == 4) {
@@ -290,6 +298,8 @@ void collect_geometry(const std::vector<TlvNode>& es, GeometryBuilder& b) {
               // their own D007 container.
               else if (x.tag == "D307" && !x.payload.empty())
                 f.hidden = (x.payload[0] & 0x01) != 0;
+              else if (x.tag == "D207" && !x.payload.empty())
+                f.layer = std::to_string(parse_varint(x.payload, 0, x.payload.size()));
             }
         for (auto& x : e.children)
           if (x.tag == "AF0D" && !x.payload.empty())
@@ -299,6 +309,7 @@ void collect_geometry(const std::vector<TlvNode>& es, GeometryBuilder& b) {
     } else if (e.tag == "6419") {
       RawInstance i;
       i.offset = e.offset;
+      i.id = entity_id(e);
       i.children = e.children;
       auto* g = find_node(e.children, "6819");
       if (g && g->payload.size() == 16) i.ref_guid = hex(g->payload);
@@ -388,6 +399,18 @@ void collect_layers(const std::vector<TlvNode>& ns, std::map<EntityId, std::stri
         }
     collect_layers(e.children, out, hidden);
   }
+}
+
+// The model record (F601) carries the model entity's own attributes the same
+// way an instance does: an 8813 entity base holding a D007 container whose
+// DC05 payload lists the named dictionaries.
+void collect_model_attribute_dictionaries(const TlvNode& model, ParsedAttrDictionaries& out) {
+  auto* entity = find_node(model.children, "8813");
+  if (!entity) return;
+  for (auto& d : entity->children)
+    if (d.tag == "D007")
+      for (auto& x : d.children)
+        if (x.tag == "DC05") extract_attribute_dictionaries(x.payload, out);
 }
 
 void collect_material_ids(const std::vector<TlvNode>& ns, std::map<EntityId, std::string>& out) {

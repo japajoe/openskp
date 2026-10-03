@@ -680,7 +680,20 @@ def _read_attr_named(ar, r):
         if key == '':
             break
         entries[key] = read_typed(r.u8())
-    r.u32()
+    # CAttributeNamed's own trailing u32 (seen zero on every real file
+    # checked) is a v7+ addition - a real SketchUp 6 file ends the record
+    # at the empty-key terminator with no trailer at all. Reading it
+    # unconditionally eats 4 bytes that belong to the START of whatever
+    # follows (a sibling entity's own tag), which doesn't raise here - it
+    # just hands a corrupted tag to the walker a few reads later, surfacing
+    # as an unrelated "back-ref to unwalked slot" deep in the object graph
+    # (openskp#284's V6 signature). CAttributeNamed's class is always
+    # learned from the unwalked pre-model region (see _new_of_class), so
+    # its own schema is never observed and can't gate this - the file's
+    # own version number is the only signal available, same as the
+    # instance GUID gate below.
+    if ar.ver >= 7:
+        r.u32()
     return {'k': 'dict', 'name': dictname, 'entries': entries}
 
 
@@ -1271,6 +1284,36 @@ def _read_entity_list_inner(ar, r, count, owner, ents):
     return ents
 
 
+def _reanchor_on_string_marker(data: bytes, pos: int) -> int:
+    """`_read_definition`'s GUID+name read assumes a fixed-width prefix: a
+    16-byte GUID immediately followed by `_STR_MARKER`. Some files skew
+    that width in either direction, leaving `pos` a few bytes off from
+    where the GUID actually starts:
+
+    - SketchUp 2020 files can carry two extra bytes ahead of the GUID
+      (prefix runs LONGER than assumed - the marker sits after `pos`).
+    - A definition imported from DWG in a SketchUp 2018 file has been
+      reported (openskp#377) to run the prefix a couple of bytes SHORTER
+      than assumed - the marker sits before `pos`. Verified by the
+      reporter against the real SketchUp SDK's own output (glTF bounding
+      boxes matched on every axis) and their own real-file regression
+      corpus, which this is unaffected by since the search only runs when
+      `pos` doesn't already land exactly on the GUID.
+
+    Searches both directions within 4 bytes, nearest offset first, and
+    returns `pos` unchanged if no match is found there (matching this
+    function's own pre-existing forward-only behavior in that case, which
+    leaves the subsequent strict read to raise instead of silently
+    trusting a wrong offset)."""
+    if data[pos + 16:pos + 19] == _STR_MARKER:
+        return pos
+    for skip in (-1, 1, -2, 2, -3, 3, -4, 4):
+        at = pos + skip
+        if at >= 0 and data[at + 16:at + 19] == _STR_MARKER:
+            return at
+    return pos
+
+
 def _read_definition(ar, r):
     _preamble(ar, r)
     r.raw(22 if ar.ver >= 17 else 20)         # undecoded base block
@@ -1320,17 +1363,7 @@ def _read_definition(ar, r):
     for _ in range(nrel):
         ar.read_object(r, expect='CRelationship')
     r.u16()
-    # The GUID is followed immediately by the name string. Some files
-    # (SketchUp 2020) carry two extra bytes ahead of the GUID, which would
-    # shift this read and leave the cursor mid-record. Anchor on the string
-    # marker that must follow the 16 GUID bytes instead of trusting the
-    # fixed prefix width.
-    if r.peek(19)[16:19] != _STR_MARKER:
-        for skip in range(1, 5):
-            at = r.pos + skip
-            if r.data[at + 16:at + 19] == _STR_MARKER:
-                r.pos = at
-                break
+    r.pos = _reanchor_on_string_marker(r.data, r.pos)
     guid = r.raw(16)
     name = r.utf16()
     r.utf16()

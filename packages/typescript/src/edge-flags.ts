@@ -29,6 +29,8 @@ export class EdgeFlagStore {
   private baseId = 0;
   private initialized = false;
   private count = 0;
+  /** Highest slot ever handed out; slots above it hold nothing. */
+  private highSlot = 0;
 
   /** Number of ids actually stored. */
   get size(): number {
@@ -51,24 +53,38 @@ export class EdgeFlagStore {
 
     if (id < this.baseId) {
       // An id below the current base: re-base, shifting existing data up.
-      const shift = this.baseId - id;
-      const needed = shift + this.flags.length;
-      const nextFlags = new Uint8Array(Math.max(needed, this.flags.length * 2));
-      nextFlags.set(this.flags, shift);
-      this.flags = nextFlags;
+      //
+      // Size from the span actually in USE, not from the current capacity,
+      // and leave headroom below the new id proportional to that span. Ids
+      // often arrive in descending order; sizing from capacity and always
+      // doubling made every such write double the array, so ~24 descending
+      // ids reached 512 MB and V8 aborted the process
+      // (`change_in_bytes < kMaxReasonableBytes`). With headroom, a
+      // descending run re-bases O(log n) times and memory stays
+      // proportional to the id span.
+      const used = this.highSlot + 1;
+      const gap = this.baseId - id;
+      const headroom = Math.max(64, used);
+      const shift = gap + headroom;
+      const nextLength = shift + used;
 
-      const nextPresent = new Uint8Array(Math.ceil(nextFlags.length / 8));
+      const nextFlags = new Uint8Array(nextLength);
+      nextFlags.set(this.flags.subarray(0, used), shift);
+
+      const nextPresent = new Uint8Array(Math.ceil(nextLength / 8));
       // Re-stamp presence bit by bit: the bitmap is not byte-aligned to the
       // shift, so it cannot simply be block-copied.
-      for (let slot = 0; slot < this.flags.length - shift; slot++) {
+      for (let slot = 0; slot < used; slot++) {
         if ((this.present[slot >> 3] & (1 << (slot & 7))) !== 0) {
           const moved = slot + shift;
           nextPresent[moved >> 3] |= 1 << (moved & 7);
         }
       }
+      this.flags = nextFlags;
       this.present = nextPresent;
-      this.baseId = id;
-      return 0;
+      this.baseId -= shift;
+      this.highSlot += shift;
+      return headroom;
     }
 
     const slot = this.slotFor(id);
@@ -82,6 +98,7 @@ export class EdgeFlagStore {
       nextPresent.set(this.present);
       this.present = nextPresent;
     }
+    if (slot > this.highSlot) this.highSlot = slot;
     return slot;
   }
 

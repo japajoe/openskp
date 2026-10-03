@@ -7,6 +7,127 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — TypeScript: `EdgeFlagStore` could abort the process on descending edge ids (#393)
+
+`ensureSlot`'s re-base path (for an edge id below the current base) sized
+its backing array from the *current capacity* and always doubled it, even
+for a shift of 1. Edge ids aren't guaranteed ascending, and a descending
+run of ids each triggers a re-base - ~24 of them reached 512 MB and V8
+hard-aborted the process (`change_in_bytes < kMaxReasonableBytes`), which
+a caller can't catch. Now sizes from the span actually in use (tracked via
+a new `highSlot` high-water mark) and leaves proportional headroom below
+the new id, so a descending run re-bases `O(log n)` times instead of on
+every write and memory stays proportional to the id span. New tests cover
+100,000 descending ids, a single far jump below, and interleaved
+ascending/descending runs cross-checked against a plain `Map`.
+### Added — C++: model attribute dictionaries, instance entity IDs, and face layers (VFF)
+
+Three things a renderer importing `.skp` files needs to match what the
+SketchUp SDK reports, all read from records the VFF reader already walks:
+
+- `SkpModel::attribute_dictionaries` - the dictionaries attached to the
+  model itself (Ruby's `Sketchup::Model#attribute_dictionaries`), where
+  SketchUp (`GeoReference`, ...) and extensions keep model-wide settings.
+  Read from the model record's `F601 -> 8813 -> D007 -> DC05` container,
+  with the same decoder `Instance::attribute_dictionaries` uses, so values
+  keep their native types.
+- `Instance::id` - the placement's own TLV entity ID, i.e. the ID SketchUp
+  persists across sessions (`Sketchup::Entity#persistent_id`). Extensions
+  key per-instance data on it; checked against real files where it matches
+  the persistent IDs a SketchUp extension saved for those instances.
+- `Face::layer` - the name of the layer (tag) a face is on, resolved from
+  its `D207` layer reference the same way instance layers already are.
+  Faces on the default layer (Layer0) carry no reference and stay `""`.
+
+All three are VFF-only for now; legacy (pre-2021 MFC) files leave them
+empty/unset. New `parser_test.cpp` tests cover the model dictionaries on
+`SU_File.skp` (typed `GeoReference`, `GSU_ContributorsInfo`, `IfcGUIDs`
+values), unique instance IDs on `Untitled.skp`, and the legacy fallbacks.
+Face layers are verified on real files outside the fixture set - none of
+the current VFF fixtures has a face on a non-default layer.
+
+### Fixed — C++: legacy reader ports of two Python fixes (openskp#284, #390, #391)
+
+Two bugs in `legacy.cpp` that Python's `legacy.py` already had fixed
+(#310, #385), never ported:
+
+- `CAttributeNamed`'s trailing `u32` is a v7+ addition - a real SketchUp 6
+  file ends the record at the empty-key terminator with nothing after it.
+  Reading it unconditionally ate 4 bytes belonging to the next sibling's
+  own tag. Gated on `ver >= 7`, same as the Python fix.
+- The instance/group GUID read (`legacy_instance_has_guid`) was still
+  gated on the class's own reported schema number - `CGroup` reports
+  schema 1 on every version tested (v3 through 2025), so that gate was
+  always true and forced a phantom 16-byte read on *every* `CGroup` in
+  *every* pre-2014 file. Replaced with the same file-version gate
+  (`ver >= 14`) Python's #310 fix established; the now-dead
+  `class_schema` bookkeeping this schema check was the only reader of is
+  removed.
+
+Found while porting #385 to C++: the new `legacy_v6_synthetic.skp`
+fixture (a nested `CGroup` carrying an attribute dictionary, reused
+as-is from #385) tripped both bugs at once, since either one alone
+corrupts the same record. Full C++ suite (263 tests) passes with both
+fixes; `lowlevel_test.cpp`'s `legacy_instance_has_guid` unit test
+updated to assert the version gate instead of the disproven schema gate.
+
+### Fixed — C++: boolean and Length attribute values keep their types through write and read
+
+The C++ writer's `AttributeValue` only had `std::string` / `std::int32_t` /
+`double`, so a SketchUp boolean had to go out as an int32 and a `Length` as
+a plain double - Python's writer already emits both natively (`bool` →
+type 7, `create.Length` → type 12). Added `AttributeBool` and
+`AttributeLength` alternatives (wrapped, so a string literal or an integer
+can never convert into them) and write them as types 7 / 12.
+
+Reading kept neither: legacy type 7 decoded as `Integer`, type 12 and VFF
+`AF38` as `Float`, and VFF `AA38` - a native boolean the VFF decoder did not
+know - as `Null`. `AA38` is real: a SketchUp 2024 file with
+`face.set_attribute("d", "is_a_face", true)` stores `A438 { AA38 01 }`.
+`ParsedAttribute` gains `Kind::Boolean` (`integer` = 1/0) and
+`Kind::Length` (`number` = inches); `A938` / type 6 stay `Float`. Both new
+kinds stringify exactly as the integer / float they used to decode to, so
+`properties`, scene, JSON and IFC output are unchanged. Python, TypeScript,
+.NET and Dart readers are not touched here.
+### Fixed — Python: legacy definition names could fail to anchor when the GUID prefix runs shorter than expected
+
+`_read_definition` reads a 16-byte GUID immediately followed by the name
+string's marker; some files skew that fixed width. SketchUp 2020 files
+carrying 2 extra bytes ahead of the GUID were already handled by scanning
+forward. Reported (openskp#377, with an excellent, self-diagnosed writeup
+and a verified fix from the reporter): a definition imported from DWG in a
+SketchUp 2018 file skews the *other* way - the prefix runs shorter, so the
+marker sits a few bytes *before* the assumed position, which the
+forward-only scan couldn't find, aborting the whole parse. The scan is now
+symmetric (nearest offset first, in both directions), extracted into a
+directly unit-tested `_reanchor_on_string_marker` helper. Verified by the
+reporter against the real SketchUp SDK's own output (glTF bounding boxes
+matched on every axis) and their own real-file regression corpus, which is
+unaffected since the fallback only ever runs where the strict read would
+otherwise raise.
+
+TypeScript/.NET/Dart carry the identical forward-only scan (confirmed by
+inspection) and would hit the same failure mode on an equivalently-skewed
+file - not yet ported, tracked in openskp#285. C++'s legacy reader has no
+equivalent mechanism at all; unclear yet whether it needs one or already
+handles both files' layout some other way - needs its own look.
+### Fixed — Python: legacy V6 files with attribute dictionaries failed to parse
+
+Part of openskp#284's version-compatibility sweep: a SketchUp 6 file's
+`CAttributeNamed` record has no trailing field, unlike v7+ - but
+`_read_attr_named` read one unconditionally. On a file with any attribute
+dictionary (e.g. a nested group's custom attributes), that phantom
+4-byte read silently ate into the next sibling's own tag, which didn't
+raise there - it surfaced many reads later, deep in the object graph, as
+an unrelated `back-ref to unwalked slot N` error (the same
+misleading-error-site pattern as the V7/V8/2013 GUID bug fixed in #310,
+but a distinct cause: `CAttributeNamed`'s class is always learned from
+the unwalked pre-model region, so its schema is never observed and can't
+gate this the way the instance-GUID fix did). Gated the trailing read on
+`ar.ver >= 7` instead, confirmed against a real SketchUp-6-downgraded
+fixture and cross-checked for no regression on the existing v7/2014
+fixtures.
+
 ### Changed — TypeScript: dropped Node 20 from CI/release after the vitest 5 bump
 
 Following up on the vitest 4→5 Dependabot bump (#366): vitest 5 requires

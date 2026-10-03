@@ -807,6 +807,37 @@ TEST(Create, InstanceAttributesRoundTrip) {
   EXPECT_DOUBLE_EQ(attrs.at("weight").number, 3.5);
 }
 
+TEST(Create, InstanceBooleanAndLengthAttributesKeepTheirTypes) {
+  // SketchUp's own boolean (type 7) and Length (type 12) - Python's `bool` / `create.Length` -
+  // used to be unwritable here (a bool had to go out as an int32, a Length as a plain double)
+  // and read back as Integer / Float.
+  auto builder = create();
+  auto& part = builder->add_component_definition("Part");
+  part.add_face({{0, 0, 0}, {1, 0, 0}, {1, 1, 0}});
+  part.close();
+
+  InstanceOptions opts;
+  opts.attributes["visible"] = AttributeBool{true};
+  opts.attributes["hidden"] = AttributeBool{false};
+  opts.attributes["depth"] = AttributeLength{15.5};
+  opts.attributes["weight"] = 3.5;
+  builder->add_instance(part, opts);
+
+  SkpModel model = round_trip(*builder);
+  ASSERT_EQ(model.root().instances.size(), 1u);
+  const auto& attrs = model.root().instances[0].attribute_dictionaries.at("attributes");
+  EXPECT_EQ(attrs.at("visible").kind, ParsedAttribute::Kind::Boolean);
+  EXPECT_EQ(attrs.at("visible").integer, 1);
+  EXPECT_EQ(attrs.at("hidden").kind, ParsedAttribute::Kind::Boolean);
+  EXPECT_EQ(attrs.at("hidden").integer, 0);
+  EXPECT_EQ(attrs.at("depth").kind, ParsedAttribute::Kind::Length);
+  EXPECT_DOUBLE_EQ(attrs.at("depth").number, 15.5);
+  EXPECT_EQ(attrs.at("weight").kind, ParsedAttribute::Kind::Float);
+  // Stringified views keep the integer / float text they always had.
+  EXPECT_EQ(attrs.at("visible").to_string(), "1");
+  EXPECT_EQ(attrs.at("depth").to_string(), "15.5");
+}
+
 TEST(Create, LayerExtraDictionariesRoundTrip) {
   auto builder = create();
   LayerOptions opts;

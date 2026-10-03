@@ -89,6 +89,52 @@ describe('EdgeFlagStore', () => {
     }
   });
 
+  it('keeps memory proportional to the id span on descending ids (#393)', () => {
+    // Every write below the base used to double the backing array, so 24
+    // descending ids reached 512 MB and a real 27 MB SketchUp 2021 model
+    // aborted V8 with `change_in_bytes < kMaxReasonableBytes`.
+    const s = new EdgeFlagStore();
+    for (let id = 100_000; id > 0; id--) s.set(id, id & 0xff);
+    const capacity = (s as unknown as { flags: Uint8Array }).flags.length;
+    expect(capacity).toBeLessThan(4 * 100_000);
+    expect(s.size).toBe(100_000);
+    for (let id = 1; id <= 100_000; id += 997) expect(s.get(id)).toBe(id & 0xff);
+    expect(s.get(0)).toBeUndefined();
+    expect(s.get(100_001)).toBeUndefined();
+  });
+
+  it('keeps memory proportional to the id span on a far jump below', () => {
+    const s = new EdgeFlagStore();
+    s.set(6_000_000, 0x06);
+    s.set(1_000_000, 0x08);
+    s.set(999_999, 0x10);
+    const capacity = (s as unknown as { flags: Uint8Array }).flags.length;
+    expect(capacity).toBeLessThan(2 * 5_000_002);
+    expect(s.get(6_000_000)).toBe(0x06);
+    expect(s.get(1_000_000)).toBe(0x08);
+    expect(s.get(999_999)).toBe(0x10);
+    expect(s.size).toBe(3);
+  });
+
+  it('matches a Map on interleaved descending and ascending runs', () => {
+    const s = new EdgeFlagStore();
+    const ref = new Map<number, number>();
+    const put = (id: number) => {
+      const flags = (id * 31) & 0xff;
+      s.set(id, flags);
+      ref.set(id, flags);
+    };
+    for (let r = 0; r < 20; r++) {
+      const start = 50_000 - r * 2_000;
+      for (let i = 0; i < 300; i++) put(start - i);
+      for (let i = 0; i < 300; i++) put(start + 10_000 + i);
+    }
+    for (let id = 0; id < 80_000; id += 3) {
+      expect(s.get(id)).toBe(ref.get(id));
+    }
+    expect(s.size).toBe(ref.size);
+  });
+
   it('masks a value to one byte, as the Map-held D307 byte always was', () => {
     const s = new EdgeFlagStore();
     s.set(1, 0x1ff);

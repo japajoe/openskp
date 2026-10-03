@@ -33,10 +33,14 @@ struct RawFace {
   bool uv_projected{};
   bool uv_projected_back{};
   bool hidden{};
+  // Layer entity id as a string until build_model resolves it to a name,
+  // same as RawInstance::layer.
+  std::string layer;
 };
 
 struct RawInstance {
   std::uint64_t offset{};
+  std::optional<EntityId> id;
   std::string ref_guid;
   std::string name;
   std::optional<EntityId> ref_idx;
@@ -152,6 +156,9 @@ struct RawParsed {
   std::vector<RawStyle> styles;
   std::map<EntityId, RawDefinition> definitions;
   RawDefinition root{"ROOT", "ROOT_MODEL"};
+  // Dictionaries attached to the model entity itself (F601 -> 8813 -> D007
+  // -> DC05), not to anything placed in it.
+  ParsedAttrDictionaries model_attribute_dicts;
 };
 
 std::uint16_t read_u16(const ByteBuffer&, std::size_t);
@@ -166,7 +173,7 @@ std::optional<std::string> read_meta_units(const ByteBuffer&);
 std::string extract_version(const ByteBuffer&);
 bool valid_header(const ByteBuffer&);
 bool is_legacy(const ByteBuffer&);
-bool legacy_instance_has_guid(const std::string&, std::optional<int>);
+bool legacy_instance_has_guid(int ver);
 
 /// Result of `find_count_after_v20_filler`: the recovered count and the
 /// offset just past it.
@@ -294,6 +301,7 @@ void collect_layers(const std::vector<TlvNode>&, std::map<EntityId, std::string>
                     std::map<std::string, bool>&);
 void collect_material_ids(const std::vector<TlvNode>&, std::map<EntityId, std::string>&);
 void collect_definitions(const std::vector<TlvNode>&, std::map<EntityId, RawDefinition>&);
+void collect_model_attribute_dictionaries(const TlvNode&, ParsedAttrDictionaries&);
 SkpModel build_model(RawParsed&&, const ParseOptions& = {});
 Scene build_scene_raw(RawParsed&&, const ParseOptions&);
 InstancedScene build_instanced_scene_raw(RawParsed&&, const ParseOptions&);

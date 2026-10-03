@@ -178,12 +178,26 @@ TEST(Geometry, AttributeDictionariesDecodeLengthAndFloatAsDistinctTagsBothF64) {
   auto dicts = attribute_dicts_for(named_dict("fbd-einfo", entries));
   const auto& depth = dicts.at("fbd-einfo").at("depth");
   const auto& price = dicts.at("fbd-einfo").at("price");
-  EXPECT_EQ(depth.kind, ParsedAttribute::Kind::Float);
+  // Same f64 payload; AF38 keeps its Length kind so it can be written back as one.
+  EXPECT_EQ(depth.kind, ParsedAttribute::Kind::Length);
   EXPECT_DOUBLE_EQ(depth.number, 15.5);
   EXPECT_EQ(price.kind, ParsedAttribute::Kind::Float);
   EXPECT_DOUBLE_EQ(price.number, 120.0);
   EXPECT_EQ(depth.to_string(), "15.5");
   EXPECT_EQ(price.to_string(), "120");
+}
+
+TEST(Geometry, AttributeDictionariesDecodeBooleanValue) {
+  // SketchUp 2024 `set_attribute(..., true)` / `false` on a face or instance: A438 { AA38 01 }.
+  auto entries = concat({entry("is_a_face", tlv("AA38", {1})), entry("flag", tlv("AA38", {0}))});
+  auto dicts = attribute_dicts_for(named_dict("SPIRIT_ELEMENT_DICT", entries));
+  const auto& yes = dicts.at("SPIRIT_ELEMENT_DICT").at("is_a_face");
+  const auto& no = dicts.at("SPIRIT_ELEMENT_DICT").at("flag");
+  EXPECT_EQ(yes.kind, ParsedAttribute::Kind::Boolean);
+  EXPECT_EQ(yes.integer, 1);
+  EXPECT_EQ(no.kind, ParsedAttribute::Kind::Boolean);
+  EXPECT_EQ(no.integer, 0);
+  EXPECT_EQ(yes.to_string(), "1");
 }
 
 TEST(Geometry, AttributeDictionariesDecodeIntegerValue) {

@@ -24,14 +24,18 @@ using Color4 = std::array<std::uint8_t, 4>;
 
 /// One attribute-dictionary value, matching Python's
 /// `_decode_vff_attr_value` / `_read_attr_named`: `None`, `str`, `int`,
-/// `float` (both VFF `A938` Float and `AF38` Length), a 3-tuple for
-/// Point3d/Vector3d, or a nested list. Scene / JSON / IFC stringify
+/// `float`, a 3-tuple for Point3d/Vector3d, or a nested list - plus the two
+/// SketchUp types the writer can also emit, so they survive a read:
+/// `Boolean` (VFF `AA38`, legacy type 7) and `Length` (VFF `AF38`, legacy
+/// type 12; `A938` / type 6 stay `Float`). Both stringify exactly as the
+/// integer / float they used to decode to, so every stringified view
+/// (`properties`, scene, JSON, IFC) is unchanged. Scene / JSON / IFC stringify
 /// every named dictionary; the model keeps types.
 /// `Instance::properties` stays a `map<string,string>` view of a
 /// dictionary named `dynamic_attributes` when that name is present
 /// (existing OpenSKP API).
 struct ParsedAttribute {
-  enum class Kind : std::uint8_t { Null, String, Integer, Float, Vec, Array };
+  enum class Kind : std::uint8_t { Null, String, Integer, Float, Vec, Array, Boolean, Length };
   Kind kind = Kind::Null;
   std::string text;
   std::int64_t integer = 0;
@@ -59,6 +63,22 @@ struct ParsedAttribute {
     ParsedAttribute v;
     v.kind = Kind::Float;
     v.number = n;
+    return v;
+  }
+
+  /// SketchUp `true`/`false`; `integer` holds 1/0.
+  static ParsedAttribute from_boolean(bool b) {
+    ParsedAttribute v;
+    v.kind = Kind::Boolean;
+    v.integer = b ? 1 : 0;
+    return v;
+  }
+
+  /// SketchUp `Length` (inches); `number` holds the value.
+  static ParsedAttribute from_length(double inches) {
+    ParsedAttribute v;
+    v.kind = Kind::Length;
+    v.number = inches;
     return v;
   }
 
@@ -177,6 +197,10 @@ struct Face {
   /// Whether the face is hidden (SketchUp's "Hide" on this specific face,
   /// not a layer/tag visibility toggle).
   bool hidden{};
+  /// Name of the layer (tag) the face is assigned to. "" for faces on the
+  /// default layer (Layer0), which VFF files don't record per face, and for
+  /// every face in legacy (pre-2021 MFC) files.
+  std::string layer;
 };
 
 /// Organization layer (tag) for model elements.
@@ -275,6 +299,10 @@ struct Instance {
   /// specific component/group placement, not a layer/tag visibility
   /// toggle).
   bool hidden{};
+  /// Unique TLV entity ID of the placement itself (the ID SketchUp persists
+  /// across sessions, `Sketchup::Entity#persistent_id`). Populated for
+  /// modern (VFF) files; unset for legacy (pre-2021 MFC) files.
+  std::optional<EntityId> id;
 };
 
 /// Section plane entity.
@@ -428,6 +456,13 @@ class OPENSKP_EXPORT SkpModel {
   std::deque<Material> materials;
   /// Model rendering styles.
   std::vector<Style> styles;
+  /// Every attribute dictionary attached to the model itself (Ruby's
+  /// `Sketchup::Model#attribute_dictionaries`), keyed by the dictionary's
+  /// own declared name - where extensions typically persist model-wide
+  /// settings. Values keep their native types, same as
+  /// `Instance::attribute_dictionaries`. Populated for modern (VFF) files;
+  /// empty for legacy (pre-2021 MFC) files.
+  ParsedAttrDictionaries attribute_dictionaries;
 
   /// Access the implicit root model definition.
   Definition& root() noexcept;

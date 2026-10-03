@@ -115,10 +115,22 @@ using UvPoint = std::pair<Point3, std::array<double, 2>>;
 /// (scale/rotation/shear/translation, no perspective) - see `FaceOptions::front_uv`/`back_uv`.
 using UvCorrespondence = std::vector<UvPoint>;
 
-/// A custom attribute value - the same 3 types SketchUp's own "dynamic component" attributes
-/// support in this writer (see `legacy.cpp`'s `_read_attr_named` equivalent for the full set this
-/// *format* supports; only these 3 are exposed here).
-using AttributeValue = std::variant<std::string, std::int32_t, double>;
+/// A SketchUp boolean attribute value (type 7), Python's `bool`. A distinct type, not `bool`
+/// itself, so a string literal or an integer can never silently convert into it.
+struct AttributeBool {
+  bool value = false;
+};
+
+/// A SketchUp `Length` attribute value in inches (type 12), Python's `create.Length`; a plain
+/// `double` is written as Float (type 6).
+struct AttributeLength {
+  double value = 0;
+};
+
+/// A custom attribute value: string, int32, double (Float), boolean or Length (see
+/// `legacy.cpp`'s `_read_attr_named` equivalent for the full set this *format* supports).
+using AttributeValue =
+    std::variant<std::string, std::int32_t, double, AttributeBool, AttributeLength>;
 /// A named dictionary of custom key/value metadata, attached to a definition/instance/face via
 /// each of their `attributes`/`attribute_dict_name` options - the same mechanism SketchUp's own
 /// "dynamic component" attributes use.
