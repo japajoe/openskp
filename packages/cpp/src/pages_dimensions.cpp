@@ -266,18 +266,37 @@ const TlvNode* find_page_node(const TlvNode& top) {
   return find_child_tag(top.children, "0702");
 }
 
+// A view camera (34BC): 34BD eye, 34BE target, 34BF up (3xf64, inches), 34C4
+// field of view (degrees), 34C2 u8 = PERSPECTIVE flag (00 = parallel
+// projection - calibrated against the bundled scene thumbnails: parallel
+// plans/elevations carry 00 and their 34C3 visible height matches the
+// thumbnail framing exactly, while perspective scenes carry 01 with a stale
+// 34C3), 34C3 f64 = visible height when parallel (inches). Scenes and the
+// model's current view (FA01) use the same record.
+RawCamera parse_camera(const ByteBuffer& record) {
+  auto cam = tlv_items_int(record);
+  RawCamera out;
+  out.eye = vec3_of(tlv_find_int(cam, 0x34bd));
+  out.target = vec3_of(tlv_find_int(cam, 0x34be));
+  out.up = vec3_of(tlv_find_int(cam, 0x34bf));
+  auto fov = tlv_find_int(cam, 0x34c4);
+  if (fov && fov->size() == 8) out.fov = read_f64(*fov, 0);
+  auto flag = tlv_find_int(cam, 0x34c2);
+  out.parallel = flag && !flag->empty() && (*flag)[0] == 0;
+  auto height = tlv_find_int(cam, 0x34c3);
+  if (height && height->size() == 8) out.ortho_height = read_f64(*height, 0);
+  return out;
+}
+
 // Scenes ("pages"). The 0702 node's payload nests 6D60 > 6D61 > one 7148
 // record per page:
 //
 // * 6F54 > 6F55 - page name (UTF-8)
-// * 714A > 34BC - camera: 34BD eye, 34BE target, 34BF up (3xf64, inches),
-//   34C4 field of view (degrees), 34C2 u8 = PERSPECTIVE flag (00 =
-//   parallel projection - calibrated against the bundled scene
-//   thumbnails: parallel plans/elevations carry 00 and their 34C3 visible
-//   height matches the thumbnail framing exactly, while perspective
-//   scenes carry 01 with a stale 34C3), 34C3 f64 = visible height when
-//   parallel (inches)
+// * 714A > 34BC - camera (see parse_camera)
 // * 7150 - layers hidden in this page: (u8 length, var-int layer id) runs
+//
+// Each page's 6F54 also carries its entity id (DC05 > DE05), and 6D62 next to
+// 6D61 holds the id of the scene selected when the model was saved.
 std::vector<RawPage> parse_pages(const TlvNode* node) {
   std::vector<RawPage> pages;
   if (!node) return pages;
@@ -286,6 +305,7 @@ std::vector<RawPage> parse_pages(const TlvNode* node) {
   for (auto& it60 : t60_items) {
     if (it60.tag != 0x6d60) continue;
     auto t61_items = tlv_items_int(it60.payload);
+    auto selected_id = tlv_find_int(t61_items, 0x6d62);
     for (auto& it61 : t61_items) {
       if (it61.tag != 0x6d61) continue;
       auto t48_items = tlv_items_int(it61.payload);
@@ -303,27 +323,23 @@ std::vector<RawPage> parse_pages(const TlvNode* node) {
         if (name && !name->empty()) {
           page.name.assign(reinterpret_cast<const char*>(name->data()), name->size());
         }
+        if (selected_id) {
+          auto ids = tlv_find_int(head, 0x05dc);
+          auto id = ids ? tlv_find_int(tlv_items_int(*ids), 0x05de) : std::nullopt;
+          page.selected = id && *id == *selected_id;
+        }
 
         auto cam_wrap_payload = tlv_find_int(items, 0x714a);
         std::vector<FlatTlvItem> cam_wrap;
         if (cam_wrap_payload) cam_wrap = tlv_items_int(*cam_wrap_payload);
-        auto cam_payload = tlv_find_int(cam_wrap, 0x34bc);
-        std::vector<FlatTlvItem> cam;
-        bool has_cam = false;
-        if (cam_payload) {
-          cam = tlv_items_int(*cam_payload);
-          has_cam = true;
-        }
-        if (has_cam) {
-          page.eye = vec3_of(tlv_find_int(cam, 0x34bd));
-          page.target = vec3_of(tlv_find_int(cam, 0x34be));
-          page.up = vec3_of(tlv_find_int(cam, 0x34bf));
-          auto fov = tlv_find_int(cam, 0x34c4);
-          if (fov && fov->size() == 8) page.fov = read_f64(*fov, 0);
-          auto flag = tlv_find_int(cam, 0x34c2);
-          page.parallel = flag && !flag->empty() && (*flag)[0] == 0;
-          auto height = tlv_find_int(cam, 0x34c3);
-          if (height && height->size() == 8) page.ortho_height = read_f64(*height, 0);
+        if (auto cam_payload = tlv_find_int(cam_wrap, 0x34bc)) {
+          auto cam = parse_camera(*cam_payload);
+          page.eye = cam.eye;
+          page.target = cam.target;
+          page.up = cam.up;
+          page.fov = cam.fov;
+          page.parallel = cam.parallel;
+          page.ortho_height = cam.ortho_height;
         }
 
         auto hidden = tlv_find_int(items, 0x7150);

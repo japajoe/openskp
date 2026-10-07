@@ -199,12 +199,14 @@ SkpModel build_model(RawParsed&& p, const ParseOptions& o) {
     page.fov = pg.fov;
     page.parallel = pg.parallel;
     page.ortho_height = pg.ortho_height;
+    page.selected = pg.selected;
     for (auto id : pg.hidden_layer_ids) {
       auto it = p.layer_id_to_name.find(id);
       if (it != p.layer_id_to_name.end()) page.hidden_layers.push_back(it->second);
     }
     m.pages.push_back(std::move(page));
   }
+  m.camera = p.camera;
   // Convert model-level linear dimensions (VFF; world space).
   for (auto& dm : p.dimensions) {
     Dimension dim;
@@ -246,7 +248,10 @@ SkpModel build_model(RawParsed&& p, const ParseOptions& o) {
       m.material_indices_[v.first] = i;
     }
   }
-  for (auto& s : p.styles) m.styles.push_back({std::move(s.name), s.front_color, s.back_color});
+  for (auto& s : p.styles)
+    m.styles.push_back({std::move(s.name), std::move(s.description), s.front_color, s.back_color,
+                        std::move(s.items), std::move(s.watermarks), std::move(s.folder), s.active,
+                        s.working_copy, s.modified});
   return m;
 }
 }  // namespace openskp

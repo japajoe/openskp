@@ -7,6 +7,149 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — TypeScript, .NET, Dart, C++: the legacy readers get the pre-2014 fixes the Python reader already had (openskp#410)
+
+Three layout fixes found while chasing openskp#284 had only landed in Python;
+each port has its own independently written parser, so none of them benefited.
+Now ported, gated on the file's own version exactly as in Python:
+
+- **Instance GUID (#310)**: the trailing 16-byte GUID on `CComponentInstance` /
+  `CGroup` is read only for files at version 14 or later, not by the class's
+  reported schema (a v7 `CComponentInstance` reports schema 6 yet has none, and
+  `CGroup` reports schema 1 everywhere). The schema gate silently ate bytes from
+  the next sibling and could truncate a root scene to one instance without
+  raising. TypeScript, .NET and Dart; C++ already had it.
+- **`CAttributeNamed` trailer (#385)**: the trailing `u32` exists from v7; a
+  SketchUp 6 file has none, and reading it surfaced much later as
+  `back-ref to unwalked slot`. TypeScript, .NET and Dart; C++ already had it.
+- **SketchUp 3 layout (#407)**: all five readers now parse SketchUp 3 files
+  (see the Python entry below for the full list of layout differences).
+
+Each language gets the same synthetic fixtures and structural tests (parsed
+definitions, root-instance placement, face material, textures), with V3
+cross-checked against V6 from the same source; the new tests fail against the
+previous TypeScript, .NET and Dart readers. In TypeScript, whose full parsed
+output was hashed before and after, every existing fixture is byte-identical;
+the other ports' existing suites pass unchanged. Same honest limits as the Python entry:
+calibrated on one V3 file, and single-material V3 files are unverified.
+
+### Fixed — TypeScript: the legacy (pre-2021) reader no longer holds the whole model's entities until the end
+
+The legacy walk kept every face, loop, edge-use, edge and vertex of the
+model alive until it finished, and only then built each definition's
+geometry. A real 411 MB SketchUp 2020 file held 11.4 million slots (~3.5
+GB of live heap) before the first builder existed, and could not be parsed
+with a 4 GB heap. Each `CComponentDefinition` is now built as its record
+completes, and its entity objects are released right away (their slots
+keep a shared, value-less placeholder so later back-refs still resolve).
+On that file the parse fits in 2.5 GB and runs about three times faster;
+the parsed model and the instanced scene are identical on all 25 real
+files tested.
+### Fixed — Python: SketchUp 3 files parse (openskp#284's V3 signature)
+
+A SketchUp 3 `.skp` died on its very first material (`expected a string record`).
+Unlike the V6/V7 signatures, this wasn't one wrong field: V3's layout differs from
+every later era in about a dozen small ways, found by byte-tracing a real V3 file
+(a synthetic model saved down through SketchUp's own version export). All are gated
+on the header version being below 4: no attribute-container pointer on vertex /
+loop / edge-use / material / layer records; a 5-byte draw block; a 4-byte-shorter
+layer tail and a 13-byte definition base block; textures stored as a bare inline
+image (no preamble, no store-map slot); a fixed 129-byte thumbnail; no layer count
+before the layer records; no name string on instances. In V3 a face's leading
+pointer is its *front material*, not an attribute container, so painted faces now
+resolve their material. Not decoded: the draw-block flags (hidden/soft/smooth are
+reported unset) and anything SketchUp 3 can't store (attribute dictionaries,
+instance names).
+
+The first working parse was misleadingly *successful* - one definition of four, a
+phantom layer, zero root instances - so the new tests assert the parsed structure
+and cross-check it against the V6 fixture built from the same source, rather than
+only that nothing raises. Honest limits: calibrated on one file; V4 needs none of
+this (a real V4 file already parses); V3 files with a single material (the
+slot-base probe path) are untouched and unverified. The other four ports are
+updated in the entry below.
+
+### Fixed — Python: `import openskp` no longer fails where `mapbox_earcut` can't be installed (freecad-openskp#3)
+
+`mapbox_earcut` is a compiled dependency, and `_core` imported it at module
+top level, so `import openskp` itself died with `ModuleNotFoundError` in
+interpreters that can't install it - FreeCAD's bundled Python, for one, where
+two users hit it immediately on opening any `.skp`. Only `triangulate_face_3d`
+(the scene/mesh path) needs it; parsing, loops/edges, the writer and the editor
+don't. The import is now optional: that one path falls back to fan
+triangulation - only correct for convex outlines - and logs a one-time warning
+saying so, instead of the whole package failing to import. `pip install
+openskp` still installs `mapbox_earcut` as before, so normal installs are
+unchanged. Tests block the module in a fresh interpreter to reproduce the real
+import failure, and check the fallback and the warn-once behaviour.
+### Fixed — TypeScript: parsing a large SketchUp 2021+ file no longer builds the whole definitions tree at once
+
+`iterTopLevelLazy` streamed top-level records one at a time, but in real
+files the component definitions are not top-level: they sit under one
+`F901` > `7017` > `7117` chain, which held 100% of a 297 MB model.dat
+(1,203 `7C15` definitions, the largest 0.8 MB). That single record was
+built whole, so parsing a 70 MB `.skp` needed more than 3 GB of heap and
+crashed browser tabs. The three wrapper tags are now passed through, and
+each definition is its own streamed record. No consumer matches those
+tags, so the parsed model and the instanced scene are identical; on that
+file the parse now fits in 1-1.5 GB of heap and runs about twice as fast.
+
+### Added — C++: the model's saved view and the selected scene
+
+SketchUp reopens a file at the view it was saved with, whichever scene is
+selected and even when that scene was not updated. `SkpModel::camera` now
+carries that view (model.dat `FA01` > `34BC`, laid out like a scene camera:
+eye, target, up, field of view, parallel flag, visible height), and
+`Page::selected` marks the scene selected at save time (`6D62` beside the
+page list names it by the entity id each page carries in `6F54` > `DC05` >
+`DE05`). Verified against SketchUp 2026's own `active_view.camera` and
+`pages.selected_page` on a three-scene model; the `Untitled.skp` fixture and
+a synthetic page list cover them.
+### Added — C++: every style.xml item, the style description, watermarks, and the current style
+
+`Style` only carried the two face colors. It now also has `description`
+(the style's `desc` attribute) and `items`: every `<sty:item>` kept raw as
+`StyleItem {type, value}`, keyed by item id, so a caller can read the rest
+of a style's display settings (edge widths, X-ray opacity, section and
+selection colors, ...). Face colors also accept variant type 5, which
+older files use. `watermarks` lists the style's watermarks (item 5001)
+with their raw attributes and the image bytes from the SKP ZIP, whether
+the style names the image relative to its folder or from the ZIP root; a
+new `style_watermark.skp` fixture covers both. `folder`, `active`,
+`working_copy` and `modified` come from model.dat's style catalog, so a
+caller can tell the model's current style (and its "_1" working copy with
+edits not yet updated into it) from the other styles in the file. `docs/API_DESIGN.md` documents the shape for the other
+languages and the item id → `RenderingOptions` key table, confirmed
+against SketchUp 2026.
+
+### Fixed — all five ports: legacy textures that carry an attribute dictionary failed to parse (#396)
+
+A texture is an entity in its own right, so right after a material's
+"has texture" flag it opens with the standard entity preamble: an
+attribute-container reference and, from v17 on, the persistent-id mask.
+`texture_block` skipped a fixed 1/2-byte pad there, which is only right
+when the reference is null. Render plugins (Rayscaper, per the report)
+store a dictionary on the texture itself, so those files died with
+`texture size block misaligned` (C++) / `texture object is not a dib`
+(Python) - the same error text as the still-open V4/V5 signature in #284,
+though that one remains uninvestigated. All five readers now step back over
+the flag's high byte and call the existing preamble reader; for a texture
+without attributes this consumes exactly the same bytes as before.
+New Python regression test (`test_legacy_texture_attributes.py`) patches the
+writer to emit a real container on a texture - the byte shape of the
+reporter's private files - and fails with the reported error on the previous
+code.
+### Fixed — All languages: style face colors read from the wrong items, with R and B swapped
+
+`styles[].front_color` / `back_color` came from style.xml items 4000/4001,
+which are the background and sky colors, not face colors; the face colors
+are items 2002 (front) and 2003 (back). The values were also decoded as
+ARGB, but SketchUp stores them as signed-int32 ABGR (R in the low byte),
+so R and B came out swapped. Verified against SketchUp 2026's own
+`rendering_options` on a model with a custom style; the `Untitled.skp`
+fixture's back color now decodes to SketchUp's default (164, 178, 187).
+The synthetic Python test pins literal colors and adds 4000/4001 decoys.
+
 ### Fixed — TypeScript: `EdgeFlagStore` could abort the process on descending edge ids (#393)
 
 `ensureSlot`'s re-base path (for an edge id below the current base) sized

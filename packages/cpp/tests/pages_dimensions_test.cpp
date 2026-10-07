@@ -134,7 +134,8 @@ TEST(PagesDimensions, DimensionConnectedPointResolvesThroughInstance) {
 
 // ── scenes (pages) ──────────────────────────────────────────────────────
 
-ByteBuffer page_record(const std::string& name, bool parallel, std::vector<int> hidden_ids = {}) {
+ByteBuffer page_record(const std::string& name, bool parallel, std::vector<int> hidden_ids = {},
+                       ByteBuffer id = {}) {
   auto cam = test::concat({
       tlv(0x34bd, vec3(100.0, -200.0, 50.0)),  // eye
       tlv(0x34be, vec3(0.0, 0.0, 0.0)),        // target
@@ -149,7 +150,8 @@ ByteBuffer page_record(const std::string& name, bool parallel, std::vector<int> 
     hidden.push_back(static_cast<std::uint8_t>(id));
   }
   auto body = test::concat({
-      tlv(0x6f54, tlv(0x6f55, test::bytes(name))),
+      tlv(0x6f54, test::concat({id.empty() ? ByteBuffer{} : tlv(0x05dc, tlv(0x05de, id)),
+                                tlv(0x6f55, test::bytes(name))})),
       tlv(0x714a, tlv(0x34bc, cam)),
       tlv(0x7150, hidden),
   });
@@ -178,6 +180,26 @@ TEST(PagesDimensions, ParsePagesSynthetic) {
   EXPECT_EQ(planta.hidden_layer_ids[0], 2);
   EXPECT_FALSE(pages[1].parallel);
   EXPECT_EQ(pages[1].fov, 35.0);
+  EXPECT_FALSE(pages[0].selected);  // no 6D62: nothing selected
+  EXPECT_FALSE(pages[1].selected);
+}
+
+// 6D62 (beside 6D61) names the scene selected when the model was saved by the
+// entity id each page carries in 6F54 > DC05 > DE05.
+TEST(PagesDimensions, ParsePagesSelected) {
+  auto payload = tlv(
+      0x6d60, test::concat({
+                  tlv(0x6d61, test::concat({page_record("Plan", true, {}, ByteBuffer{0x38, 0x02}),
+                                            page_record("3D", false, {}, ByteBuffer{0x39, 0x02})})),
+                  tlv(0x6d62, ByteBuffer{0x39, 0x02}),
+              }));
+  TlvNode node;
+  node.tag = "0702";
+  node.payload = payload;
+  auto pages = parse_pages(&node);
+  ASSERT_EQ(pages.size(), 2u);
+  EXPECT_FALSE(pages[0].selected);
+  EXPECT_TRUE(pages[1].selected);
 }
 
 TEST(PagesDimensions, PagesAbsentIsEmpty) { EXPECT_TRUE(parse_pages(nullptr).empty()); }

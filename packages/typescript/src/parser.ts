@@ -139,16 +139,46 @@ export interface TopLevelRecord {
   node: TlvNode;
 }
 
+/** Pure wrapper containers on the path to the component definitions:
+ * "F901" > "7017" > "7117" > one "7C15" per definition. In real files this
+ * chain holds nearly the whole model (a 297 MB model.dat had 100% of its
+ * bytes under a single F901), so yielding F901 as one record built the
+ * entire definitions tree at once. No consumer of iterTopLevelLazy matches
+ * these three tags - every walker searches by tag at any depth - so
+ * yielding their children one at a time instead is equivalent. */
+const PASS_THROUGH_WRAPPERS = new Set<string>(['F901', '7017', '7117']);
+
+/** Replace each pass-through wrapper header with its children's headers,
+ * recursively, keeping file order. Header scans only - no subtree is
+ * built. */
+function expandWrappers(
+  data: Uint8Array,
+  headers: [string, number, number][],
+  containerTags: Set<string>
+): [string, number, number][] {
+  const out: [string, number, number][] = [];
+  for (const header of headers) {
+    const [tag, offset, size] = header;
+    if (PASS_THROUGH_WRAPPERS.has(tag) && containerTags.has(tag)) {
+      out.push(...expandWrappers(data, flatHeaders(data, offset + 6, offset + 6 + size), containerTags));
+    } else {
+      out.push(header);
+    }
+  }
+  return out;
+}
+
 /** Yield `{index, total, node}` for each top-level TLV record's
  * fully-recursed node one at a time, transparently unwrapping a lone "F401"
- * wrapper - without ever materializing more than one top-level subtree
- * simultaneously. `total` (the top-level sibling count) comes for free from
- * the same cheap header scan that drives the loop, so callers can report
- * "N of total" progress with no extra pass over the file. Each yielded node
- * is safe to discard (drop all references) once the caller is done with it,
- * before the next one is produced - that's what keeps peak memory bounded
- * by the size of the single largest top-level record instead of the whole
- * file (real production files can have 100k+ separate definitions). */
+ * wrapper and the F901 > 7017 > 7117 definitions chain (so each "7C15"
+ * definition is its own record) - without ever materializing more than one
+ * record subtree simultaneously. `total` (the record count) comes for free
+ * from the same cheap header scan that drives the loop, so callers can
+ * report "N of total" progress with no extra pass over the file. Each
+ * yielded node is safe to discard (drop all references) once the caller is
+ * done with it, before the next one is produced - that's what keeps peak
+ * memory bounded by the size of the single largest record instead of the
+ * whole file (real production files can have 100k+ separate definitions). */
 export function* iterTopLevelLazy(
   data: Uint8Array,
   start: number,
@@ -160,6 +190,7 @@ export function* iterTopLevelLazy(
     const [, f401Offset, f401Size] = headers[0];
     headers = flatHeaders(data, f401Offset + 6, f401Offset + 6 + f401Size);
   }
+  headers = expandWrappers(data, headers, containerTags);
 
   const total = headers.length;
   let index = 0;

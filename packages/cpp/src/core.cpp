@@ -204,6 +204,42 @@ std::shared_ptr<RawMaterial> material_xml(Zip& zip, const std::string& path,
   return out;
 }
 
+// Every `name="value"` attribute of a tag's attribute text, entity-decoded.
+std::map<std::string, std::string> attributes(const std::string& s) {
+  std::map<std::string, std::string> out;
+  std::regex r("([A-Za-z_][\\w.:-]*)\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)')");
+  for (auto i = std::sregex_iterator(s.begin(), s.end(), r); i != std::sregex_iterator(); ++i)
+    out[(*i)[1].str()] = decode_xml_entities((*i)[2].matched ? (*i)[2].str() : (*i)[3].str());
+  return out;
+}
+
+// Watermarks of style.xml item 5001: `<screenimage>` entries, each naming its
+// image inside the SKP ZIP. Image bytes are filled in by the caller.
+std::vector<StyleWatermark> style_watermarks(const std::string& wmlist) {
+  std::vector<StyleWatermark> out;
+  std::regex si(
+      "<(?:[A-Za-z_][\\w.-]*:)?screenimage\\b([^>]*?)(?:/>|>([\\s\\S]*?)"
+      "</(?:[A-Za-z_][\\w.-]*:)?screenimage>)",
+      std::regex::icase);
+  std::regex im("<(?:[A-Za-z_][\\w.-]*:)?image\\b([^>]*)>", std::regex::icase);
+  for (auto i = std::sregex_iterator(wmlist.begin(), wmlist.end(), si); i != std::sregex_iterator();
+       ++i) {
+    StyleWatermark w;
+    w.attributes = attributes((*i)[1].str());
+    w.attributes.erase("name");
+    w.name = attr((*i)[1].str(), "name");
+    if (w.name == "<MODEL SPACE>") continue;  // separator between under- and overlays
+    auto body = (*i)[2].str();
+    std::smatch m;
+    if (std::regex_search(body, m, im)) {
+      w.image_path = attr(m[1].str(), "path");
+      w.file_name = attr(m[1].str(), "file_name");
+    }
+    out.push_back(std::move(w));
+  }
+  return out;
+}
+
 std::optional<RawStyle> style_xml(const ByteBuffer& bytes) {
   auto xml = str(bytes);
   std::regex st("<(?:[A-Za-z_][\\w.-]*:)?style\\b([^>]*)>", std::regex::icase);
@@ -211,26 +247,101 @@ std::optional<RawStyle> style_xml(const ByteBuffer& bytes) {
   if (!std::regex_search(xml, m, st)) return {};
   RawStyle o;
   o.name = attr(m[1].str(), "name");
+  o.description = attr(m[1].str(), "desc");
   std::regex item(
       "<(?:[A-Za-z_][\\w.-]*:)?item\\b([^>]*)>([\\s\\S]*?)</(?:[A-Za-z_][\\w.-]*:)?item>",
       std::regex::icase);
+  std::regex vr(
+      "<(?:[A-Za-z_][\\w.-]*:)?variant\\b([^>]*)>([\\s\\S]*?)</(?:[A-Za-z_][\\w.-]*:)?variant>",
+      std::regex::icase);
   for (auto i = std::sregex_iterator(xml.begin(), xml.end(), item); i != std::sregex_iterator();
        ++i) {
-    auto id = attr((*i)[1].str(), "id");
-    if (id != "4000" && id != "4001") continue;
-    std::regex vr("<(?:[A-Za-z_][\\w.-]*:)?variant[^>]*>\\s*(-?\\d+)", std::regex::icase);
+    auto id = integer(attr((*i)[1].str(), "id"), -1);
+    if (id < 0) continue;
     std::smatch v;
     auto body = (*i)[2].str();
-    if (std::regex_search(body, v, vr)) {
-      auto n = static_cast<std::uint32_t>(std::stoll(v[1].str()));
-      Color3 c{std::uint8_t(n >> 16), std::uint8_t(n >> 8), std::uint8_t(n)};
-      if (id == "4000")
-        o.front_color = c;
-      else
-        o.back_color = c;
+    if (!std::regex_search(body, v, vr)) continue;
+    StyleItem it;
+    it.type = integer(attr(v[1].str(), "type"), 0);
+    it.value = v[2].str();
+    auto first = it.value.find_first_not_of(" \t\r\n");
+    auto last = it.value.find_last_not_of(" \t\r\n");
+    it.value =
+        first == std::string::npos ? std::string{} : it.value.substr(first, last - first + 1);
+    // Faces: 2002 front, 2003 back, as signed-int32 ABGR (R in the low byte);
+    // variant type 4 in current SketchUp, 5 in older files.
+    // The 4000-series items are background/sky/ground, not face colors.
+    if (id == 2002 || id == 2003) {
+      try {
+        auto n = static_cast<std::uint32_t>(std::stoll(it.value));
+        Color3 c{std::uint8_t(n), std::uint8_t(n >> 8), std::uint8_t(n >> 16)};
+        (id == 2002 ? o.front_color : o.back_color) = c;
+      } catch (...) {
+      }
+    }
+    o.items[id] = std::move(it);
+  }
+  if (auto wm = o.items.find(5001); wm != o.items.end())
+    o.watermarks = style_watermarks(wm->second.value);
+  return o;
+}
+
+// Style catalog (model.dat record 0602 > 7869). 7969 lists the model's
+// styles as 6C6B entries (DC05 > DE05 entity id, 6F6B name = the style's
+// folder under styles/), 7A69 holds the current style's id, 7B69 the current
+// style's working copy (its own 6C6B, folder "<name>_1"), and 7C69 is 1 when
+// the current style was edited without updating it.
+struct CurrentStyle {
+  std::string folder;
+  std::string working_copy;
+  bool modified{};
+};
+
+CurrentStyle current_style(const ByteBuffer& catalog) {
+  auto field = [](const ByteBuffer& entry, const char* tag) -> std::optional<ByteBuffer> {
+    for (auto& [t, v] : parse_flat(entry))
+      if (t == tag) return v;
+    return std::nullopt;
+  };
+  std::vector<std::pair<ByteBuffer, std::string>> listed;
+  std::optional<ByteBuffer> current_id;
+  CurrentStyle out;
+  for (auto& [tag, value] : parse_flat(catalog)) {
+    if (tag == "7969") {
+      for (auto& [t, entry] : parse_flat(value)) {
+        if (t != "6C6B") continue;
+        auto name = field(entry, "6F6B");
+        auto ids = field(entry, "DC05");
+        auto id = ids ? field(*ids, "DE05") : std::nullopt;
+        if (name && id) listed.push_back({*id, str(*name)});
+      }
+    } else if (tag == "7A69") {
+      current_id = value;
+    } else if (tag == "7C69") {
+      out.modified = !value.empty() && value[0] != 0;
+    } else if (tag == "7B69") {
+      for (auto& [t, entry] : parse_flat(value))
+        if (t == "6C6B")
+          if (auto name = field(entry, "6F6B")) out.working_copy = str(*name);
     }
   }
-  return o;
+  for (auto& [id, name] : listed)
+    if (current_id && id == *current_id) out.folder = name;
+  return out;
+}
+
+// The model's current view (FA01 > 34BC); unset without eye and target.
+std::optional<ViewCamera> view_camera(const ByteBuffer& record) {
+  auto raw = parse_camera(record);
+  if (!raw.eye || !raw.target) return std::nullopt;
+  ViewCamera cam;
+  cam.eye = *raw.eye;
+  cam.target = *raw.target;
+  if (raw.up) cam.up = *raw.up;
+  cam.fov = raw.fov;
+  cam.parallel = raw.parallel;
+  cam.ortho_height = raw.ortho_height;
+  return cam;
 }
 
 // VFF model.dat wraps the file's definition list inside container tags
@@ -355,7 +466,20 @@ RawParsed full_parse(const ByteBuffer& data, const ParseOptions& o) {
   for (auto& n : zip.names)
     if (n.rfind("styles/", 0) == 0 && n.size() >= 9 && n.substr(n.size() - 9) == "style.xml")
       if (auto b = zip.get(n))
-        if (auto s = style_xml(*b)) p.styles.push_back(*s);
+        if (auto s = style_xml(*b)) {
+          if (n.size() > 17) s->folder = n.substr(7, n.size() - 17);  // styles/<folder>/style.xml
+          // A style's own images sit in its folder ("./2.jpg"); the current style's
+          // watermark images are at the ZIP root ("watermarks/Watermark1.jpg").
+          for (auto& w : s->watermarks) {
+            auto path = w.image_path;
+            while (path.rfind("./", 0) == 0) path.erase(0, 2);
+            while (!path.empty() && path[0] == '/') path.erase(0, 1);
+            if (path.empty()) continue;
+            for (const auto& candidate : {"styles/" + s->folder + "/" + path, path})
+              if ((w.image = zip.get(candidate))) break;
+          }
+          p.styles.push_back(std::move(*s));
+        }
   auto model = zip.get("model.dat");
   if (!model) throw SkpParseError("model.dat not found in ZIP container", ParseStage::zip_extract);
   auto hs = headers(*model, 0, model->size());
@@ -382,6 +506,7 @@ RawParsed full_parse(const ByteBuffer& data, const ParseOptions& o) {
   std::vector<TlvNode> page_node_owner;  // keeps page_node's subtree alive past the loop
 
   auto total = hs.size();
+  CurrentStyle current;
   for (std::size_t i = 0; i < total; ++i) {
     std::string tag;
     try {
@@ -392,6 +517,13 @@ RawParsed full_parse(const ByteBuffer& data, const ParseOptions& o) {
         continue;
       }
       tag = one[0].tag;
+      // The model's current view: FA01 > 34BC.
+      if (tag == "FA01")
+        for (auto& [t, record] : parse_flat(one[0].payload))
+          if (t == "BC34") p.camera = view_camera(record);
+      if (tag == "0602")
+        for (auto& [t, catalog] : parse_flat(one[0].payload))
+          if (t == "7869") current = current_style(catalog);
       collect_layers(one, p.layer_id_to_name, p.layer_hidden);
       collect_material_ids(one, p.material_id_to_name);
       collect_definitions(one, p.definitions);
@@ -415,6 +547,11 @@ RawParsed full_parse(const ByteBuffer& data, const ParseOptions& o) {
     }
     if (i % progress_interval == 0 || i + 1 == total)
       emit_progress(o, ParseStage::tlv_walk, i + 1, total);
+  }
+  for (auto& s : p.styles) {
+    s.active = !current.folder.empty() && s.folder == current.folder;
+    s.modified = s.active && current.modified;
+    s.working_copy = !current.working_copy.empty() && s.folder == current.working_copy;
   }
   // Units (meta/meta.dat) - VFF-only; legacy files carry no equivalent
   // container.

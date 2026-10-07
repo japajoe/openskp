@@ -102,8 +102,15 @@ struct RawMaterial {
 
 struct RawStyle {
   std::string name;
+  std::string description;
   std::optional<Color3> front_color;
   std::optional<Color3> back_color;
+  std::map<int, StyleItem> items;
+  std::vector<StyleWatermark> watermarks;
+  std::string folder;
+  bool active{};
+  bool working_copy{};
+  bool modified{};
 };
 
 struct RawPage {
@@ -115,6 +122,7 @@ struct RawPage {
   bool parallel{};
   double ortho_height{};
   std::vector<EntityId> hidden_layer_ids;
+  bool selected{};
 };
 
 struct RawDimension {
@@ -149,6 +157,7 @@ struct RawParsed {
       layer_attribute_dictionaries;
   std::map<EntityId, std::string> layer_id_to_name;
   std::vector<RawPage> pages;
+  std::optional<ViewCamera> camera;
   std::vector<RawDimension> dimensions;
   std::map<EntityId, std::string> material_id_to_name;
   std::map<std::string, std::shared_ptr<RawMaterial>> materials;
@@ -230,6 +239,8 @@ struct V {
   // dictionary's own key/value pairs, already typed (see Archive::typed()).
   ParsedAttrDict entries;
   std::uint64_t tex_dib{};
+  // SketchUp 3: the texture image sits inline (bytes in `blob`), no store slot.
+  bool inline_tex{};
   bool sense{};
   bool faces_camera{};
   bool shadows_face_sun{};
@@ -314,6 +325,18 @@ void scan_instance_transforms(const TlvNode&, std::map<std::string, std::vector<
 std::vector<RawDimension> parse_dimensions(const ByteBuffer&, const std::map<std::string, Vec3>&,
                                            const std::map<std::string, std::vector<double>>&);
 const TlvNode* find_page_node(const TlvNode&);
+
+// A view camera record (34BC), as scenes and the model's current view store it.
+struct RawCamera {
+  std::optional<Vec3> eye;
+  std::optional<Vec3> target;
+  std::optional<Vec3> up;
+  double fov{35.0};
+  bool parallel{};
+  double ortho_height{};
+};
+
+RawCamera parse_camera(const ByteBuffer& record);
 std::vector<RawPage> parse_pages(const TlvNode*);
 
 struct EarPoint {

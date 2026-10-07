@@ -30,6 +30,34 @@ void ExpectConnectedNormalizedLoops(const Definition& definition) {
   }
 }
 
+// Style watermarks (style.xml item 5001): the "<MODEL SPACE>" separator is
+// skipped, attributes are entity-decoded, and the image bytes come from the
+// ZIP entry the watermark names. The fixture is SU_File.skp with one
+// watermark and a 1x1 PNG added to both of its styles: the style names its
+// image relative to its own folder ("./logo.png"), the current style's "_1"
+// working copy from the ZIP root ("watermarks/Logo.png"), as SketchUp writes.
+TEST(Parser, StyleWatermarks) {
+  auto model = SkpFile::open(test::fixture("style_watermark.skp")).parse();
+  ASSERT_EQ(model.styles.size(), 2u);
+  for (const auto& style : model.styles) {
+    ASSERT_EQ(style.watermarks.size(), 1u);
+    const auto& w = style.watermarks[0];
+    EXPECT_EQ(w.name, "Logo & Co");
+    EXPECT_EQ(w.image_path, style.working_copy ? "watermarks/Logo.png" : "./logo.png");
+    EXPECT_EQ(w.file_name, "logo.png");
+    EXPECT_EQ(w.attributes.count("name"), 0u);
+    EXPECT_EQ(w.attributes.at("position"), "2");
+    EXPECT_EQ(w.attributes.at("alphaScale"), "0.75");
+    EXPECT_EQ(w.attributes.at("scale"), "0.3");
+    EXPECT_EQ(w.attributes.at("background"), "1");
+    ASSERT_TRUE(w.image.has_value());
+    ASSERT_EQ(w.image->size(), 70u);
+    EXPECT_EQ((*w.image)[1], 'P');  // PNG signature
+    EXPECT_EQ((*w.image)[2], 'N');
+    EXPECT_EQ((*w.image)[3], 'G');
+  }
+}
+
 TEST(Parser, ModernUntitled) {
   auto model = SkpFile::open(test::fixture("Untitled.skp")).parse();
   EXPECT_EQ(model.version, "{25.0.575}");
@@ -113,7 +141,35 @@ TEST(Parser, ModernUntitled) {
   ASSERT_EQ(model.styles.size(), 2);
   EXPECT_EQ(model.styles[0].name, "[Construction Documentation Style]");
   EXPECT_EQ(model.styles[0].front_color, (Color3{255, 255, 255}));
-  EXPECT_EQ(model.styles[0].back_color, (Color3{208, 209, 189}));
+  EXPECT_EQ(model.styles[0].back_color, (Color3{164, 178, 187}));
+  EXPECT_EQ(model.styles[0].description, "[Default face colors. Profile Edges. White background.]");
+  // Every style.xml item is kept raw, keyed by SketchUp's item id.
+  EXPECT_EQ(model.styles[0].items.size(), 58u);
+  ASSERT_TRUE(model.styles[0].items.count(1007));
+  EXPECT_EQ(model.styles[0].items.at(1007).type, 4);
+  EXPECT_EQ(model.styles[0].items.at(1007).value, "2");
+  ASSERT_TRUE(model.styles[0].items.count(2008));
+  EXPECT_EQ(model.styles[0].items.at(2008).type, 7);
+  EXPECT_EQ(model.styles[0].items.at(2008).value, "0.65000000000000002");
+  // Item 5001 lists no watermarks here (only the "<MODEL SPACE>" separator).
+  EXPECT_TRUE(model.styles[0].watermarks.empty());
+  // The current style is stored twice; model.dat's style catalog (0602 >
+  // 7869) names it and its "_1" working copy.
+  EXPECT_EQ(model.styles[0].folder, "[Construction Documentation Style]");
+  EXPECT_TRUE(model.styles[0].active);
+  EXPECT_FALSE(model.styles[0].working_copy);
+  EXPECT_EQ(model.styles[1].folder, "[Construction Documentation Style]_1");
+  EXPECT_FALSE(model.styles[1].active);
+  EXPECT_TRUE(model.styles[1].working_copy);
+
+  // The view the model was saved with (FA01 > 34BC), independent of scenes.
+  ASSERT_TRUE(model.camera.has_value());
+  EXPECT_NEAR(model.camera->eye[0], 452.09, 0.01);
+  EXPECT_NEAR(model.camera->eye[1], -974.12, 0.01);
+  EXPECT_NEAR(model.camera->eye[2], 367.93, 0.01);
+  EXPECT_NEAR(model.camera->target[0], 226.24, 0.01);
+  EXPECT_FALSE(model.camera->parallel);
+  EXPECT_DOUBLE_EQ(model.camera->fov, 35.0);
 
   // Instance layer/properties (item 17): populated from each instance's
   // own D207 (layer override)/DC05 (dynamic properties) TLV children -

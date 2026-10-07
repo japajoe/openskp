@@ -253,14 +253,63 @@ struct Material {
   std::int32_t colorize_type{};
 };
 
+/// One `<sty:item>` of a style.xml: the raw `<t:variant>` of a style setting.
+struct StyleItem {
+  /// Variant type attribute: 1 bool, 3/4 int32, 5 ABGR color in older files
+  /// (current SketchUp writes colors as type 4), 6 float, 7 double, 13 nested
+  /// XML such as the watermark list.
+  int type{};
+  /// Variant text, trimmed; nested XML is kept verbatim.
+  std::string value;
+};
+
+/// One watermark of a style (style.xml item 5001, a `<screenimage>`), in
+/// file order. The "<MODEL SPACE>" separator entry is not included.
+struct StyleWatermark {
+  /// Watermark name.
+  std::string name;
+  /// Raw `<screenimage>` attributes, entity-decoded: e.g. `position`,
+  /// `scale`, `alphaScale` (blend), `tiled`, `stretched`, `maintainAR`,
+  /// `background`.
+  std::map<std::string, std::string> attributes;
+  /// Image path as the style names it: relative to the style's folder
+  /// ("./2.jpg") or, for the current style, from the ZIP root
+  /// ("watermarks/Watermark1.jpg").
+  std::string image_path;
+  /// Original image file name.
+  std::string file_name;
+  /// Raw image file bytes, when the ZIP has the entry.
+  std::optional<ByteBuffer> image;
+};
+
 /// Bundled rendering style settings.
 struct Style {
   /// Style name.
   std::string name;
-  /// Default front face color.
+  /// Style description (`desc` attribute).
+  std::string description;
+  /// Default front face color (item 2002).
   std::optional<Color3> front_color;
-  /// Default back face color.
+  /// Default back face color (item 2003).
   std::optional<Color3> back_color;
+  /// Every item of the style.xml, keyed by item id (e.g. 1007 profile
+  /// width, 2008 X-ray opacity). Ids are SketchUp's own and undocumented;
+  /// callers map the ones they understand.
+  std::map<int, StyleItem> items;
+  /// Watermarks parsed from item 5001, with their image bytes.
+  std::vector<StyleWatermark> watermarks;
+  /// Folder of this style in the SKP ZIP ("styles/<folder>/style.xml").
+  std::string folder;
+  /// The model's current style in its list of styles (SketchUp's
+  /// `Styles#active_style`).
+  bool active{};
+  /// Working copy of the current style, folder "<folder>_1": the settings the
+  /// model displays, including edits not yet updated into the style. It is
+  /// not a style of its own in SketchUp's list.
+  bool working_copy{};
+  /// On the current style: edited in SketchUp without updating the style, so
+  /// the working copy differs from it.
+  bool modified{};
 };
 
 /// Component or group placement instance within a definition.
@@ -395,6 +444,25 @@ struct Page {
   double ortho_height{};
   /// Names of the layers this scene hides.
   std::vector<std::string> hidden_layers;
+  /// The scene selected when the model was saved (at most one).
+  bool selected{};
+};
+
+/// A view camera (VFF `34BC` record), as scenes and the model's current view
+/// store it.
+struct ViewCamera {
+  /// Camera position, in inches.
+  Vec3 eye{0.0, 0.0, 1.0};
+  /// Point the camera looks at, in inches.
+  Vec3 target{0.0, 0.0, 0.0};
+  /// Camera up vector.
+  Vec3 up{0.0, 0.0, 1.0};
+  /// Field of view in degrees (SketchUp default 35).
+  double fov{35.0};
+  /// True for parallel (orthographic) projection.
+  bool parallel{};
+  /// Visible height in inches when `parallel`.
+  double ortho_height{};
 };
 
 /// Reusable geometry container (component definition or group).
@@ -448,6 +516,10 @@ class OPENSKP_EXPORT SkpModel {
   /// The file's saved scenes (VFF files; classic pre-2021 files import
   /// with none).
   std::vector<Page> pages;
+  /// The view the model was saved with (VFF `FA01` > `34BC`). SketchUp reopens
+  /// the file at this view whichever scene is selected, even when the scene
+  /// was not updated. Unset for classic pre-2021 files.
+  std::optional<ViewCamera> camera;
   /// Model-level linear dimensions with world-space endpoints (VFF
   /// files). Legacy files surface text-only dimensions per definition
   /// instead (`Definition::dimensions`).
