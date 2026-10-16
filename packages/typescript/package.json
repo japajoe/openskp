@@ -22,6 +22,7 @@
     "test": "vitest run",
     "bench:instanced": "vite-node tests/bench/instanced-bench.ts",
     "bench:vertex-store": "node --expose-gc ./node_modules/vite-node/dist/cli.mjs tests/bench/vertex-store-bench.ts",
+    "bench:edge-store": "node --expose-gc ./node_modules/vite-node/dist/cli.mjs tests/bench/edge-store-bench.ts",
     "lint": "eslint src/",
     "typecheck": "tsc --noEmit"
   },
@@ -68,11 +69,11 @@
     "@eslint/js": "10.0.1",
     "@thatopen/fragments": "^3.4.7",
     "@types/earcut": "^3.0.0",
-    "eslint": "10.11.0",
+    "eslint": "10.12.0",
     "three": "^0.186.0",
     "tsup": "^8.0.0",
     "typescript": "^5.3.0",
-    "typescript-eslint": "8.71.0",
+    "typescript-eslint": "8.71.1",
     "vite-node": "^6.0.0",
     "vitest": "^5.0.1",
     "web-ifc": "^0.0.78"

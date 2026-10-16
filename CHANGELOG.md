@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — TypeScript: builder edges are stored in flat typed arrays (openskp#201)
+
+Both readers kept each definition's edges as `Map<id, [v1, v2]>`: a JS array
+plus a Map entry per edge, ~112 bytes for two vertex ids. They now go into an
+`EdgeStore` (`src/edge-store.ts`), the same move #208 made for vertices:
+endpoints in one `Uint32Array`, ids in insertion order, and an `Int32Array`
+index over the id span. Three id -> index choices were benchmarked
+(`npm run bench:edge-store`); the dense index is both the smallest at the id
+densities real files show (35-49 bytes per edge, 20% density on legacy files,
+50% on 2021+) and the fastest on the loop-reconstruction hot path (9.9 ns per
+endpoint read, against 16.3 ns for the Map of pairs). It falls back to a Map
+when ids are too sparse for a span-sized array to pay off. `reconstructLoopVertices`
+reads the one endpoint it needs (`v1(id)`/`v2(id)`) instead of allocating a
+tuple per edge use, and still accepts a plain Map. Output is unchanged: the
+hash of `parseSkp` and of `buildInstancedScene` is identical on 40 real files.
+On the 411 MB legacy file the walk ends with 122 MB less live heap, and the
+smallest heap that parses it drops from 2304 to 2048 MB.
+
+### Changed — tests: the legacy v3 / v7 / 2014 fixtures shrink from 1.6 MB to 8-12 KB and drop SketchUp's default-template images
+
+The three fixtures added with the pre-2014 fixes were real SketchUp saves, so each
+carried SketchUp's default template along with our test model: ~35 materials, 10
+with embedded JPEG textures (15 JPEG signatures in total), 1.6 MB apiece, copied
+into every language's test folder. Third-party image assets have no business in a
+test fixture. They are now re-saved from the lean `legacy_v6_synthetic.skp` (11 KB,
+no textures) at SketchUp 3, 7 and 2014 through the installed SketchUp library, so
+they hold only our own geometry plus the format's structural bytes. Nothing the
+tests prove is lost: against the pre-fix readers the lean files fail exactly as the
+old ones did (v7 "definition list misaligned", v3 "expected a string record"; 11 of 14
+TypeScript tests fail on the old reader either way). V3's inline-image path is now
+covered by `legacy_v3_textured.skp`, whose image is an 8x8 PNG this project
+generated. The model behind the three files now has 4 definitions and an
+`fbd-info` dictionary where the old v7/2014 pair had 3 definitions and `test-info`;
+expectations were updated to match. Note: removing the files from the tree does not
+remove them from git history.
+
+### Fixed — .NET: OBJ/MTL export retains SceneBuilder material colors and alpha (#422)
+
+The .NET SceneBuilder stores glTF `baseColorFactor` values as `double[]`,
+but the OBJ/MTL exporter only read `List<float>` and `List<object>`.
+As a result, exported materials were gray (`Kd 0.8 0.8 0.8`) and
+transparency was lost (`d 1.0`). The exporter now reads numeric
+channels from arrays and compatible lists, including `double[]` and
+`float[]`, while preserving the existing defaults for unsupported
+string values and colors with fewer than three channels. RGB-only
+factors remain opaque unless an alpha channel is supplied.
+
 ### Fixed — all five legacy readers: SketchUp 3 files with fewer than two materials now parse
 
 A legacy file with zero or one material can't use the two-material bootstrap for

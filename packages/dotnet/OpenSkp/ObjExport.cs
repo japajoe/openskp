@@ -46,17 +46,22 @@ namespace OpenSkp
                 {
                     if (pbr.TryGetValue("baseColorFactor", out object? colObj))
                     {
-                        if (colObj is List<float> floatList && floatList.Count >= 3)
+                        if (colObj is System.Collections.IEnumerable values && colObj is not string)
                         {
-                            r = floatList[0]; g = floatList[1]; b = floatList[2];
-                            if (floatList.Count >= 4) a = floatList[3];
-                        }
-                        else if (colObj is List<object> objList && objList.Count >= 3)
-                        {
-                            r = Convert.ToSingle(objList[0], CultureInfo.InvariantCulture);
-                            g = Convert.ToSingle(objList[1], CultureInfo.InvariantCulture);
-                            b = Convert.ToSingle(objList[2], CultureInfo.InvariantCulture);
-                            if (objList.Count >= 4) a = Convert.ToSingle(objList[3], CultureInfo.InvariantCulture);
+                            // SceneBuilder creates double[] baseColorFactor values.
+                            // Also accept float[] and lists supplied by API callers.
+                            // Unsupported nonnumeric elements still fail conversion, as they
+                            // did in the previous List<object> handling.
+                            var channels = new List<float>();
+                            foreach (var value in values)
+                            {
+                                channels.Add(Convert.ToSingle(value, CultureInfo.InvariantCulture));
+                            }
+                            if (channels.Count >= 3)
+                            {
+                                r = channels[0]; g = channels[1]; b = channels[2];
+                                if (channels.Count >= 4) a = channels[3];
+                            }
                         }
                     }
                 }
