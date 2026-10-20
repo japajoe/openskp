@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — TypeScript: minimum `earcut` is now 3.1.0, and the `@types/earcut` dev dependency is gone
+
+`earcut` ships its own type definitions from 3.1.0 on (3.0.x did not), and
+`@types/earcut` is now a deprecated empty stub that points there. The package
+declared `earcut ^3.0.0` and carried `@types/earcut` for the types, so the
+dev dependency is removed and the minimum `earcut` is raised to `^3.1.0`, which
+guarantees the bundled types. The lockfile already resolved 3.2.4, so installs
+from the lockfile are unchanged. Anyone who had pinned `earcut` to 3.0.x
+alongside this package will get a second, newer copy.
+
+### Fixed — all five ports: OBJ material identifiers remain distinct after sanitization (#423)
+
+OBJ/MTL export now reserves sanitized source names before assigning unique
+material identifiers. A colliding name gains `_<1-based material index>`,
+with an additional `_<n>` when that identifier is already used or reserved.
+Both `newmtl` and `usemtl` use the same resolved names. Non-conflicting
+names stay unchanged; comparisons remain case-sensitive. Blank names after
+trimming fall back to `default_material`, while punctuation is replaced with
+underscores as before.
+
+### Fixed — Python, TypeScript, Dart, .NET: PLY export preserves glTF material colors (#421)
+
+PLY exporters in these four ports previously read `baseColorFactor` from the
+material's top level rather than `pbrMetallicRoughness.baseColorFactor`.
+Consequently, colored geometry exported as the default gray RGBA in both ASCII
+and binary PLY. The exporters now read the nested glTF PBR color while retaining
+the fallback for materials without a usable color. C++ was already correct.
+
 ### Changed — TypeScript: builder edges are stored in flat typed arrays (openskp#201)
 
 Both readers kept each definition's edges as `Map<id, [v1, v2]>`: a JS array
