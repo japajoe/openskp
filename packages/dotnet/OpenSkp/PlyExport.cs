@@ -56,25 +56,25 @@ namespace OpenSkp
             }
 
             var sb = new StringBuilder();
-            sb.AppendLine("ply");
-            sb.AppendLine("format ascii 1.0");
-            sb.AppendLine("comment Created by OpenSKP");
-            sb.AppendLine($"element vertex {totalVertices}");
-            sb.AppendLine("property float x");
-            sb.AppendLine("property float y");
-            sb.AppendLine("property float z");
-            sb.AppendLine("property float nx");
-            sb.AppendLine("property float ny");
-            sb.AppendLine("property float nz");
-            sb.AppendLine("property float u");
-            sb.AppendLine("property float v");
-            sb.AppendLine("property uchar red");
-            sb.AppendLine("property uchar green");
-            sb.AppendLine("property uchar blue");
-            sb.AppendLine("property uchar alpha");
-            sb.AppendLine($"element face {totalFaces}");
-            sb.AppendLine("property list uchar int vertex_indices");
-            sb.AppendLine("end_header");
+            sb.Append("ply").Append('\n');
+            sb.Append("format ascii 1.0").Append('\n');
+            sb.Append("comment Created by OpenSKP").Append('\n');
+            sb.Append($"element vertex {totalVertices}").Append('\n');
+            sb.Append("property float x").Append('\n');
+            sb.Append("property float y").Append('\n');
+            sb.Append("property float z").Append('\n');
+            sb.Append("property float nx").Append('\n');
+            sb.Append("property float ny").Append('\n');
+            sb.Append("property float nz").Append('\n');
+            sb.Append("property float u").Append('\n');
+            sb.Append("property float v").Append('\n');
+            sb.Append("property uchar red").Append('\n');
+            sb.Append("property uchar green").Append('\n');
+            sb.Append("property uchar blue").Append('\n');
+            sb.Append("property uchar alpha").Append('\n');
+            sb.Append($"element face {totalFaces}").Append('\n');
+            sb.Append("property list uchar int vertex_indices").Append('\n');
+            sb.Append("end_header").Append('\n');
 
             foreach (var prim in scene.GlbPrimitives)
             {
@@ -100,7 +100,7 @@ namespace OpenSkp
                     string u = uVal.ToString("F6", CultureInfo.InvariantCulture);
                     string v = vVal.ToString("F6", CultureInfo.InvariantCulture);
 
-                    sb.AppendLine($"{px} {py} {pz} {nx} {ny} {nz} {u} {v} {r} {g} {b} {a}");
+                    sb.Append($"{px} {py} {pz} {nx} {ny} {nz} {u} {v} {r} {g} {b} {a}").Append('\n');
                 }
             }
 
@@ -113,7 +113,7 @@ namespace OpenSkp
                     uint i0 = prim.Indices[i * 3] + (uint)vertOffset;
                     uint i1 = prim.Indices[i * 3 + 1] + (uint)vertOffset;
                     uint i2 = prim.Indices[i * 3 + 2] + (uint)vertOffset;
-                    sb.AppendLine($"3 {i0} {i1} {i2}");
+                    sb.Append($"3 {i0} {i1} {i2}").Append('\n');
                 }
                 vertOffset += prim.Positions.Length / 3;
             }

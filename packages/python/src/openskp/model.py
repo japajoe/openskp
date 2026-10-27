@@ -18,6 +18,8 @@ Typical usage::
 
 from __future__ import annotations
 
+import contextlib
+import gc
 import pathlib
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
@@ -306,17 +308,22 @@ class Instance:
         matrix: Transformation matrix stored as a flat **13-element**
             list, not a 4x4 in disguise: indices 0-8 are the 3x3
             rotation/scale part in row-major order, 9-11 are the
-            translation, and 12 is a separate scale scalar that
-            :func:`openskp._core.transform_point` never reads (it
-            only uses 0-11). To transform a point ``(x, y, z)``::
+            translation, and 12 is a scale scalar - ``1/w`` of
+            SketchUp's homogeneous term, 1.0 for nearly every instance
+            (an instance can be scaled through it instead of through the
+            3x3; the translation is then in the scaled units). To
+            transform a point ``(x, y, z)``::
 
-                tx = m[0]*x + m[1]*y + m[2]*z + m[9]
-                ty = m[3]*x + m[4]*y + m[5]*z + m[10]
-                tz = m[6]*x + m[7]*y + m[8]*z + m[11]
+                s  = m[12]
+                tx = s * (m[0]*x + m[1]*y + m[2]*z + m[9])
+                ty = s * (m[3]*x + m[4]*y + m[5]*z + m[10])
+                tz = s * (m[6]*x + m[7]*y + m[8]*z + m[11])
 
             Verified directly against :func:`openskp._core.transform_point`
             and :func:`openskp._core.multiply_matrices`, which are what
-            every internal code path actually uses.
+            every internal code path actually uses (they fold ``s`` into
+            the other twelve values, so a composed matrix always has
+            ``m[12] == 1``).
         layer: This instance's own explicit layer override, or ``""``
             when it has none. An instance without an explicit override
             inherits its *placement's* layer, which can only be resolved
@@ -640,6 +647,28 @@ class SkpModel:
 # ── SkpFile entry-point ──────────────────────────────────────────────────
 
 
+@contextlib.contextmanager
+def _paused_cyclic_gc():
+    """Pause automatic cyclic garbage collection for a large allocation burst.
+
+    Parsing builds millions of small vertex, edge, loop and face objects that
+    the model keeps alive, so every automatic generation scan walks a growing
+    object graph and frees nothing. Reference counting is unaffected; only the
+    automatic scans are deferred, and the caller's collector state is restored
+    on every exit, including exceptions and KeyboardInterrupt.
+
+    Space_AsBuilt_Track.skp (442 MB, 3.6 M faces) parse: 95.9 s -> 61.8 s on
+    CPython 3.13, max RSS 8.24 -> 8.51 GB.
+    """
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if enabled:
+            gc.enable()
+
+
 class SkpFile:
     """High-level entry point for opening and parsing ``.skp`` files.
 
@@ -686,6 +715,15 @@ class SkpFile:
     def parse(self) -> SkpModel:
         """Run the full parsing pipeline and return a populated model.
 
+        The automatic cyclic garbage collector is paused for the duration of
+        the parse (see :func:`_paused_cyclic_gc`) and restored afterwards.
+        """
+        with _paused_cyclic_gc():
+            return self._parse_pipeline()
+
+    def _parse_pipeline(self) -> SkpModel:
+        """The parsing pipeline proper, run by :meth:`parse`.
+
         The pipeline:
 
         1. Read the file bytes and validate / extract the VFF container.
@@ -722,14 +760,20 @@ class SkpFile:
                 shadows_face_sun=d.get("shadows_face_sun", False),
                 is_image=d.get("is_image", False),
             )
+            # Completed VFF builders can retain dense private tables. Iterate
+            # those directly; their public accessors still return cached dicts.
+            if isinstance(builder, _core._GeometryBuilder):
+                vertices, edges, faces = builder._geometry_tables()
+            else:
+                vertices, edges, faces = builder.vertices, builder.edges, builder.faces
             # Populate vertices
-            for v_id, (x, y, z) in builder.vertices.items():
+            for v_id, (x, y, z) in vertices.items():
                 defn.vertices[v_id] = Vertex(id=v_id, x=x, y=y, z=z)
             # Populate edges
             flags_map = getattr(builder, "edge_flags", {})
             edge_layers_map = getattr(builder, "edge_layers", None) or {}
             edge_curves_map = getattr(builder, "edge_curves", None) or {}
-            for e_id, (v1, v2) in builder.edges.items():
+            for e_id, (v1, v2) in edges.items():
                 flags = flags_map.get(e_id, 0)
                 defn.edges[e_id] = Edge(id=e_id, v1_id=v1 or 0, v2_id=v2 or 0,
                                         soft=bool(flags & 0x08),
@@ -738,7 +782,7 @@ class SkpFile:
                                         layer=edge_layers_map.get(e_id),
                                         curve_id=edge_curves_map.get(e_id))
             # Populate faces
-            for f_id, f_data in builder.faces.items():
+            for f_id, f_data in faces.items():
                 defn.faces[f_id] = Face(
                     id=f_id,
                     loops=f_data.get("loops", []),

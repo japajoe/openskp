@@ -31,6 +31,7 @@ namespace OpenSkp.Tests
             Assert.Contains("facet normal 0.000000 0.000000 1.000000", stlText);
             Assert.Contains("vertex 0.000000 0.000000 0.000000", stlText);
             Assert.Contains("endsolid OpenSKP_Model", stlText);
+            Assert.DoesNotContain('\r', stlText);
         }
 
         [Fact]

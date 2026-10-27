@@ -7,6 +7,207 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Python: write scenes into legacy files, and read legacy scenes with their cameras
+
+`SkpBuilder.add_scene(name, eye, target, up=None, *, perspective, fov,
+ortho_height, hidden_layers)` adds a scene: a named camera plus the layers it
+hides, one click apart in SketchUp's Scenes tabs. Each scene is written the
+way SketchUp writes a new scene: `CViewPage` schema 13 (SketchUp 2016+; the
+version map still says 12), capturing everything (flags `0x7F`). The model's
+style moves into the first scene and the style manager refers back to it, as
+in SketchUp's own files. Scenes take pids from the shared sequence and slots
+from where the scaffold's font manager started; references past `0x7FFF` use
+the escape form. The ground truth is SketchUp's own 3D Warehouse model with
+eight scenes in its SketchUp 2017 format, plus SketchUp 2015 saves (neither
+redistributable, so not committed). Files written this way open in SketchUp
+Free (web) with working scenes. A file whose scenes left the style section
+out was rejected, which is why every scene captures everything.
+
+The legacy reader now reads whole scene records (`_read_page_list`) for
+schema 12 and 13: name, camera (eye, target, up, fov, parallel, ortho height)
+and hidden layers, the fields `Page` already had. That includes the common
+case the narrow scan skipped, a scene that saves its camera and style
+(#445). The `gondola_v20.skp` fixture (SketchUp 2020, flags `0x1FF`) now comes
+back with its scene, as do SketchUp's eight-scene sample, SketchUp 2015 saves
+and openskp's own output. The rendering options a scene carries grow with the
+file version (206 bytes up to SketchUp 2017, 211, 212 and 213 for 2018-2020,
+measured on the fixtures), so files from SketchUp 2014 to 2020 are covered;
+for other versions the reader gives up. The hidden-layer list is a `u32`
+count followed by the refs; the narrow scan's "refs, then a `u32` 1" reading
+takes a count of 1 for its end marker, so a scene hiding one layer came back
+with none. A record the new reader can't fully read (for example one with an
+attribute dictionary, or capture flags beyond `0x1FF`) falls back to the
+narrow scan.
+### Fixed — TypeScript: curved surfaces shade smoothly across smooth edges
+
+SketchUp draws the faces either side of an edge flagged smooth (Soften/Smooth
+Edges) as one continuous surface, but `buildScene`/`buildInstancedScene` gave
+every face its own flat normal, so cylinders, terrain and other curved models
+came out faceted in GLB and every other mesh export. Corners joined through a
+smooth edge between two faces that face the same way now share one vertex
+normal, the normalised sum of their faces' normals; hard edges keep their
+crease, and a definition without smooth edges is unchanged.
+### Added — TypeScript: `InstancedScene.layerColors` and `InstancedNode.ownLayer`
+
+`buildInstancedScene` already reports each node's effective layer and each
+layer's visibility (`layerHidden`), but not the layers' colours, so a consumer
+rebuilding the file's tag list had to run a second, full `parseSkp` (about as
+long as the scene build itself on a large model). The colours come from the
+same raw parse, so the scene now carries them too, for every layer the file
+defines whether a placement uses it or not. Optional in the type: a scene read
+back with `fromFragments` has none.
+
+Each node's `layer` is the effective one, inherited from its parent when the
+instance has none, so it cannot tell an inherited layer from an explicit
+assignment of the same layer. `ownLayer` is the layer the instance carries
+itself, absent when it inherits.
+### Fixed — all five ports: a VFF (2021+) scene that doesn't save its camera is kept (#447)
+
+SketchUp lets a scene leave "Camera Location" unticked. Such a scene saves no
+camera, but it still has a name and the layers it hides. All five ports dropped
+a scene unless they had found a camera for it, so those scenes disappeared (on
+a real 2024 model, 13 of 35). The Python port went further: a scene with no
+camera record at all made `parse()` raise a `TypeError`. A scene without a
+camera now comes back with its name and hidden layers and `eye`, `target` and
+`up` unset (`None`, `null`, or an empty optional). Fixture:
+`scene_without_camera_2021.skp`, three scenes built through SketchUp's own
+library (one with a camera, one without that hides a layer, one plain), which
+SketchUp reads back as the same three. Reported by @JFrancu.
+
+### Added — TypeScript: `SceneOptions.frontSideOnly`
+
+A face whose front and back resolve to different colours is emitted as a front
+plus a reversed back-side copy, which is right for a viewer. A modeler or CAD
+tool that rebuilds faces from the mesh reads that copy as a second, coincident
+face: the shared edges turn non-manifold and the two z-fight. With
+`frontSideOnly`, `buildScene` and `buildInstancedScene` emit every face once,
+double-sided with its front material. Off by default.
+
+### Fixed — all five ports: an instance scaled through the matrix's scale term is placed and sized correctly (#444)
+
+SketchUp can keep a uniform scale in the homogeneous term of an instance's
+transformation instead of in the 3x3: the 3x3 stays as it is, the translation
+is in the scaled units, and the 16th value `w` is the divisor (SketchUp's own
+library reports a 100 in cube placed with `w = 100` and a translation of 2000
+in as a 1 in cube at x = 20 in). The 13-value matrix stores `1/w` at index 12.
+The parse read it correctly, but `build_scene` / `build_instanced_scene` and
+every export built on them ignored it, so such an instance came out 100x its
+size and 100x its distance from its parent (a SpaceClaim export of a staircase
+landed about 76 m from the stair). The point transform, the matrix product and
+the glTF node-matrix conversion now fold the scale term into the rotation and
+translation first, so a composed matrix always has index 12 equal to 1.
+`Instance.matrix` itself still reports the raw 13 values. Checked against SketchUp's own bounding boxes
+for the same file saved in the SketchUp 6 and 2021 formats, and against 126
+local legacy and VFF files, none of which carries a scale term other than 1:
+their scene output is unchanged.
+
+### Fixed — Python: a file saved through SketchUp's C API as 2019 or 2020 parses
+
+Such a file has a null entry in its layer list. The probe that works out the
+archive's slot base subtracted from that entry's missing slot and raised
+`TypeError: unsupported operand type(s) for -: 'NoneType' and 'int'`, so
+`parse()` failed on every one of them that had a layer besides the default. The
+null entry is now skipped. The TypeScript port already read these files.
+Fixtures: `sdk_saved_2019.skp` and `sdk_saved_2020.skp` (a layer, a face and
+three scenes, built and saved through the installed SketchUp library).
+
+### Fixed — TypeScript, .NET, Dart, C++: legacy SketchUp 4, 5 and 2019 files parse correctly, and a 2020 model with no definitions keeps its root entities (#284)
+
+The four other readers now carry the fixes the Python reader got in #440: the
+bare inline texture image, the 7-byte (V4) and 8-byte (V5) draw block, the 19-
+and 20-byte definition headers, the shorter camera tail and the thumbnail
+without a trailing image pointer, no instance names in SketchUp 3 and 4,
+dimensions without the font object and trailing u32, the separator null after
+the last layer of a 2019 definition, and the 2020 root-count recovery.
+TypeScript, .NET and Dart also report the slot-base failure that got furthest
+into the file instead of the last candidate's (C++ gets the same through the
+reader position it reached). Each port is checked against the same
+SketchUp-written fixtures as Python, with tests that fail on the old code,
+and against a richer model with 47 definitions, 14 layers
+and 13 dimensions saved at V4 and V5; the real V4 sample parses to its cube
+(8 vertices, 12 edges, 6 faces) instead of nothing.
+
+Not covered, and tracked in #442: on the real multi-version project from the
+original sweep, these four readers still fail every legacy version (they only
+read `CText` entities with one arrow type, and stop at a 2017+ record Python
+reads), so the V4 and 2019 fixes could not be confirmed on it directly. With
+that one comparison relaxed locally, the TypeScript reader's V4 parse of the
+real project is identical to its V6 parse.
+
+### Fixed — .NET: OBJ, MTL, ASCII PLY and ASCII STL exports use LF line endings on every platform (#424, #434)
+
+The four text exporters built their output with `StringBuilder.AppendLine()`,
+which writes CRLF on Windows and LF on Linux and macOS, so the same model
+produced different bytes depending on where it was exported - unlike the
+other four ports, which always write LF. All 56 calls now append an explicit
+`\n`, and the tests assert that no `\r` appears. **Behaviour change:** text
+exports written on Windows by this package now contain LF instead of CRLF.
+
+### Added — TypeScript, .NET, Dart: construction lines and points are read from VFF (2021+) files (#285, #435, #436, #437)
+
+These three readers already surfaced construction lines and points from
+legacy files but treated the VFF records as opaque. They now decode them the
+way Python and C++ do: the guide containers are traversed, a `6A42` record
+gives a line's point, direction and start/end parameters (an end whose
+distance is at or beyond the `1e20` sentinel is reported as unbounded),
+and a `6D42` record gives a point's position; truncated payloads are
+ignored. Covered by synthetic-record tests in each port, mirroring Python's.
+
+### Fixed — Python: legacy SketchUp 4, 5 and 2019 files now parse correctly, and two silent data losses are gone (#284)
+
+Three of the signatures still open on #284 are fixed in the Python legacy
+reader, found by byte-tracing each failure against the same model saved at a
+neighbouring version:
+
+- **SketchUp 4 and 5** (`texture object is not a dib`, and a longer chain behind
+  it). Everything below the CDib-object era differs in small fixed ways:
+  textures are a bare inline image (no object, no store-map slot) before
+  version 6; the draw block is 7 bytes in V4 and 8 from V5; the definition
+  header is 19 bytes in V4 and 20 from V5; the camera tail and thumbnail
+  are shorter and the thumbnail has no trailing image pointer before 6;
+  SketchUp 3 and 4 store no instance names; and linear dimensions have no
+  font object and a shorter lead-in and tail before 6. A real 5 MB, 146-
+  definition textured project saved at SketchUp 4 now parses identically to
+  its SketchUp 6 save (geometry, materials, texture bytes, layers, dimensions,
+  instance transforms - only the instance names, which a V4 file does not
+  carry, differ).
+- **SketchUp 2019** (`implausible def entity count`). 2019 follows the last
+  layer in a definition with a separator null, which shifted the entity count
+  by two bytes. The same real project saved at 2019 now parses identically to
+  its 2018 save.
+- **Silent data loss, no error raised:** the real SketchUp 4 sample used to parse
+  to an empty model instead of its 8 vertices, 12 edges and 6 faces, and a
+  SketchUp 2020 model with no component definitions lost every root entity
+  (they were read as "definitions"); both now come out complete.
+
+When none of the slot-base candidates parses, the error now comes from the
+candidate that got furthest into the file rather than the last one tried. The
+last one is the earliest to fail, so it used to point at the layer list for
+files that actually broke much later.
+
+A 1 MB model with 47 definitions, 14 layers and 13 dimensions, saved at
+SketchUp 4 and 5, also parses identically to its SketchUp 6 save.
+
+Not covered: the real SketchUp 3 project from the same sweep still fails
+(`edge-use parent slot None != current loop`; the synthetic V3 fixtures from
+#407 are fine), and the project's own SketchUp 5 save is a 0-byte file, so V5
+has only been checked on SketchUp-written synthetic files. The other four
+readers are not changed by this entry.
+
+### Changed — Python: `full_parse` is about 1.8× faster on large VFF models (#431)
+
+`full_parse` used to walk every top-level record's TLV tree six separate times
+(layers, materials, component definitions, vertex positions, instance
+transforms, scenes node). It now does all of that in one pass, reads node
+fields as attributes instead of through `__getitem__`, decodes each record
+header with a single `struct` call, and shares one string per tag. The parsed
+result is unchanged: the full output was compared against the previous code,
+including dictionary order, on six real production models (13 to 359 MB) and a
+98-file local corpus, and was identical in every case. On those six models
+parse time drops from 17.7 / 56 / 64 / 185 / 271 / 256 s to 9.6 / 32 / 36 /
+101 / 156 / 138 s. Peak memory is essentially unchanged, since it is dominated
+by the parsed result rather than the traversal.
+
 ### Changed — TypeScript: minimum `earcut` is now 3.1.0, and the `@types/earcut` dev dependency is gone
 
 `earcut` ships its own type definitions from 3.1.0 on (3.0.x did not), and

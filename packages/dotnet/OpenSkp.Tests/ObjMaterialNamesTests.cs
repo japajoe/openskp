@@ -39,9 +39,10 @@ namespace OpenSkp.Tests
                     }).ToList()
                 };
 
-                // AppendLine emits CRLF on Windows; normalize assertions, not the exporter.
+                // Do not trim CR: these assertions also catch platform-dependent
+                // line endings accidentally leaking into material identifiers.
                 string[] references(string input, string prefix) =>
-                    input.Split('\n').Select(line => line.TrimEnd('\r'))
+                    input.Split('\n')
                         .Where(line => line.StartsWith(prefix, StringComparison.Ordinal))
                         .Select(line => line.Substring(prefix.Length)).ToArray();
 

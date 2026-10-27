@@ -572,6 +572,49 @@ class Geometry {
           ..layerId = instLayerId
           ..properties = instProperties
           ..children = el.children);
+      } else if (tag == '6942') {
+        // VFF construction line (9113 -> 6942 -> 6A42): point,
+        // direction and start/end distance parameters as eight doubles.
+        final body = findChildTag(el.children, '6A42');
+        if (body != null && body.payload.length >= 64) {
+          final p = body.payload;
+          final point = (
+            Tlv.readF64(p, 0),
+            Tlv.readF64(p, 8),
+            Tlv.readF64(p, 16),
+          );
+          final direction = (
+            Tlv.readF64(p, 24),
+            Tlv.readF64(p, 32),
+            Tlv.readF64(p, 40),
+          );
+          (double, double, double)? endpoint(double distance) =>
+              distance.abs() < 1e20
+                  ? (
+                      point.$1 + direction.$1 * distance,
+                      point.$2 + direction.$2 * distance,
+                      point.$3 + direction.$3 * distance,
+                    )
+                  : null;
+          builder.constructionLines.add(ConstructionLine(
+            point: point,
+            direction: direction,
+            start: endpoint(Tlv.readF64(p, 48)),
+            end: endpoint(Tlv.readF64(p, 56)),
+          ));
+        }
+      } else if (tag == '6C42') {
+        // VFF construction point (9213 -> 6C42 -> 6D42).
+        final pos = findChildTag(el.children, '6D42');
+        if (pos != null && pos.payload.length >= 24) {
+          builder.constructionPoints.add(ConstructionPoint(
+            position: (
+              Tlv.readF64(pos.payload, 0),
+              Tlv.readF64(pos.payload, 8),
+              Tlv.readF64(pos.payload, 16),
+            ),
+          ));
+        }
       } else if (el.children.isNotEmpty) {
         extractGeometryFromNodes(el.children, builder);
       }

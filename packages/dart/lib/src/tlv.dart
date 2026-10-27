@@ -37,6 +37,8 @@ class Tlv {
     // that inner instance stays buried in an opaque payload and the image
     // definition looks "never placed".
     '9013', '401F',
+    // VFF construction guide lists, entity nodes and drawbase wrappers.
+    '9113', '9213', '6942', '6C42', '6842',
   };
 
   static int readU16(Uint8List data, int offset) {

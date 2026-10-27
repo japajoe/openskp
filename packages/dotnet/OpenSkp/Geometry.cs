@@ -630,6 +630,43 @@ namespace OpenSkp
                         Children = el.Children,
                     });
                 }
+                else if (tag == "6942")
+                {
+                    // VFF construction line: 6A42 contains point/direction and
+                    // start/end distance parameters, eight little-endian doubles.
+                    var body = FindChildTag(el.Children, "6A42");
+                    if (body != null && body.Payload.Length >= 64)
+                    {
+                        var p = body.Payload;
+                        var point = (X: Tlv.ReadF64(p, 0), Y: Tlv.ReadF64(p, 8), Z: Tlv.ReadF64(p, 16));
+                        var direction = (X: Tlv.ReadF64(p, 24), Y: Tlv.ReadF64(p, 32), Z: Tlv.ReadF64(p, 40));
+                        (double X, double Y, double Z)? Endpoint(double distance)
+                        {
+                            return Math.Abs(distance) < 1e20
+                                ? (point.X + direction.X * distance, point.Y + direction.Y * distance, point.Z + direction.Z * distance)
+                                : null;
+                        }
+                        builder.ConstructionLines.Add(new ConstructionLine
+                        {
+                            Point = point,
+                            Direction = direction,
+                            Start = Endpoint(Tlv.ReadF64(p, 48)),
+                            End = Endpoint(Tlv.ReadF64(p, 56)),
+                        });
+                    }
+                }
+                else if (tag == "6C42")
+                {
+                    // VFF construction point: 6D42 stores its 3D position.
+                    var pos = FindChildTag(el.Children, "6D42");
+                    if (pos != null && pos.Payload.Length >= 24)
+                    {
+                        builder.ConstructionPoints.Add(new ConstructionPoint
+                        {
+                            Position = (Tlv.ReadF64(pos.Payload, 0), Tlv.ReadF64(pos.Payload, 8), Tlv.ReadF64(pos.Payload, 16)),
+                        });
+                    }
+                }
                 else if (el.Children.Count > 0)
                 {
                     ExtractGeometryFromNodes(el.Children, builder);

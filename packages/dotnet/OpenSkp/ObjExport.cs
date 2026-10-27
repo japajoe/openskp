@@ -64,9 +64,9 @@ namespace OpenSkp
             if (scene == null) throw new ArgumentNullException(nameof(scene));
 
             var sb = new StringBuilder();
-            sb.AppendLine("# OpenSKP MTL Material Library Export");
-            sb.AppendLine($"# Materials: {scene.GltfMaterials.Count}");
-            sb.AppendLine();
+            sb.Append("# OpenSKP MTL Material Library Export").Append('\n');
+            sb.Append($"# Materials: {scene.GltfMaterials.Count}").Append('\n');
+            sb.Append('\n');
 
             var names = MaterialNames(scene);
             for (int idx = 0; idx < scene.GltfMaterials.Count; idx++)
@@ -101,21 +101,21 @@ namespace OpenSkp
                     }
                 }
 
-                sb.AppendLine($"newmtl {matName}");
-                sb.AppendLine("Ka 1.000000 1.000000 1.000000");
-                sb.AppendLine(string.Format(CultureInfo.InvariantCulture, "Kd {0:F6} {1:F6} {2:F6}", r, g, b));
-                sb.AppendLine("Ks 0.200000 0.200000 0.200000");
-                sb.AppendLine("Ns 32.000000");
-                sb.AppendLine(string.Format(CultureInfo.InvariantCulture, "d {0:F6}", a));
-                sb.AppendLine("illum 2");
+                sb.Append($"newmtl {matName}").Append('\n');
+                sb.Append("Ka 1.000000 1.000000 1.000000").Append('\n');
+                sb.Append(string.Format(CultureInfo.InvariantCulture, "Kd {0:F6} {1:F6} {2:F6}", r, g, b)).Append('\n');
+                sb.Append("Ks 0.200000 0.200000 0.200000").Append('\n');
+                sb.Append("Ns 32.000000").Append('\n');
+                sb.Append(string.Format(CultureInfo.InvariantCulture, "d {0:F6}", a)).Append('\n');
+                sb.Append("illum 2").Append('\n');
 
                 if (mat.TryGetValue("texture_path", out object? texPathObj) && texPathObj != null)
                 {
                     string texName = Path.GetFileName(texPathObj.ToString()!);
-                    sb.AppendLine($"map_Kd {texName}");
+                    sb.Append($"map_Kd {texName}").Append('\n');
                 }
 
-                sb.AppendLine();
+                sb.Append('\n');
             }
 
             return sb.ToString();
@@ -133,15 +133,15 @@ namespace OpenSkp
             if (scene == null) throw new ArgumentNullException(nameof(scene));
 
             var sb = new StringBuilder();
-            sb.AppendLine("# OpenSKP OBJ Export");
-            sb.AppendLine($"# Primitives: {scene.GlbPrimitives.Count}");
+            sb.Append("# OpenSKP OBJ Export").Append('\n');
+            sb.Append($"# Primitives: {scene.GlbPrimitives.Count}").Append('\n');
 
             if (!string.IsNullOrEmpty(mtlFilename))
             {
-                sb.AppendLine($"mtllib {mtlFilename}");
+                sb.Append($"mtllib {mtlFilename}").Append('\n');
             }
 
-            sb.AppendLine();
+            sb.Append('\n');
 
             var names = MaterialNames(scene);
             int vertOffset = 1;
@@ -150,7 +150,7 @@ namespace OpenSkp
 
             foreach (var prim in scene.GlbPrimitives)
             {
-                sb.AppendLine($"o {prim.GeomName}");
+                sb.Append($"o {prim.GeomName}").Append('\n');
 
                 int vertCount = prim.Positions.Length / 3;
                 for (int i = 0; i < vertCount; i++)
@@ -158,7 +158,7 @@ namespace OpenSkp
                     string x = prim.Positions[i * 3].ToString("F6", CultureInfo.InvariantCulture);
                     string y = prim.Positions[i * 3 + 1].ToString("F6", CultureInfo.InvariantCulture);
                     string z = prim.Positions[i * 3 + 2].ToString("F6", CultureInfo.InvariantCulture);
-                    sb.AppendLine($"v {x} {y} {z}");
+                    sb.Append($"v {x} {y} {z}").Append('\n');
                 }
 
                 int uvCount = prim.Uvs != null ? prim.Uvs.Length / 2 : 0;
@@ -166,7 +166,7 @@ namespace OpenSkp
                 {
                     string u = prim.Uvs![i * 2].ToString("F6", CultureInfo.InvariantCulture);
                     string v = prim.Uvs![i * 2 + 1].ToString("F6", CultureInfo.InvariantCulture);
-                    sb.AppendLine($"vt {u} {v}");
+                    sb.Append($"vt {u} {v}").Append('\n');
                 }
 
                 int normCount = prim.Normals != null ? prim.Normals.Length / 3 : 0;
@@ -175,7 +175,7 @@ namespace OpenSkp
                     string nx = prim.Normals![i * 3].ToString("F6", CultureInfo.InvariantCulture);
                     string ny = prim.Normals![i * 3 + 1].ToString("F6", CultureInfo.InvariantCulture);
                     string nz = prim.Normals![i * 3 + 2].ToString("F6", CultureInfo.InvariantCulture);
-                    sb.AppendLine($"vn {nx} {ny} {nz}");
+                    sb.Append($"vn {nx} {ny} {nz}").Append('\n');
                 }
 
                 int matIdx = prim.MaterialIndex;
@@ -184,7 +184,7 @@ namespace OpenSkp
                     var mat = scene.GltfMaterials[matIdx] as Dictionary<string, object>;
                     if (mat != null)
                     {
-                        sb.AppendLine($"usemtl {names[matIdx]}");
+                        sb.Append($"usemtl {names[matIdx]}").Append('\n');
                     }
                 }
 
@@ -210,25 +210,25 @@ namespace OpenSkp
                         long vn0 = i0 + normOffset;
                         long vn1 = i1 + normOffset;
                         long vn2 = i2 + normOffset;
-                        sb.AppendLine($"f {v0}/{vt0}/{vn0} {v1}/{vt1}/{vn1} {v2}/{vt2}/{vn2}");
+                        sb.Append($"f {v0}/{vt0}/{vn0} {v1}/{vt1}/{vn1} {v2}/{vt2}/{vn2}").Append('\n');
                     }
                     else if (hasUvs)
                     {
                         long vt0 = i0 + uvOffset;
                         long vt1 = i1 + uvOffset;
                         long vt2 = i2 + uvOffset;
-                        sb.AppendLine($"f {v0}/{vt0} {v1}/{vt1} {v2}/{vt2}");
+                        sb.Append($"f {v0}/{vt0} {v1}/{vt1} {v2}/{vt2}").Append('\n');
                     }
                     else if (hasNormals)
                     {
                         long vn0 = i0 + normOffset;
                         long vn1 = i1 + normOffset;
                         long vn2 = i2 + normOffset;
-                        sb.AppendLine($"f {v0}//{vn0} {v1}//{vn1} {v2}//{vn2}");
+                        sb.Append($"f {v0}//{vn0} {v1}//{vn1} {v2}//{vn2}").Append('\n');
                     }
                     else
                     {
-                        sb.AppendLine($"f {v0} {v1} {v2}");
+                        sb.Append($"f {v0} {v1} {v2}").Append('\n');
                     }
                 }
 
@@ -236,7 +236,7 @@ namespace OpenSkp
                 if (hasUvs) uvOffset += uvCount;
                 if (hasNormals) normOffset += normCount;
 
-                sb.AppendLine();
+                sb.Append('\n');
             }
 
             return sb.ToString();

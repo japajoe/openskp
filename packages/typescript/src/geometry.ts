@@ -395,6 +395,37 @@ export function extractGeometryFromNodes(
         hidden: instHidden,
         children: el.children,
       });
+    } else if (tag === '6942') {
+      // VFF guide line (9113 -> 6942 -> 6A42): 3 point doubles,
+      // 3 direction doubles, then the start/end distance parameters.
+      const body = findChildTag(el.children, '6A42');
+      if (body && body.payload.length >= 64) {
+        const p = body.payload;
+        const point: [number, number, number] = [readF64(p, 0), readF64(p, 8), readF64(p, 16)];
+        const direction: [number, number, number] = [readF64(p, 24), readF64(p, 32), readF64(p, 40)];
+        const endpoint = (distance: number): [number, number, number] | null =>
+          Math.abs(distance) < 1e20
+            ? [
+                point[0] + direction[0] * distance,
+                point[1] + direction[1] * distance,
+                point[2] + direction[2] * distance,
+              ]
+            : null;
+        builder.constructionLines.push({
+          point,
+          direction,
+          start: endpoint(readF64(p, 48)),
+          end: endpoint(readF64(p, 56)),
+        });
+      }
+    } else if (tag === '6C42') {
+      // VFF guide point (9213 -> 6C42 -> 6D42).
+      const pos = findChildTag(el.children, '6D42');
+      if (pos && pos.payload.length >= 24) {
+        builder.constructionPoints.push({
+          position: [readF64(pos.payload, 0), readF64(pos.payload, 8), readF64(pos.payload, 16)],
+        });
+      }
     } else if (el.children && el.children.length > 0) {
       extractGeometryFromNodes(el.children, builder, options);
     }

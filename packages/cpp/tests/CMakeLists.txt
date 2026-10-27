@@ -13,6 +13,8 @@ add_executable(
   glb_textures_test.cpp
   ifc_export_test.cpp
   instanced_glb_test.cpp
+  instance_scale_term_test.cpp
+  scene_without_camera_test.cpp
   instanced_scene_test.cpp
   json_export_test.cpp
   layer_hidden_test.cpp
@@ -22,6 +24,7 @@ add_executable(
   legacy_v20_filler_test.cpp
   legacy_v20_test.cpp
   legacy_v3_format_test.cpp
+  legacy_v4_v5_v2019_test.cpp
   legacy_v6_attribute_trailer_test.cpp
   lowlevel_test.cpp
   meta_units_test.cpp

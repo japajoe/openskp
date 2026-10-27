@@ -1,4 +1,4 @@
-import { multiplyMatrices } from './transforms';
+import { foldScale, multiplyMatrices } from './transforms';
 import { extractDynamicProperties, extractAttributeDictionaries, isGenericDefinitionName, findNameOverride, stringifyVffAttrValue, VffAttrValue } from './geometry';
 import { ParseOptions, PROGRESS_INTERVAL, emitLog, emitProgress } from './observability';
 import { SkpParseError } from './errors';
@@ -96,6 +96,11 @@ export interface InstancedNode {
   definitionName: string;
   /** Effective layer, with SketchUp's inheritance already resolved. */
   layer: string;
+  /** The layer the instance carries itself, absent when it has none and
+   * {@link layer} is inherited from its parent. Tells apart a child that
+   * inherits its parent's layer from one explicitly assigned the same
+   * layer, which `layer` alone cannot. */
+  ownLayer?: string;
   /**
    * This node's transform RELATIVE TO ITS PARENT, as a 16-element
    * column-major glTF matrix (metres, Y-up) - directly usable as a glTF
@@ -174,6 +179,13 @@ export interface InstancedScene {
    * every layer to visible), read straight from the raw parse. Mirrors
    * Python's/C++'s own field of the same name. */
   layerHidden: Record<string, boolean>;
+  /** Every layer the file defines - used by a placement or not - with its
+   * RGB colour (0-255), read straight from the raw parse. Lets a consumer
+   * rebuild the file's tag list next to {@link InstancedNode.layer} and
+   * {@link layerHidden} without a second, full `parseSkp` pass. Absent on
+   * a scene read back with `fromFragments`, whose format carries no layer
+   * colours. */
+  layerColors?: Record<string, [number, number, number]>;
 }
 
 /**
@@ -320,6 +332,7 @@ export function buildInstancedSceneFromParsed(
       fallbackLayerColor: getLayerColor(layer),
       definitionId: defId,
       respectVisibility: options?.respectEdgeVisibility,
+      frontSideOnly: options?.frontSideOnly,
     });
 
     const primitives: LocalPrimitive[] = [];
@@ -401,8 +414,12 @@ export function buildInstancedSceneFromParsed(
    * converting the fully-composed SketchUp matrix. Translation is scaled to
    * metres; the rotation/scale block is unitless and is not.
    */
-  function toGltfMatrix(m: number[]): number[] {
+  function toGltfMatrix(raw: number[]): number[] {
     const scale = 0.0254;
+    // Fold the matrix's scale term (index 12, SketchUp's homogeneous 1/w) into
+    // the rotation and translation first, so an instance scaled through it is
+    // placed and sized correctly (openskp#444).
+    const m = foldScale(raw);
     // SketchUp basis (row-major 3x3 in elements 0..8, translation in 9..11).
     const a = m[0], b = m[1], c = m[2];
     const d = m[3], e = m[4], f = m[5];
@@ -448,11 +465,13 @@ export function buildInstancedSceneFromParsed(
       const newMatrix = multiplyMatrices(currentMatrix, inst.matrix);
 
       let lName = parentLayer;
+      let ownLayer: string | undefined;
       let instMaterial = inheritedMaterial;
       let properties: Record<string, string> = { ...(inst.properties || {}) };
 
       if (inst.layerId !== null && inst.layerId !== undefined) {
-        lName = layerIdToName.get(inst.layerId) || parentLayer;
+        ownLayer = layerIdToName.get(inst.layerId);
+        lName = ownLayer || parentLayer;
       }
 
       if (inst.materialId !== null && inst.materialId !== undefined) {
@@ -540,6 +559,7 @@ export function buildInstancedSceneFromParsed(
         nameIsGenerated,
         definitionName: childDefName,
         layer: lName,
+        ...(ownLayer ? { ownLayer } : {}),
         matrix: toGltfMatrix(inst.matrix),
         positionMm: [
           Math.round(tx * 100) / 100,
@@ -666,5 +686,5 @@ export function buildInstancedSceneFromParsed(
       `${meshResources.length} mesh resources (${((Date.now() - t0) / 1000).toFixed(2)}s)`
   );
 
-  return { sceneHierarchy, meshResources, gltfMaterials, textures, bounds, layerHidden: Object.fromEntries(layerHidden) };
+  return { sceneHierarchy, meshResources, gltfMaterials, textures, bounds, layerHidden: Object.fromEntries(layerHidden), layerColors: Object.fromEntries(layerColors) };
 }

@@ -31,6 +31,7 @@ namespace OpenSkp.Tests
             Assert.Contains("element vertex 3", plyText);
             Assert.Contains("element face 1", plyText);
             Assert.Contains("3 0 1 2", plyText);
+            Assert.DoesNotContain('\r', plyText);
         }
 
         [Fact]

@@ -23,6 +23,8 @@ export const CONTAINER_TAGS = new Set<string>([
   // that inner instance stays buried in an opaque payload and the image
   // definition looks "never placed".
   '9013', '401F',
+  // VFF per-definition guide lines/points and their entity/drawbase wrappers.
+  '9113', '9213', '6942', '6C42', '6842',
 ]);
 
 export function readU32(data: Uint8Array, offset: number): number {

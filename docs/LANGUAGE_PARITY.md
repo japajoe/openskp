@@ -66,7 +66,7 @@ released. ❌ = not yet ported to that language; see
 | Attribute dicts surfaced in GLB/JSON metadata export (not just IFC Psets) | ✅ | n/a, not independently re-checked this cycle | n/a, not independently re-checked this cycle | n/a, not independently re-checked this cycle | ✅ |
 | VFF pages/scenes + dimension parsing | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Legacy (pre-2021) pages/scenes reading | ✅ | ❌ VFF only | ❌ VFF only | ❌ VFF only | ✅ |
-| Construction lines/points reading | ✅ legacy + VFF | ✅ | ✅ | ✅ | ✅ legacy + VFF |
+| Construction lines/points reading | ✅ legacy + VFF | ✅ legacy + VFF | ✅ legacy + VFF | ✅ legacy + VFF | ✅ legacy + VFF |
 | VFF per-layer-hidden flag reading | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Per-edge/per-face layer, `Edge#curve` pointers, classic `CArcCurve` frames (legacy + VFF) | ✅ | ❌ | ❌ | ❌ | ❌ |
 | `mesh_index[...].properties` populated | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -138,7 +138,7 @@ over.** A real-world version-compatibility sweep (15 real `.skp` files —
 16 saves of the same project across its history from SketchUp version 3 up
 through 2025, one of which, V5, saved out corrupted/empty) found:
 
-**11 files parse, build, and export cleanly**: saves from **2014, 2015,
+**In the Python reader, 11 files parse, build, and export cleanly** (the sweep was run with Python; the other four readers cannot read the legacy saves of this project yet - [#442](https://github.com/iamahsanmehmood/openskp/issues/442)): saves from **2014, 2015,
 2016, 2017, 2018, 2020, 2021, 2025, and — as of [#310](https://github.com/iamahsanmehmood/openskp/pull/310) — V7, V8, and
 2013** — consistent output (146 definitions / 131 mesh resources) across all
 of them.
@@ -150,9 +150,9 @@ root-caused to varying depth (tracked in
 | SketchUp version | Error | Status |
 |:---|:---|:---|
 | V3 | `expected a string record` | **Fixed in all 5 languages** ([#407](https://github.com/iamahsanmehmood/openskp/pull/407), ported in [#410](https://github.com/iamahsanmehmood/openskp/issues/410)) - calibrated on one real V3 file; single-material V3 files unverified |
-| V4 | `texture object is not a dib` | Not investigated further |
+| V4, V5 | `texture object is not a dib` | **Fixed in all 5 languages** (V4 and V5 differ from V6 in about a dozen small layout details - see the CHANGELOG): Python in [#440](https://github.com/iamahsanmehmood/openskp/pull/440), the other four in the follow-up port. The real V4 project parses identically to its V6 save in Python; the other four readers match V6 on SketchUp-written files (including a 47-definition, 13-dimension model) and on the real V4 sample, but cannot yet read the real project at all ([#442](https://github.com/iamahsanmehmood/openskp/issues/442)). The project's own V5 save is a 0-byte file |
 | V6 | `definition list misaligned` | **Fixed in all 5 languages** ([#385](https://github.com/iamahsanmehmood/openskp/pull/385), ported in [#410](https://github.com/iamahsanmehmood/openskp/issues/410)) |
-| 2019 | `implausible def entity count` | Not investigated further |
+| 2019 | `implausible def entity count` | **Fixed in all 5 languages** (a separator null after the last layer of a definition shifted the entity count). The real 2019 save parses identically to its 2018 save in Python; the other four readers are checked on a SketchUp-written 2019 file ([#442](https://github.com/iamahsanmehmood/openskp/issues/442) for the real project) |
 
 ~~V7, V8, 2013 — `class-ref to non-class slot N (CAttributeNamed)`~~ —
 **fixed in [#310](https://github.com/iamahsanmehmood/openskp/pull/310)**.

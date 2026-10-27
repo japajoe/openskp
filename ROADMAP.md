@@ -81,8 +81,13 @@ implementation to port from — the hard research is already done. See
 Tracked in [issue #284](https://github.com/iamahsanmehmood/openskp/issues/284).
 A real-world version-compatibility sweep (the same project saved across
 SketchUp versions 3 through 2025, 15 usable files) found 11 of 15 files
-parse and convert cleanly; 4 fail, each with its own distinct, still-open
-error signature (V3, V4, V6, 2019) — see
+parse and convert cleanly; the rest each hit their own distinct error
+signature (V3, V4/V5, V6, 2019). Those signatures are fixed in the Python
+reader, and V3, V4, V5, V6 and 2019 on SketchUp-written synthetic files in
+all five; but that sweep was run with Python, and the other four readers fail
+every legacy version of the real project (a `CText` variant they do not
+read, tracked in [#442](https://github.com/iamahsanmehmood/openskp/issues/442)), and the real V3 project fails in all five
+— see
 [docs/LANGUAGE_PARITY.md § 4](docs/LANGUAGE_PARITY.md#4-real-sketchup-file-version-support)
 for the full table. The three files that used to share one root cause (V7,
 V8, 2013 — a `class-ref to non-class slot N (CAttributeNamed)`
@@ -91,7 +96,7 @@ slot-collision) are fixed as of
 instance/group GUID read was gated on the class's own schema number, which
 doesn't actually track GUID presence across versions — fixed by gating on
 the file's real version instead. Stated here plainly rather than glossed
-over — the remaining 4 are a real gap in the classic MFC `CArchive` support
+over — what is left is a real gap in the classic MFC `CArchive` support
 some corners of the README describe as "full."
 
 ### Fragments export: no native visibility field

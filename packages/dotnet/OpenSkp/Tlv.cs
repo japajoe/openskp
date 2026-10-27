@@ -37,6 +37,8 @@ namespace OpenSkp
             // two containers, that inner instance stays buried in an opaque
             // payload and the image definition looks "never placed".
             "9013", "401F",
+            // VFF guide-line / guide-point lists and entity wrappers.
+            "9113", "9213", "6942", "6C42", "6842",
         };
 
         public static ushort ReadU16(byte[] data, int offset)

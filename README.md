@@ -141,12 +141,13 @@ condensed version.
 | Attribute dicts: full 9-value-type support (`Point3d`/`Length`/nested lists) | ✅ | ❌ | ❌ | ❌ | ❌ str only |
 | Attribute dicts surfaced in GLB/JSON metadata export (not just IFC Psets) | ✅ | n/a | n/a | n/a | ✅ |
 | VFF pages/scenes + dimension parsing | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Legacy (pre-2021) pages/scenes reading | ✅ | ❌ | ❌ | ❌ | ✅ |
+| Legacy (pre-2021) pages/scenes reading | ✅ with cameras (2014–2020) | ❌ | ❌ | ❌ | ✅ |
 | Construction lines/points reading | ✅ legacy + VFF | ✅ | ✅ | ✅ | ✅ legacy + VFF |
 | Scene baking, instancing-preserving scene output | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Loose-edge curve support (structural framing) | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Writer: materials/layers/definitions/groups/faces/curves/images | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Writer: dimensions, section planes, construction geometry | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Writer: scenes (camera + hidden layers) | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Editor (`open_existing()`), code generator | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Export: GLB / OBJ / STL / PLY / DXF / IFC4 / JSON | ✅ | ✅ | ✅ | ✅ | ✅ |
 | IFC export correctness fixes (units, layer visibility, Psets, classification) | ✅ | not checked | not checked | not checked | ✅ |
@@ -162,8 +163,10 @@ across its save history) found:
 
 | Result | Versions |
 |:---|:---|
-| ✅ Parse, build, and export cleanly | 2014, 2015, 2016, 2017, 2018, 2020, 2021, 2025, **V7, V8, 2013** (fixed in [#310](https://github.com/iamahsanmehmood/openskp/pull/310)) |
-| ❌ Fail — 4 distinct error signatures, root cause tracked in [issue #284](https://github.com/iamahsanmehmood/openskp/issues/284) | V3, V4, V6, 2019 |
+| ✅ Parse, build, and export cleanly — **Python reader** | 2014, 2015, 2016, 2017, 2018, 2020, 2021, 2025, **V4**, **V6**, **V7, V8, 2013**, **2019** (fixed in [#385](https://github.com/iamahsanmehmood/openskp/pull/385), [#310](https://github.com/iamahsanmehmood/openskp/pull/310) and [#440](https://github.com/iamahsanmehmood/openskp/pull/440)) |
+| ❌ Fail — root causes tracked in [issue #284](https://github.com/iamahsanmehmood/openskp/issues/284) | V3 in every reader (synthetic V3 files parse); and, in the TypeScript, .NET, Dart and C++ readers, every legacy version of this real project (see below) |
+
+That sweep was run with the Python reader. The other four readers parse the SketchUp-written synthetic fixtures (V3, V4, V5, V6, V7, 2014, 2019), but stop on the real project's text entities: [#442](https://github.com/iamahsanmehmood/openskp/issues/442).
 
 Full per-version error table and investigation notes: [docs/LANGUAGE_PARITY.md § 4](docs/LANGUAGE_PARITY.md#4-real-sketchup-file-version-support).
 

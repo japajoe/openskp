@@ -43,11 +43,13 @@ namespace OpenSkp.Tests
             Assert.Contains("vn 0.000000 0.000000 1.000000", objText);
             Assert.Contains("usemtl Yellow_Material", objText);
             Assert.Contains("f 1/1/1 2/2/2 3/3/3", objText);
+            Assert.DoesNotContain('\r', objText);
 
             string mtlText = ObjExport.ToMtl(scene);
             Assert.Contains("# OpenSKP MTL Material Library Export", mtlText);
             Assert.Contains("newmtl Yellow_Material", mtlText);
             Assert.Contains("Kd 1.000000 1.000000 0.000000", mtlText);
+            Assert.DoesNotContain('\r', mtlText);
         }
     }
 }

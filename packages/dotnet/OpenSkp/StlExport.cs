@@ -47,7 +47,7 @@ namespace OpenSkp
             if (scene == null) throw new ArgumentNullException(nameof(scene));
 
             var sb = new StringBuilder();
-            sb.AppendLine("solid OpenSKP_Model");
+            sb.Append("solid OpenSKP_Model").Append('\n');
 
             foreach (var prim in scene.GlbPrimitives)
             {
@@ -92,17 +92,17 @@ namespace OpenSkp
                     string v2y = v2.y.ToString("F6", CultureInfo.InvariantCulture);
                     string v2z = v2.z.ToString("F6", CultureInfo.InvariantCulture);
 
-                    sb.AppendLine($"  facet normal {nx} {ny} {nz}");
-                    sb.AppendLine("    outer loop");
-                    sb.AppendLine($"      vertex {v0x} {v0y} {v0z}");
-                    sb.AppendLine($"      vertex {v1x} {v1y} {v1z}");
-                    sb.AppendLine($"      vertex {v2x} {v2y} {v2z}");
-                    sb.AppendLine("    endloop");
-                    sb.AppendLine("  endfacet");
+                    sb.Append($"  facet normal {nx} {ny} {nz}").Append('\n');
+                    sb.Append("    outer loop").Append('\n');
+                    sb.Append($"      vertex {v0x} {v0y} {v0z}").Append('\n');
+                    sb.Append($"      vertex {v1x} {v1y} {v1z}").Append('\n');
+                    sb.Append($"      vertex {v2x} {v2y} {v2z}").Append('\n');
+                    sb.Append("    endloop").Append('\n');
+                    sb.Append("  endfacet").Append('\n');
                 }
             }
 
-            sb.AppendLine("endsolid OpenSKP_Model");
+            sb.Append("endsolid OpenSKP_Model").Append('\n');
             return sb.ToString();
         }
 
