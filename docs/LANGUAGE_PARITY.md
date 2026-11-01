@@ -17,16 +17,16 @@ cross-language porting backlog) and [`ROADMAP.md`](../ROADMAP.md).
 
 ## 1. Package versions
 
-As of the 2026-09-18 synchronized release, all 5 languages are on
-**1.3.0** — but same version number does not mean identical capability.
-Python and C++ carry real, additional capability (Fragments reading,
-loose-edge/curve support, IFC curve annotations, legacy pages/scenes
-reading) that TypeScript, .NET, and Dart do not have yet - see
-[§2](#2-feature-matrix) for exactly what differs. This was a deliberate
-choice, not an oversight: that work was real, tested, and ready, and
-holding it back purely to keep every language byte-for-byte equal would
-have wasted it for no real benefit. See
-[CHANGELOG.md § 1.3.0](../CHANGELOG.md) for the full picture.
+As of the 2026-10-27 synchronized release, all 5 languages are on
+**1.4.0** — but same version number does not mean identical capability.
+Python carries a few things the other four do not (writing scenes,
+per-edge and per-face layer ids, loose-edge/curve scene support, IFC curve
+annotations) - see [§2](#2-feature-matrix) for exactly what differs. This is
+a deliberate choice, not an oversight: that work is real, tested and ready,
+and holding it back purely to keep every language byte-for-byte equal would
+waste it for no real benefit. See
+[CHANGELOG.md § 1.4.0](../CHANGELOG.md) for the full picture (and § 1.3.0 for
+the release before it).
 
 | Language | Registry | Released version | On `main`, not released yet |
 |:---|:---|:---:|:---|
@@ -65,7 +65,7 @@ released. ❌ = not yet ported to that language; see
 | Attribute dicts: multiple dictionaries per entity | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Attribute dicts surfaced in GLB/JSON metadata export (not just IFC Psets) | ✅ | n/a, not independently re-checked this cycle | n/a, not independently re-checked this cycle | n/a, not independently re-checked this cycle | ✅ |
 | VFF pages/scenes + dimension parsing | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Legacy (pre-2021) pages/scenes reading | ✅ | ❌ VFF only | ❌ VFF only | ❌ VFF only | ✅ |
+| Legacy (pre-2021) pages/scenes reading | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Construction lines/points reading | ✅ legacy + VFF | ✅ legacy + VFF | ✅ legacy + VFF | ✅ legacy + VFF | ✅ legacy + VFF |
 | VFF per-layer-hidden flag reading | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Per-edge/per-face layer, `Edge#curve` pointers, classic `CArcCurve` frames (legacy + VFF) | ✅ | ❌ | ❌ | ❌ | ❌ |
@@ -100,11 +100,11 @@ released. ❌ = not yet ported to that language; see
 | **Import** | | | | | |
 | Read a `.frag` file back (6th input format alongside `.skp`) | ✅ | ✅ | ✅ | ✅ | ✅ |
 
-## 3. What's still outstanding after 1.3.0
+## 3. What's still outstanding after 1.4.0
 
 Everything that was tracked here as "unreleased on main" as of the previous
-update to this page is now released as part of the 2026-09-18 synchronized
-1.3.0 (see [CHANGELOG.md § 1.3.0](../CHANGELOG.md)). What remains open is
+update to this page is now released as part of the 2026-10-27 synchronized
+1.4.0 (see [CHANGELOG.md § 1.4.0](../CHANGELOG.md)). What remains open is
 genuine cross-language porting work, not a release-timing gap:
 
 **Closed**: reading a `.frag` file back (`from_fragments`/`read`) is now
@@ -121,10 +121,9 @@ path's own output.
 
 | Item | Python has it via | Needs porting to |
 |:---|:---|:---|
-| `build_instanced_scene()` loose-edge curve support + public typed-model `Edge.layer`/`Edge.curve_id`/`Face.layer`/`loose_edge_runs()` | `_curves.py`, `instanced_scene.py`, `model.py` | TypeScript, .NET, Dart, C++ — none started |
+| `build_instanced_scene()` loose-edge curve support + public typed-model `Edge.layer`/`Face.layer`/`loose_edge_runs()` | `_curves.py`, `instanced_scene.py`, `model.py` | TypeScript, .NET, Dart, C++ — none started |
 | IFC export: loose-edge curve sets + analytic arcs as `IfcAnnotation`/`IfcIndexedPolyCurve`, plus the 4 IFC4 STEP-conformance fixes | `scene.py`, `export/ifc.py` | TypeScript, .NET, Dart, C++ — none started |
-| Legacy (pre-2021) pages/scenes reading | `legacy.py` (also in C++, released) | TypeScript, .NET, Dart |
-| Per-edge/per-face layer, `Edge#curve` pointers, classic `CArcCurve` frames | `legacy.py`/`_core.py` | TypeScript, .NET, Dart, C++ |
+| Per-edge/per-face layer | `legacy.py`/`_core.py` | TypeScript, .NET, Dart, C++ |
 | Attribute dicts: full 9-value-type decoding for VFF (2021+) format (Python: 7/9, others: string-only) — not independently re-verified this cycle for TS/.NET/Dart/C++, carried over from the prior version of this page rather than asserted fresh | `_core.py` | TypeScript, .NET, Dart, C++ — status needs a fresh check |
 
 All tracked in [issue #285](https://github.com/iamahsanmehmood/openskp/issues/285).
@@ -138,7 +137,7 @@ over.** A real-world version-compatibility sweep (15 real `.skp` files —
 16 saves of the same project across its history from SketchUp version 3 up
 through 2025, one of which, V5, saved out corrupted/empty) found:
 
-**In the Python reader, 11 files parse, build, and export cleanly** (the sweep was run with Python; the other four readers cannot read the legacy saves of this project yet - [#442](https://github.com/iamahsanmehmood/openskp/issues/442)): saves from **2014, 2015,
+**In the Python reader, 11 files parse, build, and export cleanly** (the sweep was run with Python; TypeScript, .NET, Dart and C++ read the same saves since [#442](https://github.com/iamahsanmehmood/openskp/issues/442) and give identical totals on every one of them - 32,982 vertices, 40,925 edges, 9,652 faces and 150 instances, the same as its 2021 and 2025 saves): saves from **2014, 2015,
 2016, 2017, 2018, 2020, 2021, 2025, and — as of [#310](https://github.com/iamahsanmehmood/openskp/pull/310) — V7, V8, and
 2013** — consistent output (146 definitions / 131 mesh resources) across all
 of them.
@@ -150,9 +149,9 @@ root-caused to varying depth (tracked in
 | SketchUp version | Error | Status |
 |:---|:---|:---|
 | V3 | `expected a string record` | **Fixed in all 5 languages** ([#407](https://github.com/iamahsanmehmood/openskp/pull/407), ported in [#410](https://github.com/iamahsanmehmood/openskp/issues/410)) - calibrated on one real V3 file; single-material V3 files unverified |
-| V4, V5 | `texture object is not a dib` | **Fixed in all 5 languages** (V4 and V5 differ from V6 in about a dozen small layout details - see the CHANGELOG): Python in [#440](https://github.com/iamahsanmehmood/openskp/pull/440), the other four in the follow-up port. The real V4 project parses identically to its V6 save in Python; the other four readers match V6 on SketchUp-written files (including a 47-definition, 13-dimension model) and on the real V4 sample, but cannot yet read the real project at all ([#442](https://github.com/iamahsanmehmood/openskp/issues/442)). The project's own V5 save is a 0-byte file |
+| V4, V5 | `texture object is not a dib` | **Fixed in all 5 languages** (V4 and V5 differ from V6 in about a dozen small layout details - see the CHANGELOG): Python in [#440](https://github.com/iamahsanmehmood/openskp/pull/440), the other four in the follow-up port. The real V4 project parses identically to its V6 save in Python; the other four readers match V6 on SketchUp-written files (including a 47-definition, 13-dimension model) and on the real V4 sample, and, since [#442](https://github.com/iamahsanmehmood/openskp/issues/442), read the real project's V4 save with the same totals as its V6 save. The project's own V5 save is a 0-byte file |
 | V6 | `definition list misaligned` | **Fixed in all 5 languages** ([#385](https://github.com/iamahsanmehmood/openskp/pull/385), ported in [#410](https://github.com/iamahsanmehmood/openskp/issues/410)) |
-| 2019 | `implausible def entity count` | **Fixed in all 5 languages** (a separator null after the last layer of a definition shifted the entity count). The real 2019 save parses identically to its 2018 save in Python; the other four readers are checked on a SketchUp-written 2019 file ([#442](https://github.com/iamahsanmehmood/openskp/issues/442) for the real project) |
+| 2019 | `implausible def entity count` | **Fixed in all 5 languages** (a separator null after the last layer of a definition shifted the entity count). The real 2019 save parses identically to its 2018 save in Python; the other four readers are checked on a SketchUp-written 2019 file and, since [#442](https://github.com/iamahsanmehmood/openskp/issues/442), read the real project's 2019 save with the same totals as its 2018 save |
 
 ~~V7, V8, 2013 — `class-ref to non-class slot N (CAttributeNamed)`~~ —
 **fixed in [#310](https://github.com/iamahsanmehmood/openskp/pull/310)**.

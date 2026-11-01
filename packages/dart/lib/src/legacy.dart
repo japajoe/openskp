@@ -4,6 +4,7 @@ import 'dart:typed_data';
 import 'core.dart';
 import 'errors.dart';
 import 'geometry.dart';
+import 'legacy_pages.dart';
 import 'model.dart';
 import 'observability.dart';
 import 'tlv.dart';
@@ -536,7 +537,12 @@ class VertexRec {
 class EdgeRec {
   DrawBase db;
   int? curve, v1, v2;
-  EdgeRec({required this.db, this.curve, this.v1, this.v2});
+
+  /// The curve itself, on the edge that first points at it (a back-ref to a
+  /// curve already read carries none).
+  Object? curveValue;
+  EdgeRec(
+      {required this.db, this.curve, this.curveValue, this.v1, this.v2});
 }
 
 class CurveRec {
@@ -544,7 +550,12 @@ class CurveRec {
   CurveRec(this.n);
 }
 
-class ArcCurveRec {}
+/// A CArcCurve: the points `center + cos(t) * xAxis + sin(t) * yAxis` for `t`
+/// from startAngle to endAngle.
+class ArcCurveRec {
+  final ArcFrame frame;
+  ArcCurveRec(this.frame);
+}
 
 class EdgeUseRec {
   int? edge;
@@ -705,12 +716,14 @@ class DefinitionRec {
   List<(int, String?, Object?)> ents;
   bool facesCamera;
   bool shadowsFaceSun;
+  bool isGroup;
   DefinitionRec(
       {required this.name,
       required this.guid,
       required this.ents,
       required this.facesCamera,
-      required this.shadowsFaceSun});
+      required this.shadowsFaceSun,
+      this.isGroup = false});
 }
 
 class InstanceRec {
@@ -823,11 +836,11 @@ class LegacyReaders {
     final db = drawbase(ar, r);
     final (s1, _, __) = ar.readObject(r, 'CVertex');
     final (s2, _2, __2) = ar.readObject(r, 'CVertex');
-    final (cs, cn, _3) = ar.readObject(r);
+    final (cs, cn, cv) = ar.readObject(r);
     if (cn != null && cn != 'CCurve' && cn != 'CArcCurve') {
       throw LegacyParseError('edge curve pointer resolved to $cn ${r.ctx()}');
     }
-    return EdgeRec(db: db, curve: cs, v1: s1, v2: s2);
+    return EdgeRec(db: db, curve: cs, curveValue: cv, v1: s1, v2: s2);
   }
 
   static Object readCurve(Archive ar, LR r) {
@@ -840,8 +853,16 @@ class LegacyReaders {
   static Object readArcCurve(Archive ar, LR r) {
     preamble(ar, r);
     r.raw(5);
-    r.f64s(14);
-    return ArcCurveRec();
+    // center[3], normal[3], x_axis[3], start_angle, end_angle, y_axis[3]
+    final v = r.f64s(14);
+    return ArcCurveRec(ArcFrame(
+      center: (v[0], v[1], v[2]),
+      normal: (v[3], v[4], v[5]),
+      xAxis: (v[6], v[7], v[8]),
+      startAngle: v[9],
+      endAngle: v[10],
+      yAxis: (v[11], v[12], v[13]),
+    ));
   }
 
   /// Record that the writer burned [delta] store-map indices without
@@ -1387,7 +1408,14 @@ class LegacyReaders {
   static Object readSkFont(Archive ar, LR r) {
     ar.readObject(r, 'CAttributeContainer');
     if (ar.hasPid) {
-      r.u8();
+      // the mask byte says how many pid bytes follow (SketchUp 2017+ writes
+      // two or more here)
+      final mask = r.u8();
+      var n = 0;
+      for (var bit = 0; bit < 8; bit++) {
+        if ((mask & (1 << bit)) != 0) n++;
+      }
+      r.raw(n);
     }
     r.utf16();
     r.raw(15);
@@ -1478,7 +1506,7 @@ class LegacyReaders {
           blk[1] == 0x00 &&
           blk[2] == 0x00 &&
           blk[3] == 0x00 &&
-          blk[6] == 0x03 &&
+          blk[6] <= 8 &&
           blk[7] == 0x00 &&
           blk[8] == 0x00 &&
           blk[9] == 0x00 &&
@@ -1679,6 +1707,15 @@ class LegacyReaders {
     }
     final gap = r.raw(tpos - r.pos);
     final behavior = gap.length >= 9 ? gap[gap.length - 9] : 0;
+    // the last u32 before the thumbnail is 1 for the definition of a group
+    // and 0 for a component's (what SketchUp's SUComponentDefinitionGetType
+    // reports), measured against SketchUp 2025's own counts
+    final isGroup = gap.length >= 4 &&
+        (gap[gap.length - 4] |
+                (gap[gap.length - 3] << 8) |
+                (gap[gap.length - 2] << 16) |
+                (gap[gap.length - 1] << 24)) ==
+            1;
     ar.readObject(r, 'CThumbnail');
     return DefinitionRec(
       name: name,
@@ -1686,6 +1723,7 @@ class LegacyReaders {
       ents: ents,
       facesCamera: (behavior & 1) != 0,
       shadowsFaceSun: (behavior & 2) != 0,
+      isGroup: isGroup,
     );
   }
 
@@ -1854,7 +1892,9 @@ class Legacy {
     final layerSlots = <int>[];
     for (int i = 0; i < layerCount; i++) {
       final (s, _, __) = boot.readObject(boot.r, 'CLayer');
-      layerSlots.add(s!);
+      // a null entry in the layer list has no slot, so it is no candidate
+      // (files saved through SketchUp's C API as 2019 or 2020 have one)
+      if (s != null) layerSlots.add(s);
     }
     boot.collectTrailingLayers(slotsOut: layerSlots, unmatchedClassRef: true);
     final (s, n, __) = boot.readObject(boot.r);
@@ -2069,6 +2109,15 @@ class Legacy {
     if (flags != 0) {
       builder.edgeFlags[slot] = flags;
     }
+    // The edge's parent Curve (the CCurve/CArcCurve slot) and, if that curve
+    // is an analytic arc, its frame: it arrives on the edge that first
+    // references the CArcCurve; every later edge on the arc back-refs it.
+    final curve = e.curve;
+    if (curve != null) {
+      builder.edgeCurves[slot] = curve;
+      final cv = e.curveValue;
+      if (cv is ArcCurveRec) builder.arcCurves[curve] = cv.frame;
+    }
   }
 
   static void _fillBuilder(GeometryBuilder builder,
@@ -2077,6 +2126,8 @@ class Legacy {
       if (v == null) continue;
       if (v is EdgeRec) {
         _addEdge(builder, s, v, slots);
+      } else if (v is ArcCurveRec) {
+        builder.arcCurves[s] = v.frame;
       } else if (v is FaceRec) {
         final loops = <List<(int, int)>>[];
         for (final lp in v.loops) {
@@ -2315,6 +2366,7 @@ class Legacy {
             guid: d.guid,
             name: d.name,
             isImage: imageDefIds.contains(entry.key),
+            isGroup: d.isGroup,
             alwaysFacesCamera: d.facesCamera,
             shadowsFaceSun: d.shadowsFaceSun,
             builder: b,
@@ -2351,6 +2403,9 @@ class Legacy {
       // that's a VFF/ZIP-only construct - so there is no known source for
       // the model's unit-system string here.
       ..units = null
+      // Scenes come from the scene list in the document tail (see
+      // legacy_pages.dart).
+      ..pages.addAll(readPageList(data, ar) ?? const [])
       ..layerColors.addAll(layerColors)
       ..layerHidden.addAll(layerHidden)
       ..layerIdToName.addAll(layerIdToName)

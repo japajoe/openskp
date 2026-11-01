@@ -254,6 +254,32 @@ void collect_geometry(const std::vector<TlvNode>& es, GeometryBuilder& b) {
           if (z.tag == "D007")
             for (auto& w : z.children)
               if (w.tag == "D307" && !w.payload.empty()) b.edge_flags[*id] = w.payload[0];
+        // BB0B = the parent Curve's entity id (Edge#curve).
+        auto* bb = find_node(e.children, "BB0B");
+        if (bb && !bb->payload.empty()) {
+          auto curve_id = parse_varint(bb->payload, 0, bb->payload.size());
+          if (curve_id) b.edge_curves[*id] = curve_id;
+        }
+      }
+    } else if (e.tag == "2C4C") {
+      // A Curve (384A: its entity id and edge count) and, when the curve is an arc, 2D4C: 16
+      // doubles - center, normal, the plane constant, x axis, y axis, radius, start angle, end
+      // angle. Checked against SketchUp 2025's own SUArcCurve getters.
+      auto* curve = find_node(e.children, "384A");
+      auto* arc = find_node(e.children, "2D4C");
+      if (curve && arc && arc->payload.size() == 128) {
+        auto id = entity_id(*curve);
+        if (id) {
+          auto f = [&](int i) { return read_f64(arc->payload, i * 8); };
+          RawArcFrame a;
+          a.center = {f(0), f(1), f(2)};
+          a.normal = {f(3), f(4), f(5)};
+          a.x_axis = {f(7), f(8), f(9)};
+          a.y_axis = {f(10), f(11), f(12)};
+          a.start_angle = f(14);
+          a.end_angle = f(15);
+          b.arc_curves[*id] = a;
+        }
       }
     } else if (e.tag == "AC0D") {
       auto id = entity_id(e);
@@ -432,9 +458,13 @@ void collect_definitions(const std::vector<TlvNode>& ns, std::map<EntityId, RawD
           d.guid = hex(c.payload);
         else if (c.tag == "7E15")
           d.name = text(c.payload);
-        else if (c.tag == "8315" && !c.payload.empty())
-          d.is_image = parse_varint(c.payload, 0, c.payload.size()) == 2;
-        else if (c.tag == "581B")
+        else if (c.tag == "8315" && !c.payload.empty()) {
+          // Definition kind: 0 for a component, 1 for a group (what SketchUp's own
+          // API reports too), 2 for the quad definition backing an Image entity.
+          auto kind = parse_varint(c.payload, 0, c.payload.size());
+          d.is_image = kind == 2;
+          d.is_group = kind == 1;
+        } else if (c.tag == "581B")
           for (auto& v : parse_flat(c.payload)) {
             if (v.first == "5D1B" && !v.second.empty())
               d.always_faces_camera = parse_varint(v.second, 0, v.second.size()) == 1;

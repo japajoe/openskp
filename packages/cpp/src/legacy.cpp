@@ -669,7 +669,11 @@ struct Archive {
       draw(*v);
       v->v1 = std::get<0>(object("CVertex"));
       v->v2 = std::get<0>(object("CVertex"));
-      object();
+      auto curve = object();
+      if (!std::get<1>(curve).empty()) {
+        v->curve = std::get<0>(curve);
+        v->curve_value = std::get<2>(curve);
+      }
     } else if (n == "CCurve") {
       preamble();
       v->k = "curve";
@@ -677,9 +681,16 @@ struct Archive {
       r.u32();
     } else if (n == "CArcCurve") {
       preamble();
-      v->k = "curve";
+      v->k = "arccurve";
       r.raw(5);
-      r.f64s(14);
+      // center[3], normal[3], x_axis[3], start_angle, end_angle, y_axis[3]
+      auto a = r.f64s(14);
+      v->arc.center = {a[0], a[1], a[2]};
+      v->arc.normal = {a[3], a[4], a[5]};
+      v->arc.x_axis = {a[6], a[7], a[8]};
+      v->arc.start_angle = a[9];
+      v->arc.end_angle = a[10];
+      v->arc.y_axis = {a[11], a[12], a[13]};
     } else if (n == "CEdgeUse") {
       early_preamble();
       v->k = "edgeuse";
@@ -971,7 +982,14 @@ struct Archive {
       }
     } else if (n == "CSkFont") {
       object("CAttributeContainer");
-      if (pid) r.u8();
+      if (pid) {
+        // the mask byte says how many pid bytes follow (SketchUp 2017+ writes two or more here)
+        const int mask = r.u8();
+        int n = 0;
+        for (int bit = 0; bit < 8; ++bit)
+          if (mask & (1 << bit)) ++n;
+        r.raw(n);
+      }
       r.utf16();
       r.raw(15);
     } else if (n == "CDimensionLinear") {
@@ -1004,7 +1022,7 @@ struct Archive {
       size_t found = std::string::npos;
       for (size_t q = r.p; q + 14 <= std::min(r.d.size(), r.p + 512); ++q)
         if (r.d[q] == 1 && r.d[q + 1] == 0 && r.d[q + 2] == 0 && r.d[q + 3] == 0 &&
-            r.d[q + 6] == 3 && r.d[q + 7] == 0 && r.d[q + 8] == 0 && r.d[q + 9] == 0 &&
+            r.d[q + 6] <= 8 && r.d[q + 7] == 0 && r.d[q + 8] == 0 && r.d[q + 9] == 0 &&
             r.d[q + 10] == 1 && r.d[q + 11] == 255 && r.d[q + 12] == 254 && r.d[q + 13] == 255) {
           found = q + 11;
           break;
@@ -1135,6 +1153,11 @@ struct Archive {
       auto gap = r.raw(tpos - r.p);
       v->faces_camera = gap.size() >= 9 && (gap[gap.size() - 9] & 1);
       v->shadows_face_sun = gap.size() >= 9 && (gap[gap.size() - 9] & 2);
+      // the last u32 before the thumbnail is 1 for the definition of a group and 0
+      // for a component's (what SketchUp's SUComponentDefinitionGetType reports),
+      // measured against SketchUp 2025's own counts
+      v->is_group = gap.size() >= 4 && gap[gap.size() - 4] == 1 && gap[gap.size() - 3] == 0 &&
+                    gap[gap.size() - 2] == 0 && gap[gap.size() - 1] == 0;
       object("CThumbnail");
     } else if (n == "CComponentInstance" || n == "CGroup") {
       v->attrs = preamble();
@@ -1501,6 +1524,14 @@ void add_edge(GeometryBuilder& b, uint64_t s, const V& e,
   b.edges[s] = {EntityId(e.v1), EntityId(e.v2)};
   int f = (e.soft ? 8 : 0) | (e.smooth ? 16 : 0) | (e.hidden ? 1 : 0);
   if (f) b.edge_flags[s] = f;
+  // The edge's parent Curve (the CCurve/CArcCurve slot) and, if that curve is an analytic arc, its
+  // frame: it arrives on the edge that first references the CArcCurve; every later edge on the arc
+  // back-refs it.
+  if (e.curve) {
+    b.edge_curves[s] = EntityId(*e.curve);
+    if (e.curve_value && e.curve_value->k == "arccurve")
+      b.arc_curves[EntityId(*e.curve)] = e.curve_value->arc;
+  }
 }
 
 // SketchUp's Dynamic Components extension stores its data in an attribute
@@ -1535,6 +1566,8 @@ void fill(GeometryBuilder& b,
     if (!v) continue;
     if (v->k == "edge")
       add_edge(b, s, *v, slots);
+    else if (v->k == "arccurve")
+      b.arc_curves[EntityId(s)] = v->arc;
     else if (v->k == "face") {
       RawFace f;
       f.normal = {v->plane[0], v->plane[1], v->plane[2]};
@@ -1837,6 +1870,320 @@ std::vector<RawPage> scan_pages_for_layers(const ByteBuffer& data, std::size_t s
   return pages;
 }
 
+// ── full scene records ───────────────────────────────────────────────────
+//
+// Ground truth, all read byte-exactly: the gondola_v20.skp fixture (SketchUp 2020, one scene,
+// flags 0x1FF); SketchUp's own 3D Warehouse model "Skill Builder: Creating Section Animations
+// with Scenes" in its SketchUp 2017 format (eight scenes, 0x7F) and SketchUp 2015 saves (nine
+// scenes, 0x7F) - not redistributable, so not committed; files written by openskp.create, which
+// SketchUp Free opens with working scenes; and files built and saved through SketchUp's C API as
+// 2017 to 2020 (schema 15), whose names, cameras and hidden layers SketchUp's own library reads
+// back identically.
+//
+// The scene list sits in the document tail as a u32 count right before the first record (which
+// declares the CViewPage class), then one record per scene, then a ref to the selected scene. A
+// record is: the class tag | a null attribute ref | (schema 13+, SketchUp 2016+, only) a pid | name
+// | description | u32 capture flags | the camera (CCamera, or null) | the thumbnail (CDib, or
+// null) | (schema 13) a byte | then one section per capture flag that is set:
+//
+//   0x02 style       the rendering options (length by file version, see rendering_options_len)
+//                    + a CSkpStyle ref or object
+//   0x04 shadows     2 bytes (schema 13+: 3) + the shadow info
+//   0x08 axes        (schema 13+: a flag byte +) 110 bytes
+//   0x10 hidden      a byte, u32 n, n entity refs
+//   0x20 layers      u32 n, n refs to the layers (tags) the scene hides
+//   0x40 sections    u32 n, n section-plane refs
+//
+// | 22 bytes (transition and delay time, flags) | u32 n + an n-byte PNG.
+//
+// Schema 15 (a file saved through the C API as 2017 to 2020) differs: flag 0x01 is the camera,
+// which is only there when the flag is set, with no CDib tag, no byte after it and no thumbnail;
+// the rendering options are 3 bytes longer; the style options have two more value types
+// (3: 2 bytes, 5: 4 bytes); and the trailer is 21 bytes with no PNG after it.
+//
+// A record this reader can't fully read, or flags outside 0x1FF, make read_page_list give up (it
+// returns nullopt) and parse_legacy falls back to scan_pages_for_layers, which finds scene names
+// and hidden layers only - the same order as Python.
+namespace {
+
+constexpr uint32_t kPageKnownFlags = 0x1FF;
+constexpr size_t kPageAxesLen = 110;
+constexpr size_t kPageTrailerLen = 22;
+constexpr size_t kShadowInfoFixedLen = 60;  // after the city and country strings
+
+// The rendering options' length by SketchUp major version, measured on the model-level copy of the
+// same block in every fixture from 2014 to 2020 (and in the 2020 scene); other versions aren't
+// known, so give up there.
+int rendering_options_len(int ver) {
+  switch (ver) {
+    case 14:
+    case 15:
+    case 16:
+    case 17:
+      return 206;
+    case 18:
+      return 211;
+    case 19:
+      return 212;
+    case 20:
+      return 213;
+    default:
+      return -1;
+  }
+}
+
+// CSkpStyle option values: type tag -> byte size (-1 when unknown)
+int style_value_size(uint32_t type) {
+  switch (type) {
+    case 1:
+      return 1;
+    case 3:
+      return 2;
+    case 4:
+    case 5:
+    case 6:
+      return 4;
+    case 7:
+      return 8;
+    default:
+      return -1;
+  }
+}
+
+struct PageError : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+
+enum class PageTag { null_tag, decl, class_ref, obj };
+
+// One archive tag, with the 0x7FFF escape to 32 bits resolved.
+std::pair<PageTag, uint64_t> read_page_tag(R& r) {
+  uint32_t v = r.u16();
+  if (v == 0) return {PageTag::null_tag, 0};
+  if (v == 0xFFFF) return {PageTag::decl, 0};
+  if (v == 0x7FFF) {
+    uint32_t w = r.u32();
+    return (w & 0x80000000u) ? std::pair<PageTag, uint64_t>{PageTag::class_ref, w & 0x7FFFFFFFu}
+                             : std::pair<PageTag, uint64_t>{PageTag::obj, w};
+  }
+  return (v & 0x8000) ? std::pair<PageTag, uint64_t>{PageTag::class_ref, v & 0x7FFFu}
+                      : std::pair<PageTag, uint64_t>{PageTag::obj, v};
+}
+
+int popcount8(unsigned mask) {
+  int n = 0;
+  for (int bit = 0; bit < 8; ++bit)
+    if (mask & (1u << bit)) ++n;
+  return n;
+}
+
+void skip_page_pid(R& r) { r.raw(size_t(popcount8(r.u8()))); }
+
+// The classes the scene records declare or refer to: the schema each was declared with and, once
+// seen, the slot its class-refs use - every class-ref to one class must carry the same slot, which
+// catches a record read from the wrong offset early.
+struct PageClasses {
+  // CCamera and CDib are declared in the document prefix; the scene records only refer to them, at
+  // the schemas every v6+ file uses.
+  std::map<std::string, int> schema{{"CCamera", 5}, {"CDib", 3}};
+  std::map<std::string, uint64_t> slot;
+
+  // After a decl or class tag: the declaration's header (if any); returns the schema the object
+  // was written with.
+  int object(R& r, PageTag kind, uint64_t s, const std::string& name) {
+    if (kind == PageTag::decl) {
+      int sch = r.u16();
+      size_t n = r.u16();
+      auto bytes = r.raw(n);
+      std::string got(bytes.begin(), bytes.end());
+      if (n != name.size() || got != name) throw PageError("expected a " + name + " declaration");
+      schema[name] = sch;
+    } else {
+      auto have = slot.find(name);
+      if (have == slot.end())
+        slot[name] = s;
+      else if (have->second != s)
+        throw PageError(name + " class-ref to another slot");
+    }
+    auto it = schema.find(name);
+    if (it == schema.end()) throw PageError(name + " object of an unknown schema");
+    return it->second;
+  }
+};
+
+void read_page_camera(R& r, RawPage& page) {
+  auto eye = r.f64s(3);
+  auto target = r.f64s(3);
+  auto up = r.f64s(3);
+  r.f64s(2);  // constants 1.0, 1000.0
+  uint8_t perspective = r.u8();
+  double fov = r.f64();
+  double ortho_height = r.f64();
+  r.raw(137 - 105);
+  r.u16();
+  r.utf16();
+  r.raw(33);
+  page.eye = Vec3{eye[0], eye[1], eye[2]};
+  page.target = Vec3{target[0], target[1], target[2]};
+  page.up = Vec3{up[0], up[1], up[2]};
+  page.fov = fov;
+  page.parallel = perspective == 0;
+  page.ortho_height = ortho_height;
+}
+
+// A CSkpStyle object's body: no attributes, a pid (schema 2+), GUID, a string, u32, name,
+// description, then its options - each a u32 key and a u32 count of (u32 type, value) pairs.
+void skip_page_style(R& r, int schema) {
+  if (r.u16() != 0) throw PageError("style with attributes");
+  if (schema >= 2) skip_page_pid(r);
+  r.raw(16);
+  r.utf16();
+  r.u32();
+  r.utf16();
+  r.utf16();
+  uint32_t n = r.u32();
+  for (uint32_t i = 0; i < n; ++i) {
+    r.u32();
+    uint32_t m = r.u32();
+    for (uint32_t j = 0; j < m; ++j) {
+      int size = style_value_size(r.u32());
+      if (size < 0) throw PageError("unknown style value type");
+      r.raw(size_t(size));
+    }
+  }
+}
+
+std::vector<EntityId> read_page_refs(R& r, uint32_t n) {
+  if (n > (r.d.size() - r.p) / 2) throw PageError("implausible ref count");
+  std::vector<EntityId> refs;
+  for (uint32_t i = 0; i < n; ++i) {
+    auto [kind, v] = read_page_tag(r);
+    if (kind != PageTag::obj) throw PageError("expected a back-ref");
+    refs.push_back(EntityId(v));
+  }
+  return refs;
+}
+
+RawPage read_page_record(Archive& ar, R& r, PageClasses& classes) {
+  auto [kind, slot] = read_page_tag(r);
+  if (kind != PageTag::decl && kind != PageTag::class_ref)
+    throw PageError("expected a CViewPage record");
+  int schema = classes.object(r, kind, slot, "CViewPage");
+  if (r.u16() != 0) throw PageError("scene with attributes");
+  if (schema >= 13) skip_page_pid(r);
+  RawPage page;
+  page.name = r.utf16();
+  r.utf16();  // description
+  uint32_t flags = r.u32();
+  if (flags & ~kPageKnownFlags) throw PageError("scene capture flags");
+  if (schema >= 15) {
+    // saved through SketchUp's C API: the camera is there when its flag is, and there is no
+    // thumbnail
+    if (flags & 0x01) {
+      std::tie(kind, slot) = read_page_tag(r);
+      if (kind != PageTag::decl && kind != PageTag::class_ref) throw PageError("expected a camera");
+      classes.object(r, kind, slot, "CCamera");
+      read_page_camera(r, page);
+    }
+  } else {
+    std::tie(kind, slot) = read_page_tag(r);
+    if (kind == PageTag::decl || kind == PageTag::class_ref) {
+      classes.object(r, kind, slot, "CCamera");
+      read_page_camera(r, page);
+    }
+    std::tie(kind, slot) = read_page_tag(r);
+    if (kind == PageTag::decl || kind == PageTag::class_ref) {
+      classes.object(r, kind, slot, "CDib");
+      read_dib_body(r);
+    }
+    if (schema >= 13) r.u8();
+  }
+  if (flags & 0x02) {
+    int base = rendering_options_len(ar.ver);
+    if (base < 0) throw PageError("rendering options of an unknown version");
+    r.raw(size_t(base + (schema >= 15 ? 3 : 0)));
+    std::tie(kind, slot) = read_page_tag(r);
+    if (kind == PageTag::decl || kind == PageTag::class_ref)
+      skip_page_style(r, classes.object(r, kind, slot, "CSkpStyle"));
+  }
+  if (flags & 0x04) {
+    r.raw(schema >= 13 ? 3 : 2);
+    r.u32();  // time
+    r.u8();
+    r.utf16();  // city
+    r.utf16();  // country
+    r.raw(kShadowInfoFixedLen);
+  }
+  if (flags & 0x08) r.raw(kPageAxesLen + (schema >= 13 ? 1 : 0));
+  if (flags & 0x10) {
+    r.u8();
+    read_page_refs(r, r.u32());
+  }
+  if (flags & 0x20) page.hidden_layer_ids = read_page_refs(r, r.u32());
+  if (flags & 0x40) read_page_refs(r, r.u32());
+  if (schema >= 15) {
+    r.raw(kPageTrailerLen - 1);
+    return page;
+  }
+  r.raw(kPageTrailerLen);
+  uint32_t png = r.u32();
+  if (png > r.d.size() - r.p) throw PageError("implausible thumbnail length");
+  r.raw(png);
+  return page;
+}
+
+// Every scene, with its camera and hidden layers, read as a sequence from the scene list in the
+// file tail. nullopt when there is a scene list this reader can't fully read; an empty list when
+// there is none.
+std::optional<std::vector<RawPage>> read_page_list(const ByteBuffer& data, Archive& ar) {
+  static const std::string kClass = "CViewPage";
+  size_t start = std::string::npos;
+  for (size_t i = ar.r.p; i + 6 + kClass.size() <= data.size(); ++i) {
+    if (data[i] != 0xFF || data[i + 1] != 0xFF) continue;
+    uint8_t schema = data[i + 2];
+    if (schema != 0x0C && schema != 0x0D && schema != 0x0F) continue;
+    if (data[i + 3] != 0x00 || data[i + 4] != 0x09 || data[i + 5] != 0x00) continue;
+    if (std::equal(kClass.begin(), kClass.end(), data.begin() + i + 6)) {
+      start = i;
+      break;
+    }
+  }
+  if (start == std::string::npos) {
+    // a scene list in a schema this reader doesn't know
+    auto it = std::search(data.begin() + std::min(ar.r.p, data.size()), data.end(), kClass.begin(),
+                          kClass.end());
+    if (it != data.end()) return std::nullopt;
+    return std::vector<RawPage>{};
+  }
+  try {
+    if (start < 4) return std::nullopt;
+    uint32_t count = read_u32(data, start - 4);
+    if (count < 1 || count > 10000) throw PageError("implausible scene count");
+    R r{data, start};
+    PageClasses classes;
+    std::vector<RawPage> pages;
+    for (uint32_t i = 0; i < count; ++i) pages.push_back(read_page_record(ar, r, classes));
+    // the list ends with a ref to the selected scene (or a null ref)
+    auto [kind, v] = read_page_tag(r);
+    (void)v;
+    if (kind != PageTag::obj && kind != PageTag::null_tag) throw PageError("no selected-scene ref");
+    for (auto& page : pages) {
+      std::vector<EntityId> kept;
+      for (auto id : page.hidden_layer_ids) {
+        auto it = ar.slots.find(id);
+        if (it != ar.slots.end() && !it->second.cls && it->second.name == "CLayer")
+          kept.push_back(id);
+      }
+      page.hidden_layer_ids = std::move(kept);
+    }
+    return pages;
+  } catch (const std::exception&) {
+    return std::nullopt;
+  }
+}
+
+}  // namespace
+
 RawParsed parse_legacy(const ByteBuffer& data, const ParseOptions& o) {
   emit_log(o, LogLevel::information,
            "Parsing legacy MFC container (" + std::to_string(data.size()) + " bytes)");
@@ -1962,13 +2309,17 @@ RawParsed parse_legacy(const ByteBuffer& data, const ParseOptions& o) {
         d.always_faces_camera = s.second.v->faces_camera;
         d.shadows_face_sun = s.second.v->shadows_face_sun;
         d.is_image = image_def_ids.count(s.first) != 0;
+        d.is_group = s.second.v->is_group;
         fill(d.builder, s.second.v->ents, ar.slots);
         out.definitions[s.first] = std::move(d);
       }
     fill(out.root.builder, root, ar.slots);
     try {
-      out.pages =
-          scan_pages_for_layers(data, ar.r.p, LegacySlotTable{ar.slots, ar.class_slot, ar.next});
+      // whole scene records first; the narrow scan only when the full reader gives up on one
+      auto pages = read_page_list(data, ar);
+      out.pages = pages ? std::move(*pages)
+                        : scan_pages_for_layers(data, ar.r.p,
+                                                LegacySlotTable{ar.slots, ar.class_slot, ar.next});
     } catch (const std::exception&) {
       out.pages.clear();
     }

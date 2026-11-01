@@ -7,6 +7,176 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] — 2026-10-27 — all 5 languages
+
+> What most readers will notice, from the entries below (everything since 1.3.0):
+>
+> - **Reading, now in all five languages:** a classic (pre-2021) file's scenes with their
+>   cameras and hidden layers; `Definition.is_group`, which says whether SketchUp made a
+>   definition for a group or a component; `Definition.arcs`, the exact centre, radius and
+>   angles of every arc and circle (including ones that bound a face, and from 2021+ files,
+>   where they were stored but never read), with `Edge.curveId` to join them to their edges.
+> - **Fixes that change what a model looks like:** an instance scaled through the matrix's
+>   scale term is placed and sized correctly (it came out 100x too big), and a 2021+ scene
+>   that saves no camera is kept. TypeScript, .NET, Dart and C++ now read every legacy save
+>   of a real multi-version project (SketchUp 4 through 2020); they stopped on it before.
+> - **Writing:** the writers mark a group's definition as a group (SketchUp counted written
+>   groups as components); Python writes scenes into legacy files.
+> - Much faster 2021+ parsing in Python, and a long list of smaller fixes below.
+>
+> Not identical capability: Python still has a few things the other four do not (writing
+> scenes, the per-edge and per-face layer ids, loose-edge curve scene support), tracked in
+> [docs/LANGUAGE_PARITY.md](docs/LANGUAGE_PARITY.md) and
+> [issue #285](https://github.com/iamahsanmehmood/openskp/issues/285).
+>
+> **Upgrade notes:** in TypeScript, `Edge.curveId` is optional but `Definition.isGroup` and
+> `Definition.arcs` are required, so code that builds `Definition` objects by hand needs the
+> two new fields (parsed models already carry them). A file written by an earlier version keeps
+> the old group flag on its definitions and reads back with `is_group` false for its groups.
+
+### Fixed — all five ports: a group the writer makes is a group to SketchUp (#446)
+
+A file written by `openskp.create` (or the TypeScript, .NET, Dart and C++ writers) placed a group
+with a `CGroup` record but wrote its definition as a component's: the flag in the definition record
+that SketchUp's own API reports as a group (`SUComponentType_Group`) was 0, so SketchUp counted
+every such group as a component and `Definition.is_group` read back false. The writers now set it
+for the definition `add_group` makes and for the definition `add_group_instance` places, which is
+the way to write a group nested inside a component (the first version of this fix covered only
+`add_group`, so a nested group still read back as a component, #467). A definition placed both as a
+group and as a component instance reads as a group. Checked with SketchUp 2025's own library: a file
+with one group and one component, and one with a group nested in a component, each report one group
+definition and one component definition, and OpenSKP reads the same;
+an existing test that asked SketchUp to count the definitions of a file with 20 components and 10
+groups used to expect 30 components and now expects 20 components and 10 groups. Each port tests it.
+
+### Added — TypeScript, .NET, Dart, C++: scenes in classic files, with their cameras (#445)
+
+The Python reader (#454, #460) ported: `SkpModel.pages` is filled from a classic (pre-2021)
+file's scene list in these four ports as well, with each scene's name, camera (eye, target, up,
+field of view, projection, parallel height) and the layers it hides. They returned no scenes before
+(C++ found names and hidden layers only, with a narrow scan that still runs when the full reader
+gives up on a record). SketchUp 2015 to 2020 desktop saves (record schema 12 and 13) and files saved
+through SketchUp's C API as 2017 to 2020 (schema 15) are read; a scene that captures everything
+(flags `0x1FF`) is read to its last byte.
+
+Checked by comparing all four against the Python reader on 78 files (every fixture of the five
+ports, the older models, the SketchUp-library saves and the VFF scene files; 29 scenes in 11 files):
+name, eye, target, up, field of view, projection, parallel height and hidden layers are identical
+in every scene, and the files that fail to parse fail in all of them. The files saved through the C
+API as 2019 and 2020 surfaced a second thing: .NET and Dart crashed opening them at all, on the null
+entry such a file has in its layer list that #459 fixed in Python; TypeScript and C++ were not
+affected. Both are fixed here. New tests in each port read `gondola_v20.skp`'s scene and the four
+`sdk_saved_*` fixtures (three scenes, one without a camera, one hiding a layer, and a scene
+capturing every property followed by a plain one).
+
+Not ported: Python's narrow scan fallback (scene names and hidden layers only, for records the full
+reader gives up on) in TypeScript, .NET and Dart, which return no scenes there. This is the
+reading half of #445; writing scenes into a file (`SkpBuilder.add_scene`) stays Python-only.
+
+### Fixed — TypeScript, .NET, Dart, C++: the real multi-version project reads in every legacy version (#442)
+
+On the real multi-version project from the #284 sweep (a 5 MB, 146-definition, textured model
+saved from SketchUp V3 through 2025) these four readers failed every legacy save. Two causes,
+both already handled in Python:
+
+- A `CText` is found by an 11-byte block just before its string, `01 00 00 00 ?? 00 <arrow type>
+  00 00 00 01`, and the four readers required arrow type 3. The type is 0 to 8 (a dot, a closed
+  or open arrow, a slash, none); one text with another stopped the walk (`text delimiter not
+  found` on V4 to 2016).
+- The text font (`CSkFont`) reads its pid as a mask byte plus the bytes the mask declares; the four
+  readers read only the mask byte. A pid above 255 takes two bytes, and the real project's 2017 to
+  2020 saves have one on the font, which threw every later field off (`expected a string record`).
+
+All four now parse every save of the project from V4 through 2020, 2021 and 2025, with
+identical totals: 32,982 vertices, 40,925 edges, 9,652 faces and 150 instances in each,
+the same as the 2021 and 2025 saves. V3 stays a failure in every reader (#284), and V5 is a
+corrupted 0-byte save. A new fixture, `legacy_text_arrows_2017.skp`, covers both causes in
+every port (three leader texts with arrow types 1, 2 and 4 and a two-byte font pid, from
+`openskp.create` plus two documented byte edits; SketchUp 2025 opens it and reports the same
+texts and arrow types), and its test fails on the old code (in TypeScript the old code did not
+even raise: the file parsed with no texts at all).
+### Added — TypeScript, .NET, Dart, C++: `Definition.arcs` and `Edge.curveId` (#462)
+
+The Python entry below, ported: `Definition.arcs` (`arcs`, `Arcs`) maps a curve id
+to an `ArcCurve` - centre, normal, x and y axis, start and end angle, plus
+`radius` and `isFullCircle` - for every arc and circle, including ones that bound
+a face, from classic and 2021+ files. These four ports did not expose which
+curve an edge belongs to at all, so `Edge.curveId` (`CurveId`, `curve_id`) comes
+with it: the id of the curve, or null/none, the same grouping Python's
+`Edge.curve_id` carries, and the key into `arcs`.
+
+2021+ files store the arc in a 128-byte `2D4C` record beside each curve's record;
+classic files in the `CArcCurve` the readers already stepped over. Checked in each
+port against the fixtures the Python entry used (a loose arc, a disc and a half disc
+saved as SketchUp 2017, 2020 and 2021, read back identically) and on the 368
+circles of `Untitled.skp`, each joined to the 24 edges SketchUp reports.
+
+### Added — Python: `Definition.arcs`, the analytic arc of every arc and circle (#462)
+
+A curve SketchUp drew as an arc or a circle is a run of straight edges and
+also an exact description: centre, plane, axes, radius and start and end
+angle. `Definition.arcs` maps a curve id (the `Edge.curve_id` of the edges
+that form it) to an `ArcCurve` with those, from classic and 2021+ files alike.
+It covers every arc, including a circle or an arc that bounds a face, which the
+scene's `curve_sets[].arc` (loose curves only) never reached.
+
+Classic files already carried the arc inside the reader; 2021+ files store it
+as a 128-byte record (`2D4C`: 16 doubles - centre, normal, a plane constant,
+x axis, y axis, radius, start and end angle) beside each curve's record
+(`384A`), and the reader skipped it. It is read now. Checked against SketchUp
+2025's own `SUArcCurve` getters: a loose arc, a circle and an arc closed by its
+chord (the last two bounding faces), saved as SketchUp 2017, 2020 and 2021,
+read back identically in all three; and the 368 arcs of `Untitled.skp`
+(24-edge circles) agree to 5e-6 inches, each joined to the 24 edges SketchUp
+reports.
+
+One visible change: `curve_sets[].arc` is now filled for loose arcs in 2021+
+files too, as it already was in classic ones, so a loose arc in a 2021+ file
+reaches a scene consumer as an arc and not only as segments. The scene output of every other
+fixture and of 26 older models is unchanged.
+
+### Added — all five ports: `Definition.is_group` tells a group from a component (#446)
+
+Groups and component instances are both an `Instance` of a `Definition`, and
+nothing in the model said which SketchUp made, so a reader that wanted
+SketchUp's own tree had to guess ("a definition placed once is a group" files a
+component placed once as a group). `Definition.is_group` (`isGroup`, `IsGroup`)
+is `True` for the definition SketchUp made for a group, which is what its API
+reports as `SUComponentType_Group`. It is read from the file, not inferred from
+how often a definition is placed: the definition kind (`8315`: 0 component, 1
+group, 2 image) in a 2021+ file, and in a classic file the last `u32` of the
+definition record before its thumbnail (1 for a group, 0 for a component). The
+placing record is not the signal there: `CGroup` over a definition SketchUp
+calls a component is what `openskp.create` writes, and what SketchUp reports
+for those files is "component".
+
+Checked against SketchUp 2025's own `SUModelGetNumGroupDefinitions` on 50
+files: the 36 repository fixtures and older models that SketchUp opens (14
+groups and 6 components on `gondola_v20.skp`, 46 groups on `Untitled.skp`), and
+14 saves of one model with 144 groups and 1 component, SketchUp 4 to 2025. The
+counts agree on every one. New fixtures `nesting_v6/2013/2017/2020/2021.skp` (a group holding a
+component holding a group, built through the library) test each port.
+
+Files written by `openskp.create` read back with `is_group` false for their
+groups in this entry's release, because the writer put the group flag in no
+definition (SketchUp reported those as components too); the next entry fixes it.
+
+### Fixed — Python: scenes in a legacy file saved through SketchUp's C API are read (#445)
+
+A model saved through the SketchUp library (`SUModelSaveToFileWithVersion`) as
+2017 to 2020 declares its `CViewPage` class at schema 15, and the scene
+reader only knew 12 and 13, so such a file came back with no scenes. Schema 15
+is read now: name, camera, hidden layers. Measured on files built and saved
+through SketchUp 2025's library, which reads the same names, cameras and
+hidden layers back: the camera is only there when its capture flag is, there
+is no thumbnail, the trailer is a byte shorter, the rendering options are 3
+bytes longer, and the style options use two more value types. A scene that
+captures everything (flags `0x1FF`) is read to its last byte, so the layout of
+every section is measured rather than assumed. Scenes of other schemas read as
+before: the scene output of every fixture and of 26 older models is
+unchanged. Files saved through the C API as SketchUp 2016 or older still fall
+back to the narrow scan, as before.
+
 ### Added — Python: write scenes into legacy files, and read legacy scenes with their cameras
 
 `SkpBuilder.add_scene(name, eye, target, up=None, *, perspective, fov,
@@ -27,7 +197,8 @@ The legacy reader now reads whole scene records (`_read_page_list`) for
 schema 12 and 13: name, camera (eye, target, up, fov, parallel, ortho height)
 and hidden layers, the fields `Page` already had. That includes the common
 case the narrow scan skipped, a scene that saves its camera and style
-(#445). The `gondola_v20.skp` fixture (SketchUp 2020, flags `0x1FF`) now comes
+(#445 is only partly covered here: files saved through SketchUp's C API are
+the next entry). The `gondola_v20.skp` fixture (SketchUp 2020, flags `0x1FF`) now comes
 back with its scene, as do SketchUp's eight-scene sample, SketchUp 2015 saves
 and openskp's own output. The rendering options a scene carries grow with the
 file version (206 bytes up to SketchUp 2017, 211, 212 and 213 for 2018-2020,
@@ -127,12 +298,8 @@ and against a richer model with 47 definitions, 14 layers
 and 13 dimensions saved at V4 and V5; the real V4 sample parses to its cube
 (8 vertices, 12 edges, 6 faces) instead of nothing.
 
-Not covered, and tracked in #442: on the real multi-version project from the
-original sweep, these four readers still fail every legacy version (they only
-read `CText` entities with one arrow type, and stop at a 2017+ record Python
-reads), so the V4 and 2019 fixes could not be confirmed on it directly. With
-that one comparison relaxed locally, the TypeScript reader's V4 parse of the
-real project is identical to its V6 parse.
+Confirmed on the real multi-version project since #442: the four readers now
+parse its V4 and 2019 saves with the same totals as its V6 and 2018 saves.
 
 ### Fixed — .NET: OBJ, MTL, ASCII PLY and ASCII STL exports use LF line endings on every platform (#424, #434)
 

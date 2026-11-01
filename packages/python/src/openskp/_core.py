@@ -725,6 +725,11 @@ class _GeometryBuilder:
         # SourceCity_Facade on 36/34324 (10 curves). Present means the
         # grouping is authoritative - no chaining heuristic needed.
         self.edge_curves = {}
+        # curve id -> the analytic frame of a Curve that is one arc
+        # (center, normal, x_axis, y_axis, start_angle, end_angle), the same
+        # shape the classic reader keeps. Only curves that are arcs have an
+        # entry; a polyline curve has none.
+        self.arc_curves = {}
         self.faces = {}
         self.instances = []
         self.section_planes = []
@@ -1392,6 +1397,23 @@ def _extract_geometry_nodes(elements, builder):
                     'position': (read_f64(p, 0), read_f64(p, 8), read_f64(p, 16)),
                 })
 
+        elif tag == '2C4C':
+            # A Curve (384A: its entity id and edge count) and, when the curve
+            # is an arc, 2D4C: 16 doubles - center, normal, the plane
+            # constant, x axis, y axis, radius, start angle, end angle.
+            # Checked against SketchUp 2025's own SUArcCurve getters on a
+            # loose arc, a circle and an arc, the latter two bounding a face.
+            curve = _direct_child(el.children, '384A')
+            arc = _direct_child(el.children, '2D4C')
+            if curve is not None and arc is not None and len(arc.payload) == 128:
+                curve_id = _entity_id(curve)
+                if curve_id is not None:
+                    v = struct.unpack('<16d', arc.payload)
+                    builder.arc_curves[curve_id] = {
+                        'center': v[0:3], 'normal': v[3:6],
+                        'x_axis': v[7:10], 'y_axis': v[10:13],
+                        'start_angle': v[14], 'end_angle': v[15]}
+
         elif el.children:
             _extract_geometry_nodes(el.children, builder)
 
@@ -1979,6 +2001,7 @@ def full_parse(skp_path: str) -> Dict[str, Any]:
                 faces_camera = False
                 shadows_face_sun = False
                 is_image = False
+                is_group = False
                 for child in children:
                     ctag = child.tag
                     if ctag == '7D15' and len(child.payload) == 16:
@@ -2004,11 +2027,13 @@ def full_parse(skp_path: str) -> Dict[str, Any]:
                                     pl, pos+6, sub_size) == 1
                             pos += 6 + sub_size
                     elif ctag == '8315' and child.payload:
-                        # Definition kind: observed 0/1 for ordinary
-                        # component/group definitions, 2 for the quad
-                        # definition backing an Image entity.
-                        is_image = parse_var_int(
-                            child.payload, 0, len(child.payload)) == 2
+                        # Definition kind: 0 for a component, 1 for a
+                        # group (SketchUp's own API reports the same
+                        # split), 2 for the quad definition backing an
+                        # Image entity.
+                        kind = parse_var_int(child.payload, 0, len(child.payload))
+                        is_image = kind == 2
+                        is_group = kind == 1
                 ent_id = _entity_id(el)
                 builder = _GeometryBuilder()
                 _extract_geometry_nodes(children, builder)
@@ -2017,7 +2042,8 @@ def full_parse(skp_path: str) -> Dict[str, Any]:
                 defs_dict[ent_id] = {'guid': guid, 'name': name,
                                      'always_faces_camera': faces_camera,
                                      'shadows_face_sun': shadows_face_sun,
-                                     'is_image': is_image, 'builder': builder}
+                                     'is_image': is_image, 'is_group': is_group,
+                                     'builder': builder}
 
             elif tag == 'C409':
                 # Vertex persistent id (hex) -> (x, y, z) inches, for

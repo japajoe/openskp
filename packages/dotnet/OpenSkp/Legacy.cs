@@ -600,9 +600,14 @@ namespace OpenSkp
     }
 
     internal sealed class VertexRec { public double[] Xyz = new double[3]; }
-    internal sealed class EdgeRec { public DrawBase Db = new DrawBase(); public int? Curve; public int? V1; public int? V2; }
+    internal sealed class EdgeRec { public DrawBase Db = new DrawBase(); public int? Curve; public object? CurveValue; public int? V1; public int? V2; }
     internal sealed class CurveRec { public uint N; }
-    internal sealed class ArcCurveRec { }
+    /// <summary>A CArcCurve: the points center + cos(t) * XAxis + sin(t) * YAxis for t from
+    /// StartAngle to EndAngle.</summary>
+    internal sealed class ArcCurveRec
+    {
+        public ArcFrame Frame = new ArcFrame();
+    }
     internal sealed class EdgeUseRec { public int? Edge; public int Sense; }
     internal sealed class LoopRec { public List<EdgeUseRec> Uses = new List<EdgeUseRec>(); }
     internal sealed class FaceRec
@@ -675,6 +680,7 @@ namespace OpenSkp
         public List<(int Slot, string? Name, object? Value)> Ents = new List<(int, string?, object?)>();
         public bool FacesCamera;
         public bool ShadowsFaceSun;
+        public bool IsGroup;
     }
     internal sealed class InstanceRec
     {
@@ -806,12 +812,14 @@ namespace OpenSkp
             var db = Drawbase(ar, r);
             var (s1, _, _) = ar.ReadObject(r, "CVertex");
             var (s2, _, _) = ar.ReadObject(r, "CVertex");
-            var (cs, cn, _) = ar.ReadObject(r);
+            var (cs, cn, cv) = ar.ReadObject(r);
             if (cn != null && cn != "CCurve" && cn != "CArcCurve")
             {
                 throw new LegacyParseError($"edge curve pointer resolved to {cn} {r.Ctx()}");
             }
-            return new EdgeRec { Db = db, Curve = cs, V1 = s1, V2 = s2 };
+            // cv is the curve itself on the edge that first points at it (a back-ref to a
+            // curve already read carries none)
+            return new EdgeRec { Db = db, Curve = cs, CurveValue = cv, V1 = s1, V2 = s2 };
         }
 
         public static object ReadCurve(Archive ar, LR r)
@@ -826,8 +834,20 @@ namespace OpenSkp
         {
             Preamble(ar, r);
             r.Raw(5);
-            r.F64s(14);
-            return new ArcCurveRec();
+            // center[3], normal[3], x_axis[3], start_angle, end_angle, y_axis[3]
+            var v = r.F64s(14);
+            return new ArcCurveRec
+            {
+                Frame = new ArcFrame
+                {
+                    Center = (v[0], v[1], v[2]),
+                    Normal = (v[3], v[4], v[5]),
+                    XAxis = (v[6], v[7], v[8]),
+                    StartAngle = v[9],
+                    EndAngle = v[10],
+                    YAxis = (v[11], v[12], v[13]),
+                },
+            };
         }
 
         /// <summary>Record that the writer burned <paramref name="delta"/>
@@ -1406,7 +1426,11 @@ namespace OpenSkp
             ar.ReadObject(r, "CAttributeContainer");
             if (ar.HasPid)
             {
-                r.U8();
+                // the mask byte says how many pid bytes follow (SketchUp 2017+ writes two or more here)
+                int mask = r.U8();
+                int n = 0;
+                for (int bit = 0; bit < 8; bit++) if ((mask & (1 << bit)) != 0) n++;
+                r.Raw(n);
             }
             r.Utf16();
             r.Raw(15);
@@ -1514,7 +1538,7 @@ namespace OpenSkp
                 var blk = new byte[11];
                 Array.Copy(r.Data, idx - 11, blk, 0, 11);
                 if (blk[0] == 0x01 && blk[1] == 0x00 && blk[2] == 0x00 && blk[3] == 0x00
-                    && blk[6] == 0x03 && blk[7] == 0x00 && blk[8] == 0x00 && blk[9] == 0x00
+                    && blk[6] <= 8 && blk[7] == 0x00 && blk[8] == 0x00 && blk[9] == 0x00
                     && blk[10] == 1)
                 {
                     break;
@@ -1743,6 +1767,10 @@ namespace OpenSkp
             }
             var gap = r.Raw(tpos.Value - r.Pos);
             int behavior = gap.Length >= 9 ? gap[gap.Length - 9] : 0;
+            // the last u32 before the thumbnail is 1 for the definition of a group
+            // and 0 for a component's (what SketchUp's SUComponentDefinitionGetType
+            // reports), measured against SketchUp 2025's own counts
+            bool isGroup = gap.Length >= 4 && (gap[gap.Length - 4] | (gap[gap.Length - 3] << 8) | (gap[gap.Length - 2] << 16) | (gap[gap.Length - 1] << 24)) == 1;
             ar.ReadObject(r, "CThumbnail");
             return new DefinitionRec
             {
@@ -1751,6 +1779,7 @@ namespace OpenSkp
                 Ents = ents,
                 FacesCamera = (behavior & 1) != 0,
                 ShadowsFaceSun = (behavior & 2) != 0,
+                IsGroup = isGroup,
             };
         }
 
@@ -1985,7 +2014,9 @@ namespace OpenSkp
             for (int i = 0; i < layerCount; i++)
             {
                 var (s, _, _) = boot.ReadObject(boot.R, "CLayer");
-                layerSlots.Add(s!.Value);
+                // a null entry in the layer list has no slot, so it is no candidate (files saved
+                // through SketchUp's C API as 2019 or 2020 have one)
+                if (s != null) layerSlots.Add(s.Value);
             }
             boot.CollectTrailingLayers(layerSlots, null, true);
             var (anchorSlot, anchorName, _) = boot.ReadObject(boot.R);
@@ -2217,6 +2248,8 @@ namespace OpenSkp
             public Dictionary<long, (double X, double Y, double Z)> Vertices = new Dictionary<long, (double, double, double)>();
             public Dictionary<long, (long? V1, long? V2)> Edges = new Dictionary<long, (long?, long?)>();
             public Dictionary<long, int> EdgeFlags = new Dictionary<long, int>();
+            public Dictionary<long, long> EdgeCurves = new Dictionary<long, long>();
+            public Dictionary<long, ArcFrame> ArcCurves = new Dictionary<long, ArcFrame>();
             public Dictionary<long, GeometryBuilderFace> Faces = new Dictionary<long, GeometryBuilderFace>();
             public List<GeometryBuilderInstance> Instances = new List<GeometryBuilderInstance>();
             public List<SectionPlane> SectionPlanes = new List<SectionPlane>();
@@ -2245,6 +2278,17 @@ namespace OpenSkp
             {
                 builder.EdgeFlags[slot] = flags;
             }
+            // The edge's parent Curve (the CCurve/CArcCurve slot) and, if that curve is an
+            // analytic arc, its frame: it arrives on the edge that first references the
+            // CArcCurve; every later edge on the arc back-refs it.
+            if (e.Curve != null)
+            {
+                builder.EdgeCurves[slot] = e.Curve.Value;
+                if (e.CurveValue is ArcCurveRec arc)
+                {
+                    builder.ArcCurves[e.Curve.Value] = arc.Frame;
+                }
+            }
         }
 
         private static void FillBuilder(LegacyBuilder builder, List<(int Slot, string? Name, object? Value)> ents, Dictionary<int, SlotEntry> slots)
@@ -2255,6 +2299,10 @@ namespace OpenSkp
                 if (v is EdgeRec edgeRec)
                 {
                     AddEdge(builder, s, edgeRec, slots);
+                }
+                else if (v is ArcCurveRec arcRec)
+                {
+                    builder.ArcCurves[s] = arcRec.Frame;
                 }
                 else if (v is FaceRec faceRec)
                 {
@@ -2525,6 +2573,7 @@ namespace OpenSkp
                             Guid = d.Guid,
                             Name = d.Name,
                             IsImage = imageDefIds.Contains((int)kv.Key),
+                            IsGroup = d.IsGroup,
                             AlwaysFacesCamera = d.FacesCamera,
                             ShadowsFaceSun = d.ShadowsFaceSun,
                             Builder = ToGeometryBuilder(b),
@@ -2552,9 +2601,13 @@ namespace OpenSkp
                 options, SkpLogLevel.Information,
                 $"Parse complete: {defsDict.Count} defs ({sw.Elapsed.TotalSeconds:F2}s)");
 
+            // Scenes come from the scene list in the document tail (see LegacyPages).
+            var pages = LegacyPages.ReadPageList(data, ar) ?? new List<RawPage>();
+
             return new Core.RawParsed
             {
                 Version = version,
+                Pages = pages,
                 // Legacy (pre-2021 MFC) files carry no meta/meta.dat
                 // container - that's a VFF/ZIP-only construct - so there
                 // is no known source for the model's unit-system string
@@ -2588,6 +2641,8 @@ namespace OpenSkp
             foreach (var kv in b.Vertices) g.Vertices[kv.Key] = kv.Value;
             foreach (var kv in b.Edges) g.Edges[kv.Key] = kv.Value;
             foreach (var kv in b.EdgeFlags) g.EdgeFlags[kv.Key] = kv.Value;
+            foreach (var kv in b.EdgeCurves) g.EdgeCurves[kv.Key] = kv.Value;
+            foreach (var kv in b.ArcCurves) g.ArcCurves[kv.Key] = kv.Value;
             foreach (var kv in b.Faces) g.Faces[kv.Key] = kv.Value;
             g.Instances = b.Instances;
             // SectionPlanes/Texts/Dimensions were already correctly read

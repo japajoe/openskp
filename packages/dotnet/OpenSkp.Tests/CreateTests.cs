@@ -501,6 +501,44 @@ namespace OpenSkp.Tests
         }
 
         [Fact]
+        public void AGroupIsWrittenAsAGroupAndAComponentAsAComponent()
+        {
+            // SketchUp 2025's own library reports one group definition and one component
+            // definition for a file like this (openskp#446)
+            var builder = SkpCreate.NewFile();
+            using (var table = builder.AddGroup("Table"))
+            {
+                table.AddFace(Square());
+            }
+            var chair = builder.AddComponentDefinition("Chair");
+            chair.AddFace(Square());
+            chair.Dispose();
+            builder.AddInstance(chair);
+            var model = SkpFile.Parse(builder.ToBytes());
+            Assert.Equal(1, model.Definitions.Values.Count(d => d.IsGroup));
+            Assert.False(model.Definitions.Values.Single(d => d.Name == "Chair").IsGroup);
+        }
+
+        [Fact]
+        public void AGroupPlacedInsideAComponentIsAGroup()
+        {
+            // SketchUp 2025's own library reports the placed definition as a group definition and
+            // the enclosing one as a component (openskp#467)
+            var builder = SkpCreate.NewFile();
+            var engine = builder.AddComponentDefinition("Engine");
+            engine.AddFace(Square());
+            engine.Dispose();
+            var car = builder.AddComponentDefinition("Car");
+            car.AddFace(Square());
+            car.AddGroupInstance(engine, translation: (50, 0, 10));
+            car.Dispose();
+            builder.AddInstance(car);
+            var model = SkpFile.Parse(builder.ToBytes());
+            Assert.True(model.Definitions.Values.Single(d => d.Name == "Engine").IsGroup);
+            Assert.False(model.Definitions.Values.Single(d => d.Name == "Car").IsGroup);
+        }
+
+        [Fact]
         public void GroupOnlyFileStillFlushesPendingGroup()
         {
             var builder = SkpCreate.NewFile();

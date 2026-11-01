@@ -115,10 +115,10 @@ for anything specific to FreeCAD/Blender behavior.
 | 🎯 **Dart / Flutter** | [![Pub](https://img.shields.io/pub/v/openskp.svg?label=)](https://pub.dev/packages/openskp) | ✅ Available | `dart pub add openskp` |
 | ⚙️ **C++17** | [![C++](https://img.shields.io/github/v/release/iamahsanmehmood/openskp?filter=cpp-v*&label=)](https://github.com/iamahsanmehmood/openskp/releases?q=cpp-) | ✅ Source package | `find_package(OpenSkp CONFIG REQUIRED)` |
 
-All five languages are on **1.3.0** as of the 2026-09-18 synchronized
-release — same version number, not identical capability: Python and C++
-carry a few things (Fragments reading, loose-edge/curve support) the
-other three don't have yet. All five parse both the modern VFF (2021+)
+All five languages are on **1.4.0** as of the 2026-10-27 synchronized
+release — same version number, not identical capability: Python carries a
+few things (writing scenes, per-edge and per-face layer ids, loose-edge
+curve scene support) the other four don't have yet. All five parse both the modern VFF (2021+)
 and classic MFC (2013–2020) `.skp` containers, and support the same
 opt-in scene-baking (`buildScene()`) and observability APIs. Full detail
 on what differs between languages, and which real SketchUp file versions
@@ -141,7 +141,7 @@ condensed version.
 | Attribute dicts: full 9-value-type support (`Point3d`/`Length`/nested lists) | ✅ | ❌ | ❌ | ❌ | ❌ str only |
 | Attribute dicts surfaced in GLB/JSON metadata export (not just IFC Psets) | ✅ | n/a | n/a | n/a | ✅ |
 | VFF pages/scenes + dimension parsing | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Legacy (pre-2021) pages/scenes reading | ✅ with cameras (2014–2020) | ❌ | ❌ | ❌ | ✅ |
+| Legacy (pre-2021) pages/scenes reading | ✅ with cameras (2014–2020) | ✅ | ✅ | ✅ | ✅ |
 | Construction lines/points reading | ✅ legacy + VFF | ✅ | ✅ | ✅ | ✅ legacy + VFF |
 | Scene baking, instancing-preserving scene output | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Loose-edge curve support (structural framing) | ✅ | ❌ | ❌ | ❌ | ❌ |
@@ -163,10 +163,10 @@ across its save history) found:
 
 | Result | Versions |
 |:---|:---|
-| ✅ Parse, build, and export cleanly — **Python reader** | 2014, 2015, 2016, 2017, 2018, 2020, 2021, 2025, **V4**, **V6**, **V7, V8, 2013**, **2019** (fixed in [#385](https://github.com/iamahsanmehmood/openskp/pull/385), [#310](https://github.com/iamahsanmehmood/openskp/pull/310) and [#440](https://github.com/iamahsanmehmood/openskp/pull/440)) |
-| ❌ Fail — root causes tracked in [issue #284](https://github.com/iamahsanmehmood/openskp/issues/284) | V3 in every reader (synthetic V3 files parse); and, in the TypeScript, .NET, Dart and C++ readers, every legacy version of this real project (see below) |
+| ✅ Parse, build, and export cleanly — **Python reader** (TypeScript, .NET, Dart and C++ parse these saves too, since [#442](https://github.com/iamahsanmehmood/openskp/issues/442), with identical totals) | 2014, 2015, 2016, 2017, 2018, 2020, 2021, 2025, **V4**, **V6**, **V7, V8, 2013**, **2019** (fixed in [#385](https://github.com/iamahsanmehmood/openskp/pull/385), [#310](https://github.com/iamahsanmehmood/openskp/pull/310) and [#440](https://github.com/iamahsanmehmood/openskp/pull/440)) |
+| ❌ Fail — root causes tracked in [issue #284](https://github.com/iamahsanmehmood/openskp/issues/284) | V3 in every reader (synthetic V3 files parse); V5 is a corrupted, 0-byte save |
 
-That sweep was run with the Python reader. The other four readers parse the SketchUp-written synthetic fixtures (V3, V4, V5, V6, V7, 2014, 2019), but stop on the real project's text entities: [#442](https://github.com/iamahsanmehmood/openskp/issues/442).
+That sweep was run with the Python reader. Since [#442](https://github.com/iamahsanmehmood/openskp/issues/442) the other four readers parse every legacy save of the same project as well (all but V3 and the corrupted V5), with identical vertex, edge, face and instance totals - 32,982 / 40,925 / 9,652 / 150 - on each, equal to its 2021 and 2025 saves; the build and export checks above were run with Python only.
 
 Full per-version error table and investigation notes: [docs/LANGUAGE_PARITY.md § 4](docs/LANGUAGE_PARITY.md#4-real-sketchup-file-version-support).
 

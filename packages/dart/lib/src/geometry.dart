@@ -45,10 +45,37 @@ class GeometryBuilderInstance {
 
 /// Accumulates the raw geometry extracted for one component definition (or
 /// the implicit ROOT definition). Mirrors Python's _GeometryBuilder.
+/// The analytic frame of a Curve that is one arc: the points
+/// `center + cos(t) * xAxis + sin(t) * yAxis` for `t` from [startAngle] to
+/// [endAngle].
+class ArcFrame {
+  final (double, double, double) center;
+  final (double, double, double) normal;
+  final (double, double, double) xAxis;
+  final (double, double, double) yAxis;
+  final double startAngle;
+  final double endAngle;
+  ArcFrame({
+    required this.center,
+    required this.normal,
+    required this.xAxis,
+    required this.yAxis,
+    required this.startAngle,
+    required this.endAngle,
+  });
+}
+
 class GeometryBuilder {
   final Map<int, (double, double, double)> vertices = {};
   final Map<int, (int?, int?)> edges = {};
   final Map<int, int> edgeFlags = {};
+
+  /// Edge id -> entity id of the Curve the edge belongs to (SketchUp's
+  /// `Edge#curve`). Absent means the edge belongs to no curve.
+  final Map<int, int> edgeCurves = {};
+
+  /// Curve id -> its analytic arc, for the curves that are arcs.
+  final Map<int, ArcFrame> arcCurves = {};
   final Map<int, GeometryBuilderFace> faces = {};
   final List<GeometryBuilderInstance> instances = [];
   final List<SectionPlane> sectionPlanes = [];
@@ -103,6 +130,7 @@ class RawDefinition {
   bool alwaysFacesCamera;
   bool shadowsFaceSun;
   bool isImage;
+  bool isGroup;
   GeometryBuilder builder;
   RawDefinition({
     this.guid,
@@ -110,6 +138,7 @@ class RawDefinition {
     this.alwaysFacesCamera = false,
     this.shadowsFaceSun = false,
     this.isImage = false,
+    this.isGroup = false,
     GeometryBuilder? builder,
   }) : builder = builder ?? GeometryBuilder();
 }
@@ -412,6 +441,35 @@ class Geometry {
               builder.edgeFlags[eId] = d307.payload[0];
             }
           }
+
+          // BB0B = the parent Curve's entity id (Edge#curve).
+          final bb0b = findChildTag(el.children, 'BB0B');
+          if (bb0b != null && bb0b.payload.isNotEmpty) {
+            final curveId =
+                Tlv.parseVarInt(bb0b.payload, 0, bb0b.payload.length);
+            if (curveId != 0) builder.edgeCurves[eId] = curveId;
+          }
+        }
+      } else if (tag == '2C4C') {
+        // A Curve (384A: its entity id and edge count) and, when the curve is
+        // an arc, 2D4C: 16 doubles - center, normal, the plane constant, x
+        // axis, y axis, radius, start angle, end angle. Checked against
+        // SketchUp 2025's own SUArcCurve getters.
+        final curve = findChildTag(el.children, '384A');
+        final arc = findChildTag(el.children, '2D4C');
+        if (curve != null && arc != null && arc.payload.length == 128) {
+          final curveId = extractEntityId(curve);
+          if (curveId != null) {
+            double f(int i) => Tlv.readF64(arc.payload, i * 8);
+            builder.arcCurves[curveId] = ArcFrame(
+              center: (f(0), f(1), f(2)),
+              normal: (f(3), f(4), f(5)),
+              xAxis: (f(7), f(8), f(9)),
+              yAxis: (f(10), f(11), f(12)),
+              startAngle: f(14),
+              endAngle: f(15),
+            );
+          }
         }
       } else if (tag == 'AC0D') {
         final fId = extractEntityId(el);
@@ -684,6 +742,7 @@ class Geometry {
         bool facesCamera = false;
         bool shadowsFaceSun = false;
         bool isImage = false;
+        bool isGroup = false;
         for (final child in el.children) {
           if (child.tag == '7D15' && child.payload.length == 16) {
             guid = Tlv.toHexUpper(child.payload);
@@ -705,8 +764,13 @@ class Geometry {
               pos += 6 + subSize;
             }
           } else if (child.tag == '8315' && child.payload.isNotEmpty) {
-            isImage =
-                Tlv.parseVarInt(child.payload, 0, child.payload.length) == 2;
+            // Definition kind: 0 for a component, 1 for a group (what
+            // SketchUp's own API reports too), 2 for the quad definition
+            // backing an Image entity.
+            final kind =
+                Tlv.parseVarInt(child.payload, 0, child.payload.length);
+            isImage = kind == 2;
+            isGroup = kind == 1;
           }
         }
         final entId = extractEntityId(el);
@@ -719,6 +783,7 @@ class Geometry {
             alwaysFacesCamera: facesCamera,
             shadowsFaceSun: shadowsFaceSun,
             isImage: isImage,
+            isGroup: isGroup,
             builder: builder,
           );
         }

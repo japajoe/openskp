@@ -13,7 +13,11 @@ add_executable(
   glb_textures_test.cpp
   ifc_export_test.cpp
   instanced_glb_test.cpp
+  arc_curves_test.cpp
+  definition_is_group_test.cpp
   instance_scale_term_test.cpp
+  legacy_scenes_test.cpp
+  legacy_text_arrows_test.cpp
   scene_without_camera_test.cpp
   instanced_scene_test.cpp
   json_export_test.cpp

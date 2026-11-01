@@ -56,11 +56,28 @@ namespace OpenSkp
     /// <summary>Accumulates the raw geometry extracted for one component
     /// definition (or the implicit ROOT definition). Mirrors Python's
     /// _GeometryBuilder in _core.py.</summary>
+    /// <summary>The analytic frame of a Curve that is one arc: the points
+    /// <c>Center + cos(t) * XAxis + sin(t) * YAxis</c> for <c>t</c> from <c>StartAngle</c> to
+    /// <c>EndAngle</c>.</summary>
+    internal sealed class ArcFrame
+    {
+        public (double X, double Y, double Z) Center;
+        public (double X, double Y, double Z) Normal;
+        public (double X, double Y, double Z) XAxis;
+        public (double X, double Y, double Z) YAxis;
+        public double StartAngle;
+        public double EndAngle;
+    }
+
     internal sealed class GeometryBuilder
     {
         public Dictionary<long, (double X, double Y, double Z)> Vertices = new Dictionary<long, (double, double, double)>();
         public Dictionary<long, (long? V1, long? V2)> Edges = new Dictionary<long, (long?, long?)>();
         public Dictionary<long, int> EdgeFlags = new Dictionary<long, int>();
+        /// <summary>Edge id -> entity id of the Curve the edge belongs to (SketchUp's <c>Edge#curve</c>).</summary>
+        public Dictionary<long, long> EdgeCurves = new Dictionary<long, long>();
+        /// <summary>Curve id -> its analytic arc, for the curves that are arcs.</summary>
+        public Dictionary<long, ArcFrame> ArcCurves = new Dictionary<long, ArcFrame>();
         public Dictionary<long, GeometryBuilderFace> Faces = new Dictionary<long, GeometryBuilderFace>();
         public List<GeometryBuilderInstance> Instances = new List<GeometryBuilderInstance>();
         public List<SectionPlane> SectionPlanes = new List<SectionPlane>();
@@ -452,6 +469,40 @@ namespace OpenSkp
                                 builder.EdgeFlags[eId.Value] = d307.Payload[0];
                             }
                         }
+
+                        // BB0B = the parent Curve's entity id (Edge#curve).
+                        var bb0b = FindChildTag(el.Children, "BB0B");
+                        if (bb0b != null && bb0b.Payload.Length > 0)
+                        {
+                            long curveId = Tlv.ParseVarInt(bb0b.Payload, 0, bb0b.Payload.Length);
+                            if (curveId != 0) builder.EdgeCurves[eId.Value] = curveId;
+                        }
+                    }
+                }
+                else if (tag == "2C4C")
+                {
+                    // A Curve (384A: its entity id and edge count) and, when the curve is an arc,
+                    // 2D4C: 16 doubles - center, normal, the plane constant, x axis, y axis,
+                    // radius, start angle, end angle. Checked against SketchUp 2025's own
+                    // SUArcCurve getters.
+                    var curve = FindChildTag(el.Children, "384A");
+                    var arc = FindChildTag(el.Children, "2D4C");
+                    if (curve != null && arc != null && arc.Payload.Length == 128)
+                    {
+                        var curveId = ExtractEntityId(curve);
+                        if (curveId != null)
+                        {
+                            double F(int i) => Tlv.ReadF64(arc.Payload, i * 8);
+                            builder.ArcCurves[curveId.Value] = new ArcFrame
+                            {
+                                Center = (F(0), F(1), F(2)),
+                                Normal = (F(3), F(4), F(5)),
+                                XAxis = (F(7), F(8), F(9)),
+                                YAxis = (F(10), F(11), F(12)),
+                                StartAngle = F(14),
+                                EndAngle = F(15),
+                            };
+                        }
                     }
                 }
                 else if (tag == "AC0D")
@@ -746,6 +797,7 @@ namespace OpenSkp
             public bool AlwaysFacesCamera;
             public bool ShadowsFaceSun;
             public bool IsImage;
+            public bool IsGroup;
             public GeometryBuilder Builder = new GeometryBuilder();
         }
 
@@ -760,6 +812,7 @@ namespace OpenSkp
                     bool facesCamera = false;
                     bool shadowsFaceSun = false;
                     bool isImage = false;
+                    bool isGroup = false;
                     foreach (var child in el.Children)
                     {
                         if (child.Tag == "7D15" && child.Payload.Length == 16)
@@ -792,7 +845,12 @@ namespace OpenSkp
                         }
                         else if (child.Tag == "8315" && child.Payload.Length > 0)
                         {
-                            isImage = Tlv.ParseVarInt(child.Payload, 0, child.Payload.Length) == 2;
+                            // Definition kind: 0 for a component, 1 for a group (what
+                            // SketchUp's own API reports too), 2 for the quad definition
+                            // backing an Image entity.
+                            long kind = Tlv.ParseVarInt(child.Payload, 0, child.Payload.Length);
+                            isImage = kind == 2;
+                            isGroup = kind == 1;
                         }
                     }
                     long? entId = ExtractEntityId(el);
@@ -807,6 +865,7 @@ namespace OpenSkp
                             AlwaysFacesCamera = facesCamera,
                             ShadowsFaceSun = shadowsFaceSun,
                             IsImage = isImage,
+                            IsGroup = isGroup,
                             Builder = builder,
                         };
                     }
