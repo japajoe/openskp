@@ -156,6 +156,33 @@ int? retryCountAfterV20Filler(LR r, int countPos, int limit, [Archive? ar]) {
   return hit.count;
 }
 
+/// The SketchUp 2020 layout of a model with NO component definitions AND no
+/// root entities. [findCountAfterV20Filler] cannot see it: behind the filler
+/// (an empty string record, then 13 bytes of padding) the only count is the
+/// ROOT entity count, and it is 0, which that search skips as "no count".
+///
+/// Returns the offset of that root count (so the caller can put the cursor
+/// there and read the zero), or null when the bytes are not that layout: the
+/// empty string record has to sit within 12 bytes of [countPos], and the 13
+/// padding bytes and the count behind it have to be all zero.
+int? findEmptyRootAfterV20Filler(Uint8List data, int countPos) {
+  var markerAt = -1;
+  for (var i = countPos; i < countPos + 12 && i + 4 <= data.length; i++) {
+    if (data[i] == 0xFF && data[i + 1] == 0xFE && data[i + 2] == 0xFF) {
+      markerAt = i;
+      break;
+    }
+  }
+  // none, or a non-empty string: real data
+  if (markerAt < 0 || data[markerAt + 3] != 0) return null;
+  final rootCountAt = markerAt + 4 + 13;
+  if (rootCountAt + 4 > data.length) return null;
+  for (var i = markerAt + 3; i < rootCountAt + 4; i++) {
+    if (data[i] != 0) return null;
+  }
+  return rootCountAt;
+}
+
 /// True when the u16 at [at] can legally start an object read: a null, an
 /// escape, a class definition, a class-ref to a KNOWN class, or an object
 /// back-ref within the allocated range.
@@ -320,6 +347,9 @@ class Archive {
   int cumDelta = 0;
   int? annotWatermark;
   final List<int> burnStack = []; // per-entity-list burned-item credits
+  // per-entity-list instances an annotation's path wrote in full (see
+  // _pathRef) that the list has not listed yet, in order
+  final List<Set<int>> inlineStack = [];
   int? clineTail;
 
   Archive(this.data, this.ver) : hasPid = ver >= 17 {
@@ -492,6 +522,27 @@ class Archive {
     return slot - offset;
   }
 
+  /// The walker slot of the back-reference at the cursor, without moving
+  /// it; null when the next tag is anything else.
+  int? peekBackref(LR r) {
+    if (r.pos + 2 > r.data.length) return null;
+    final tag = r.data[r.pos] | (r.data[r.pos + 1] << 8);
+    int slot;
+    if (tag == 0x7FFF) {
+      if (r.pos + 6 > r.data.length) return null;
+      slot = Tlv.readU32(r.data, r.pos + 2);
+      if ((slot & 0x80000000) != 0) return null;
+    } else if (tag == 0 || (tag & 0x8000) != 0) {
+      return null;
+    } else {
+      slot = tag;
+    }
+    if (burns.isNotEmpty && slot >= burns[0].$1) {
+      return _translateRef(slot);
+    }
+    return slot;
+  }
+
   (int?, String?, Object?) _backref(int slot, LR r) {
     if (burns.isNotEmpty && slot >= burns[0].$1) {
       final walker = _translateRef(slot);
@@ -610,6 +661,7 @@ class MaterialRec {
   double texW = 0, texH = 0;
   String texFile = '';
   bool colorized = false;
+  int colorizeType = 0;
   bool hasTexture = false;
   MaterialRec({required this.name, required this.rgba});
 }
@@ -623,6 +675,7 @@ class TextureBlockRec {
   double texW, texH;
   String texFile;
   bool colorized;
+  int colorizeType;
   TextureBlockRec({
     required this.rgba,
     required this.opacity,
@@ -633,6 +686,7 @@ class TextureBlockRec {
     required this.texH,
     required this.texFile,
     required this.colorized,
+    required this.colorizeType,
   });
 }
 
@@ -1137,17 +1191,22 @@ class LegacyReaders {
     final w = r.f64();
     final h = r.f64();
     final fname = r.utf16();
-    final avg = r.raw(9); // RGBA + 00 + RGBA (colour stored twice)
+    // Image average RGBA + 00 + the material's paint RGBA.
+    final avg = r.raw(9);
     r.utf16();
-    final blob = r.raw(8); // u32 + u32 colorized flag
+    // u32 material type (1 textured, 2 colorized) + u32 colorize mode.
+    final blob = r.raw(8);
     final opacity = r.f64();
     final useOp = r.u8();
-    // A colourized (re-tinted) texture stores the ORIGINAL image plus the
-    // tint as the average colour; flagged by the second blob u32 or by
-    // alpha 0xFF on the stored colour.
-    final colorized = blob[4] != 0 || avg[3] == 0xFF;
+    // Checked against materials written by SketchUp's own library: the first
+    // blob u32 is SUMaterialGetType (2 = a colorized texture, which keeps the
+    // ORIGINAL image and stores the tint as the paint colour) and the second
+    // is SUMaterialGetColorizeType (0 shift, 1 tint). The alpha byte of the
+    // image average says nothing about either - it is 0xFF on plain textures
+    // too.
+    final colorized = blob[0] == 2;
     return TextureBlockRec(
-      rgba: Uint8List.sublistView(avg, 0, 4),
+      rgba: Uint8List.fromList([avg[5], avg[6], avg[7], 255]),
       opacity: opacity,
       useOpacity: useOp,
       texDib: s,
@@ -1156,6 +1215,7 @@ class LegacyReaders {
       texH: h,
       texFile: fname,
       colorized: colorized,
+      colorizeType: blob[4] == 1 ? 1 : 0,
     );
   }
 
@@ -1185,6 +1245,7 @@ class LegacyReaders {
       out.texH = tex.texH;
       out.texFile = tex.texFile;
       out.colorized = tex.colorized;
+      out.colorizeType = tex.colorizeType;
       out.hasTexture = true;
     }
     return out;
@@ -1448,11 +1509,11 @@ class LegacyReaders {
     // front of the first connection block, nor the trailing u32 of the last
     // one.
     r.raw(ar.ver >= 6 ? 37 : 32);
-    _entityRef(ar, r); // connection point 1 (may be null)
-    connectionPaths((rr) => ar.readObject(rr).$1, r);
+    _pathRef((rr) => ar.readObject(rr).$1, r); // connection point 1 (may be null; may be written in full)
+    connectionPaths((rr) => ar.readObject(rr).$1, r, ar);
     r.raw(32);
-    _entityRef(ar, r); // connection point 2 (may be null)
-    connectionPaths((rr) => ar.readObject(rr).$1, r);
+    _pathRef((rr) => ar.readObject(rr).$1, r); // connection point 2 (may be null; may be written in full)
+    connectionPaths((rr) => ar.readObject(rr).$1, r, ar);
     r.raw(ar.ver >= 6 ? 72 : 68);
     return DimLinearRec(db, text);
   }
@@ -1460,9 +1521,11 @@ class LegacyReaders {
   /// What follows a dimension connection ref (see [readDimLinear]):
   /// `[entity ref][u32 n1][n1 refs][u32 n2][n2 refs]`. [readNewObject] reads a
   /// path entry that MFC wrote in full (the first time anything pointed at it)
-  /// and returns its slot.
+  /// and returns its slot; [ar], when given, notes such an entry for the
+  /// entity list being read (see [_pathRef]).
   static (int?, List<int?>, List<int?>) connectionPaths(
-      int? Function(LR r) readNewObject, LR r) {
+      int? Function(LR r) readNewObject, LR r,
+      [Archive? ar]) {
     final extra = _entityRef(null, r);
     final lists = <List<int?>>[];
     for (int k = 0; k < 2; k++) {
@@ -1470,7 +1533,10 @@ class LegacyReaders {
       if (count > 1000) {
         throw LegacyParseError('implausible dimension path length ${r.ctx()}');
       }
-      lists.add([for (int i = 0; i < count; i++) _pathRef(readNewObject, r)]);
+      lists.add([
+        for (int i = 0; i < count; i++)
+          _pathRef(readNewObject, r, i == 0 ? ar : null)
+      ]);
     }
     return (extra, lists[0], lists[1]);
   }
@@ -1480,24 +1546,32 @@ class LegacyReaders {
   /// serialized before the group it is anchored in carries that whole group
   /// right here (the root list later holds a back-reference). Read it like
   /// any object then, so it is registered and the stream stays aligned;
-  /// return its slot either way.
-  static int? _pathRef(int? Function(LR r) readNewObject, LR r) {
+  /// return its slot either way. A path runs from the outermost instance in,
+  /// so its first one is an entity of the list the annotation is in: [member]
+  /// is given for it, and one written here in full is noted for that list
+  /// (see [readEntityList]).
+  static int? _pathRef(int? Function(LR r) readNewObject, LR r,
+      [Archive? member]) {
     final tag = r.peekU16();
     var isNew = tag == 0xFFFF || (tag != 0x7FFF && (tag & 0x8000) != 0);
     if (tag == 0x7FFF) {
       isNew = (Tlv.readU32(r.data, r.pos + 2) & 0x80000000) != 0;
     }
-    return isNew ? readNewObject(r) : _entityRef(null, r);
+    if (!isNew) return _entityRef(null, r);
+    final slot = readNewObject(r);
+    if (member != null && slot != null && member.inlineStack.isNotEmpty) {
+      member.inlineStack.last.add(slot);
+    }
+    return slot;
   }
 
-  static Object readText(Archive ar, LR r) {
-    preamble(ar, r);
-    final db = drawbase(ar, r);
-    ar.readObject(r, 'CSkFont');
+  /// The text's string start: the variable-length variant middle ends in an
+  /// 11-byte block `01 00 00 00 ?? 00 <arrow type> 00 00 00 01` right before
+  /// it.
+  static int _textDelimiter(LR r) {
     int p = r.pos;
-    int idx;
     while (true) {
-      idx = _findBytes(r.data, _strMarker, p, r.pos + 512);
+      final idx = _findBytes(r.data, _strMarker, p, r.pos + 512);
       if (idx < 0) {
         throw LegacyParseError('text delimiter not found ${r.ctx()}');
       }
@@ -1511,10 +1585,41 @@ class LegacyReaders {
           blk[8] == 0x00 &&
           blk[9] == 0x00 &&
           blk[10] == 1) {
-        break;
+        return idx;
       }
       p = idx + 3;
     }
+  }
+
+  /// Whether the text whose font ends at [pos] is anchored to an entity:
+  /// after the two screen-fraction f64s comes the connection block,
+  /// `[u32 type][u32 4][point3d]`, and a type other than 0 or 1 (2, 4, 5 and
+  /// 7 seen; see docs/dimension-record-notes.md) anchors the label.
+  static bool _anchoredConnection(Uint8List data, int pos) {
+    if (pos + 24 > data.length) return false;
+    if (Tlv.readU32(data, pos + 20) != 4) return false;
+    final kind = Tlv.readU32(data, pos + 16);
+    return kind >= 2 && kind <= 15;
+  }
+
+  static Object readText(Archive ar, LR r) {
+    preamble(ar, r);
+    final db = drawbase(ar, r);
+    ar.readObject(r, 'CSkFont');
+    if (_anchoredConnection(r.data, r.pos)) {
+      // An anchored connection block is followed, as a dimension's is (see
+      // readDimLinear), by the anchored entity's ref and its instance paths -
+      // and MFC writes a path instance IN FULL there when nothing has pointed
+      // at it before (a label anchored to a component instance serialized
+      // after it, its class declaration included when it is the file's first
+      // instance). Skipped as bytes, that instance never gets its store-map
+      // slots and every later reference is off by them ("class-ref to
+      // non-class slot"); read it instead.
+      r.raw(16 + 32);
+      _entityRef(ar, r);
+      connectionPaths((rr) => ar.readObject(rr).$1, r, ar);
+    }
+    final idx = _textDelimiter(r);
     r.raw(idx - r.pos);
     final text = r.utf16();
     r.raw(5);
@@ -1541,17 +1646,42 @@ class LegacyReaders {
       Archive ar, LR r, int count, String owner) {
     final ents = <(int, String?, Object?)>[];
     ar.burnStack.add(0);
+    ar.inlineStack.add(<int>{});
     try {
-      return _readEntityListInner(ar, r, count, owner, ents);
+      _readEntityListInner(ar, r, count, owner, ents);
+      // An instance an annotation wrote in full (see _pathRef) is one of this
+      // list's items, and the declared count holds it - but SketchUp does not
+      // always list it again with a back-reference (labels anchored to the
+      // loudspeakers of an auditorium: of five instances written in a
+      // definition's labels, three were listed again, two not). Keep the ones
+      // never listed, as the list's own entities.
+      for (final slot in ar.inlineStack.last) {
+        if (ents.length >= count) break;
+        final ent = ar.slots[slot];
+        ents.add((slot, ent?.name, ent?.value));
+      }
+      return ents;
     } finally {
       ar.burnStack.removeLast();
+      ar.inlineStack.removeLast();
     }
   }
 
   static List<(int, String?, Object?)> _readEntityListInner(Archive ar, LR r,
       int count, String owner, List<(int, String?, Object?)> ents) {
+    final inline = ar.inlineStack.isNotEmpty ? ar.inlineStack.last : null;
     while (ents.length < count) {
       final p = r.pos;
+      if (inline != null &&
+          inline.isNotEmpty &&
+          ents.length + inline.length >= count) {
+        final next = ar.peekBackref(r);
+        if (next == null || !inline.contains(next)) {
+          // every item left is an instance an annotation already wrote in
+          // full and the list does not list again (see readEntityList)
+          break;
+        }
+      }
       final hasBurnCredit =
           owner == 'def' && ar.burnStack.isNotEmpty && ar.burnStack.last > 0;
       if (hasBurnCredit &&
@@ -1590,6 +1720,7 @@ class LegacyReaders {
         rethrow;
       }
       ar.inEntityList = prevFlag;
+      inline?.remove(s!);
       ents.add((s!, n, v));
     }
     return ents;
@@ -2051,6 +2182,14 @@ class Legacy {
           defCount = 0;
           r.pos -= 4;
         }
+      } else {
+        // No count behind the filler at all: an entirely empty model, whose
+        // root count is 0 (the retry only accepts counts > 0).
+        final rootCountAt = findEmptyRootAfterV20Filler(r.data, r.pos - 4);
+        if (rootCountAt != null) {
+          defCount = 0;
+          r.pos = rootCountAt;
+        }
       }
     }
     if (defCount > 1000000) {
@@ -2311,9 +2450,7 @@ class Legacy {
         a: rgba[3],
         transparency: trans,
         colorized: colorized,
-        // colourize type is not decoded in the legacy record; tint (1) is
-        // the correct rendering for the grey base textures observed.
-        colorizeType: colorized ? 1 : 0,
+        colorizeType: v.colorizeType,
         texture: texture,
       );
       materialsMap[v.name] = matObj;

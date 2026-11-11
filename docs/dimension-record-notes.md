@@ -108,3 +108,123 @@ A second SDK helper (`mktext`) settled the text record. Key findings:
   screen slot zeroed, free connection with the anchor, label position
   at ``point + leader``, leader type 2, closed arrow (3). The reader
   extracts both points (``TextEntity.point`` / ``label_point``).
+- Every connection type is followed, as in a dimension, by the
+  anchored entity's ref and its instance paths: `[entity ref][entity
+  ref][u32 n][n path refs][u32 n][n refs]` — the placement tail's 12
+  zero bytes for types 0 and 1. Anchored labels carry
+  real refs there (types 2, 4, 5 and 7 in the 25 SketchUp 2015 models
+  of the BRAS room-acoustics benchmark, 2026-10-28), and a path
+  instance not written yet comes IN FULL, class declaration included
+  when it is the file's first instance. Every port's reader reads the block
+  for types other than 0 and 1; skipped as bytes, it shifted every later
+  store-map slot. The entity list's declared count holds such an
+  instance even where SketchUp never lists it again (no back-ref), so
+  the list keeps it as its own entity.
+
+## Legacy C++ reader: inline vertices and plane offsets
+
+A connection reference can be a complete `CVertex` object, including a new
+class declaration or a short/escaped class reference. It is not always a
+back-reference. Reading it into the archive preserves the slot numbering for
+later dimensions and edges. Plain forward references are resolved after the
+archive walk. Free connections store their xyz directly after type 1 and the
+constant 4. Connections with instance paths still consume those variable-length
+paths, but leave endpoints unset until those paths can be resolved in owner
+coordinates.
+
+After the second connection's path lists, the remaining placement block is
+72 bytes (68 before version 6): three doubles for the plane normal, three for
+the X axis, a u32 constrained axis, the signed offset double, a reserved double,
+and the version-dependent trailing u32. SDK comparisons on axis-constrained
+SU2018 dimensions identify mode 1 as offset along `normal × X` and mode 2 as
+offset along `-X`. Multiplying by the stored signed distance preserves the
+line's side even when measured endpoints are reversed. Other modes retain their
+frame and scalar offset without inventing an explicit offset vector.
+
+`LegacyDimensionGeometry` tests use generated records with synthetic vertices,
+short and escaped references, forward references, variable-length paths and
+plane frames. No user model is required.
+
+## C++ writer: vector offsets
+
+`SkpBuilder::add_dimension(p1, p2, offset_vector)` and the matching component
+builder overload preserve a three-dimensional line offset. The X axis follows
+the measured segment; its cross product with the offset determines the plane
+normal and perpendicular distance. Mode 1 encodes the side in the normal, so
+vertical and reversed segments retain their placement. Any component parallel
+to the segment is discarded. Zero perpendicular offset uses a stable plane.
+The scalar overload retains its existing default frame and mode 0.
+
+Vector inputs are validated before any dimension record bytes are appended.
+Tests cover root and nested dimensions, reversed endpoints, oblique planes,
+zero/parallel offsets and invalid inputs followed by valid records. Independent
+SketchUp SDK reads of an SU2018 accessory and its re-export agree on all three
+dimensions' endpoints and bounding boxes.
+
+## VFF reader: constrained plane offsets
+
+Modern SKP dimensions store the plane normal in `5BCF`, the plane X axis in
+`5BD0`, the constraint mode in `5BD1`, and the signed distance in `5BD2`.
+Modes 1 and 2 use the same `normal × X` and `-X` offset directions as legacy
+records. In particular, a vertical measurement with reversed endpoints must
+not reverse the side of its offset. Ignoring `5BD1` let downstream geometric
+heuristics flip an inward height annotation to the outside of the component.
+
+The C++ reader now exposes `offset_vector` for these VFF modes as well, both
+through raw dimensions and public model dimensions. The historical `plane_x`
+and `normal` fields retain their original VFF tag assignments for compatibility;
+use `offset_vector` for resolved placement. Missing, malformed, or unsupported
+constraint modes keep the existing scalar/frame fallback.
+
+Synthetic tests exercise both constraint modes, positive and negative distances,
+reversed endpoints, public-model conversion, and invalid/missing mode records.
+A downstream modern SKP reproduction additionally tests definition-local
+annotations on direct load and re-export; SDK bounds put all three annotations
+inside an 800 × 560 × 645 mm box.
+
+
+## C++ annotation drawing properties and ownership
+
+Dimensions and text now expose their own `layer` and `hidden` drawing properties.
+Legacy annotations retain the drawing base already consumed by the archive walker.
+VFF dimensions read `59D8 > 07D0 > 07D2/07D3`; text reads its own `07D0` base.
+A referenced vertex or other connection target must not override these properties.
+Numeric layer references are resolved to names alongside guide and instance layers.
+
+VFF records inside a `7C15` definition populate that definition's annotations in
+local coordinates. Root annotations populate `root()`. The existing world-space
+`SkpModel::dimensions` view remains available for compatibility. Definition spans
+are read only from the actual definition catalog, and candidate annotation records
+must contain a complete, valid TLV field list before their payloads are copied.
+
+Text retains free anchors or resolvable vertex attachments, label positions,
+leader/arrow types and screen fractions. Legacy nested/inline text attachments
+remain unresolved when their owner-local point cannot be established. This does
+not add font/style or attachment-relationship preservation to the writer.
+
+`DimensionOptions` and `TextOptions` allow root and component writers to preserve
+tags and hidden state. Existing dimension overloads and the root three-argument
+`add_text` overload remain available. A screen position overrides the text leader
+type; invalid positions and layer handles are rejected before writing a record.
+
+`annotation_layers_legacy.skp` and `annotation_layers_vff.skp` are SDK-generated
+fixtures saved as 2019 and current VFF formats. They extend the repository's public
+`legacy_text_arrows_2017.skp` fixture with root/nested dimensions, guide lines/points,
+and screen text on three named tags, including hidden elements. They contain no
+user model data. Tests verify each owner's tags, hidden states and text placement,
+as well as writer round trips and invalid-options recovery.
+
+
+### Text leader visibility
+
+Native leader type 0 denotes screen text, even when a free 3D connection is present.
+`TextOptions::leader_type == 0` without `screen_position` is therefore written as
+model text (type 2) with `display_leader=false`. This canonicalization preserves
+both the world anchor and label position without moving the note to the screen.
+
+The independent display switch is the last byte of the legacy arrow delimiter
+(immediately before the text string), and VFF field `55FC`. It must be accepted
+as either 0 or 1 by the legacy reader. The SDK-generated annotation fixtures now
+hide the first root text's leader while retaining its model placement. Tests cover
+visible/hidden View and Model leaders, leaderless model text, root/component
+ownership and unchanged screen fractions.

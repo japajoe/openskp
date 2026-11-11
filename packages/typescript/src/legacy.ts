@@ -115,6 +115,32 @@ function retryCountAfterV20Filler(r: R, countPos: number, limit: number, ar?: Ar
   return hit.count;
 }
 
+/**
+ * The SketchUp 2020 layout of a model with NO component definitions AND no root
+ * entities. `findCountAfterV20Filler` cannot see it: behind the filler (an empty
+ * string record, then 13 bytes of padding) the only count is the ROOT entity
+ * count, and it is 0, which that search skips as "no count".
+ *
+ * Returns the offset of that root count (so the caller can put the cursor there
+ * and read the zero), or null when the bytes are not that layout: the empty
+ * string record has to sit within 12 bytes of `countPos`, and the 13 padding
+ * bytes and the count behind it have to be all zero.
+ */
+export function findEmptyRootAfterV20Filler(data: Uint8Array, countPos: number): number | null {
+  let markerAt = -1;
+  for (let i = countPos; i < countPos + 12 && i + 4 <= data.length; i++) {
+    if (data[i] === 0xff && data[i + 1] === 0xfe && data[i + 2] === 0xff) {
+      markerAt = i;
+      break;
+    }
+  }
+  if (markerAt < 0 || data[markerAt + 3] !== 0) return null; // none, or a non-empty string: real data
+  const rootCountAt = markerAt + 4 + 13;
+  if (rootCountAt + 4 > data.length) return null;
+  for (let i = markerAt + 3; i < rootCountAt + 4; i++) if (data[i] !== 0) return null;
+  return rootCountAt;
+}
+
 /** True when the u16 at `at` can legally start an object read: a null, an
  * escape, a class definition, a class-ref to a KNOWN class, or an object
  * back-ref within the allocated range. */
@@ -315,6 +341,9 @@ export class Archive {
   cumDelta = 0;
   annotWatermark: number | null = null;
   burnStack: number[] = []; // per-entity-list burned-item credits
+  // per-entity-list instances an annotation's path wrote in full (see
+  // pathRef) that the list has not listed yet, in order
+  inlineStack: Set<number>[] = [];
   // Called as each CComponentDefinition record completes. walkModel uses it
   // to build that definition's geometry right away and release its entity
   // objects, so the walk never holds the whole model's entity graph (see
@@ -500,6 +529,28 @@ export class Archive {
       offset += width;
     }
     return slot - offset;
+  }
+
+  /** The walker slot of the back-reference at the cursor, without moving
+   * it; `null` when the next tag is anything else. */
+  peekBackref(r: R): number | null {
+    if (r.pos + 2 > r.data.length) return null;
+    const view = new DataView(r.data.buffer, r.data.byteOffset, r.data.byteLength);
+    const tag = view.getUint16(r.pos, true);
+    let slot: number;
+    if (tag === 0x7fff) {
+      if (r.pos + 6 > r.data.length) return null;
+      slot = view.getUint32(r.pos + 2, true);
+      if (slot & 0x80000000) return null;
+    } else if (tag === 0 || tag & 0x8000) {
+      return null;
+    } else {
+      slot = tag;
+    }
+    if (this.burns.length > 0 && slot >= this.burns[0][0]) {
+      return this.translateRef(slot);
+    }
+    return slot;
   }
 
   private backref(slot: number, r: R): [number, string | null, any] {
@@ -918,6 +969,7 @@ function textureBlock(
   tex_h: number;
   tex_file: string;
   colorized: boolean;
+  colorize_type: number;
 } {
   let s: number | null;
   let dib: any;
@@ -942,17 +994,19 @@ function textureBlock(
   const w = r.f64();
   const h = r.f64();
   const fname = r.utf16();
-  const avg = r.raw(9); // RGBA + 00 + RGBA (colour stored twice)
+  const avg = r.raw(9); // image average RGBA + 00 + the material's paint RGBA
   r.utf16();
-  const blob = r.raw(8); // u32 + u32 colorized flag
+  const blob = r.raw(8); // u32 material type (1 textured, 2 colorized) + u32 colorize mode
   const opacity = r.f64();
   const useOp = r.u8();
-  // A colourized (re-tinted) texture stores the ORIGINAL image plus the
-  // tint as the average colour; flagged by the second blob u32 or by alpha
-  // 0xFF on the stored colour.
-  const colorized = Boolean(blob[4]) || avg[3] === 0xff;
+  // Checked against materials written by SketchUp's own library: the first
+  // blob u32 is SUMaterialGetType (2 = a colorized texture, which keeps the
+  // ORIGINAL image and stores the tint as the paint colour) and the second is
+  // SUMaterialGetColorizeType (0 shift, 1 tint). The alpha byte of the image
+  // average says nothing about either - it is 0xFF on plain textures too.
+  const colorized = blob[0] === 2;
   return {
-    rgba: Array.from(avg.subarray(0, 4)),
+    rgba: [avg[5], avg[6], avg[7], 255],
     opacity,
     use_opacity: useOp,
     tex_dib: s,
@@ -961,6 +1015,7 @@ function textureBlock(
     tex_h: h,
     tex_file: fname,
     colorized,
+    colorize_type: blob[4] === 1 ? 1 : 0,
   };
 }
 
@@ -989,6 +1044,7 @@ function readMaterial(ar: Archive, r: R): any {
     out.tex_h = tex.tex_h;
     out.tex_file = tex.tex_file;
     out.colorized = tex.colorized;
+    out.colorize_type = tex.colorize_type;
   }
   return out;
 }
@@ -1112,7 +1168,7 @@ export function connectionPaths(
       throw new LegacyParseError(`implausible dimension path length ${r.ctx()}`);
     }
     const refs: number[] = [];
-    for (let i = 0; i < count; i++) refs.push(pathRef(ar, r));
+    for (let i = 0; i < count; i++) refs.push(pathRef(ar, r, i === 0));
     lists.push(refs);
   }
   return [extra, lists[0], lists[1]];
@@ -1124,9 +1180,11 @@ export function connectionPaths(
  * serialized before the group it is anchored in carries that whole group
  * right here (the root list later holds a back-reference). Read it like any
  * object then, so it is registered and the stream stays aligned; return its
- * slot either way.
+ * slot either way. A path runs from the outermost instance in, so its first
+ * one (`member`) is an entity of the list the annotation is in; one written
+ * here in full is noted for that list (see readEntityList).
  */
-function pathRef(ar: Archive, r: R): number {
+function pathRef(ar: Archive, r: R, member = false): number {
   const tag = r.peekU16();
   let isNew = tag === 0xffff || (tag !== 0x7fff && (tag & 0x8000) !== 0);
   if (tag === 0x7fff) {
@@ -1135,6 +1193,10 @@ function pathRef(ar: Archive, r: R): number {
   }
   if (isNew) {
     const [slot] = ar.readObject(r);
+    const inline = ar.inlineStack;
+    if (member && inline && inline.length > 0) {
+      inline[inline.length - 1].add(slot as number);
+    }
     return slot as number;
   }
   return entityRef(ar, r) as number;
@@ -1287,26 +1349,22 @@ export function readDimLinear(ar: Archive, r: R): any {
   // SketchUp 4 and 5 write neither the font object above nor the 5 bytes in
   // front of the first connection block, nor the trailing u32 of the last one.
   r.raw(ar.ver >= 6 ? 37 : 32);
-  const c1 = entityRef(ar, r); // connection point 1 (may be null)
+  const c1 = pathRef(ar, r); // connection point 1 (may be null; may be written in full)
   const path1 = connectionPaths(ar, r);
   r.raw(32);
-  const c2 = entityRef(ar, r); // connection point 2 (may be null)
+  const c2 = pathRef(ar, r); // connection point 2 (may be null; may be written in full)
   const path2 = connectionPaths(ar, r);
   r.raw(ar.ver >= 6 ? 72 : 68);
   return { k: 'dimension', db, text, connect: [c1, c2], paths: [path1, path2] };
 }
 
-function readText(ar: Archive, r: R): any {
-  preamble(ar, r);
-  const db = drawbase(ar, r);
-  ar.readObject(r, 'CSkFont');
-  // variable-length variant middle, delimited by an 11-byte block
-  // `01 00 00 00 ?? 00 <arrow type> 00 00 00 01` right before the text string;
-  // the arrow type is 0-8 (Python's reader accepts the same range)
+/** The text's string start: the variable-length variant middle ends in an
+ * 11-byte block `01 00 00 00 ?? 00 <arrow type> 00 00 00 01` right before
+ * it; the arrow type is 0-8 (Python's reader accepts the same range). */
+function textDelimiter(r: R): number {
   let p = r.pos;
-  let idx: number;
   while (true) {
-    idx = findBytes(r.data, STR_MARKER, p, r.pos + 512);
+    const idx = findBytes(r.data, STR_MARKER, p, r.pos + 512);
     if (idx < 0) {
       throw new LegacyParseError(`text delimiter not found ${r.ctx()}`);
     }
@@ -1316,10 +1374,44 @@ function readText(ar: Archive, r: R): any {
       blk[6] <= 8 && blk[7] === 0x00 && blk[8] === 0x00 && blk[9] === 0x00 &&
       blk[10] === 1
     ) {
-      break;
+      return idx;
     }
     p = idx + 3;
   }
+}
+
+/** Whether the text whose font ends at `pos` is anchored to an entity:
+ * after the two screen-fraction f64s comes the connection block,
+ * [u32 type][u32 4][point3d], and a type other than 0 or 1 (2, 4, 5 and 7
+ * seen; see docs/dimension-record-notes.md) anchors the label. */
+function anchoredConnection(data: Uint8Array, pos: number): boolean {
+  if (pos + 24 > data.length) return false;
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  if (view.getUint32(pos + 20, true) !== 4) return false;
+  const kind = view.getUint32(pos + 16, true);
+  return kind >= 2 && kind <= 15;
+}
+
+function readText(ar: Archive, r: R): any {
+  preamble(ar, r);
+  const db = drawbase(ar, r);
+  ar.readObject(r, 'CSkFont');
+  let connect: number | null = null;
+  let paths: [number | null, number[], number[]] | null = null;
+  if (anchoredConnection(r.data, r.pos)) {
+    // An anchored connection block is followed, as a dimension's is (see
+    // readDimLinear), by the anchored entity's ref and its instance paths -
+    // and MFC writes a path instance IN FULL there when nothing has pointed
+    // at it before (a label anchored to a component instance serialized
+    // after it, its class declaration included when it is the file's first
+    // instance). Skipped as bytes, that instance never gets its store-map
+    // slots and every later reference is off by them ("class-ref to
+    // non-class slot"); read it instead.
+    r.raw(16 + 32);
+    connect = entityRef(ar, r);
+    paths = connectionPaths(ar, r);
+  }
+  const idx = textDelimiter(r);
   r.raw(idx - r.pos);
   const text = r.utf16();
   r.raw(5);
@@ -1342,16 +1434,31 @@ function readText(ar: Archive, r: R): any {
     r.raw(6);
     attach.push(val);
   }
-  return { k: 'text', text, db, attach };
+  return { k: 'text', text, db, attach, connect, paths };
 }
 
-function readEntityList(ar: Archive, r: R, count: number, owner: string): [number, string | null, any][] {
+/** @internal exported for the anchored-text tests */
+export function readEntityList(ar: Archive, r: R, count: number, owner: string): [number, string | null, any][] {
   const ents: [number, string | null, any][] = [];
   ar.burnStack.push(0);
+  ar.inlineStack.push(new Set<number>());
   try {
-    return readEntityListInner(ar, r, count, owner, ents);
+    readEntityListInner(ar, r, count, owner, ents);
+    // An instance an annotation wrote in full (see pathRef) is one of this
+    // list's items, and the declared count holds it - but SketchUp does not
+    // always list it again with a back-reference (labels anchored to the
+    // loudspeakers of an auditorium: of five instances written in a
+    // definition's labels, three were listed again, two not). Keep the ones
+    // never listed, as the list's own entities.
+    for (const slot of ar.inlineStack[ar.inlineStack.length - 1]) {
+      if (ents.length >= count) break;
+      const ent = ar.slots.get(slot);
+      ents.push([slot, ent ? ent[1] : null, ent ? ent[2] : null]);
+    }
+    return ents;
   } finally {
     ar.burnStack.pop();
+    ar.inlineStack.pop();
   }
 }
 
@@ -1365,6 +1472,15 @@ function readEntityListInner(
   const view = new DataView(r.data.buffer, r.data.byteOffset, r.data.byteLength);
   while (ents.length < count) {
     const p = r.pos;
+    const inline = ar.inlineStack.length > 0 ? ar.inlineStack[ar.inlineStack.length - 1] : null;
+    if (inline && inline.size > 0 && ents.length + inline.size >= count) {
+      const next = ar.peekBackref(r);
+      if (next === null || !inline.has(next)) {
+        // every item left is an instance an annotation already wrote in full
+        // and the list does not list again (see readEntityList)
+        break;
+      }
+    }
     const hasBurnCredit = owner === 'def' && ar.burnStack.length > 0 && ar.burnStack[ar.burnStack.length - 1] > 0;
     if (
       hasBurnCredit &&
@@ -1383,6 +1499,7 @@ function readEntityListInner(
     try {
       const [s, n, v] = ar.readObject(r);
       ar.inEntityList = prevFlag;
+      inline?.delete(s as number);
       ents.push([s as number, n, v]);
     } catch (e) {
       ar.inEntityList = prevFlag;
@@ -1876,6 +1993,14 @@ function walkModel(data: Uint8Array, ver: number, start: number, matCount: numbe
         // put it back.
         defCount = 0;
         r.pos -= 4;
+      }
+    } else {
+      // No count behind the filler at all: an entirely empty model, whose root
+      // count is 0 (the retry only accepts counts > 0).
+      const rootCountAt = findEmptyRootAfterV20Filler(r.data, r.pos - 4);
+      if (rootCountAt !== null) {
+        defCount = 0;
+        r.pos = rootCountAt;
       }
     }
   }
@@ -2467,10 +2592,8 @@ export function parseLegacyToRaw(data: Uint8Array, options?: ParseOptions): Pars
       transparency: trans,
       id: null,
       texture,
-      // colourize type is not decoded in the legacy record; tint (1) is
-      // the correct rendering for the grey base textures observed.
       colorized,
-      colorizeType: colorized ? 1 : 0,
+      colorizeType: v.colorize_type ?? 0,
     };
     materialsMap.set(v.name, matObj);
     materialIdToName.set(s, v.name);

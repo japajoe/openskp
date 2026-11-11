@@ -205,6 +205,28 @@ namespace OpenSkp
             r.Pos = hit.Value.Next;
             return hit.Value.Count;
         }
+
+        /// <summary>
+        /// The SketchUp 2020 layout of a model with NO component definitions AND no root entities.
+        /// <see cref="FindCountAfterV20Filler"/> cannot see it: behind the filler (an empty string record, then 13
+        /// bytes of padding) the only count is the ROOT entity count, and it is 0, which that search skips as
+        /// "no count". Returns the offset of that root count (so the caller can put the cursor there and read the
+        /// zero), or null when the bytes are not that layout: the empty string record has to sit within 12 bytes of
+        /// <paramref name="countPos"/>, and the 13 padding bytes and the count behind it have to be all zero.
+        /// </summary>
+        public static int? FindEmptyRootAfterV20Filler(byte[] data, int countPos)
+        {
+            int markerAt = -1;
+            for (int i = countPos; i < countPos + 12 && i + 4 <= data.Length; i++)
+            {
+                if (data[i] == 0xFF && data[i + 1] == 0xFE && data[i + 2] == 0xFF) { markerAt = i; break; }
+            }
+            if (markerAt < 0 || data[markerAt + 3] != 0) return null; // none, or a non-empty string: real data
+            int rootCountAt = markerAt + 4 + 13;
+            if (rootCountAt + 4 > data.Length) return null;
+            for (int i = markerAt + 3; i < rootCountAt + 4; i++) if (data[i] != 0) return null;
+            return rootCountAt;
+        }
     }
 
     /// <summary>Byte cursor, matching Python's _R / TS's R.</summary>
@@ -352,6 +374,9 @@ namespace OpenSkp
         public int CumDelta;
         public int? AnnotWatermark;
         public List<int> BurnStack = new List<int>();  // per-entity-list burned-item credits
+        // per-entity-list instances an annotation's path wrote in full (see
+        // PathRef) that the list has not listed yet, in order
+        public List<List<int>> InlineStack = new List<List<int>>();
         // Cached CConstructionLine trailer width, self-calibrated on the
         // first guide line of the file (see ReadConstructionLine).
         public int? ClineTail;
@@ -552,6 +577,36 @@ namespace OpenSkp
             return slot - offset;
         }
 
+        /// <summary>The walker slot of the back-reference at the cursor,
+        /// without moving it; null when the next tag is anything
+        /// else.</summary>
+        public int? PeekBackref(LR r)
+        {
+            if (r.Pos + 2 > r.Data.Length) return null;
+            int tag = r.Data[r.Pos] | (r.Data[r.Pos + 1] << 8);
+            int slot;
+            if (tag == 0x7FFF)
+            {
+                if (r.Pos + 6 > r.Data.Length) return null;
+                uint big = Tlv.ReadU32(r.Data, r.Pos + 2);
+                if ((big & 0x80000000) != 0) return null;
+                slot = (int)big;
+            }
+            else if (tag == 0 || (tag & 0x8000) != 0)
+            {
+                return null;
+            }
+            else
+            {
+                slot = tag;
+            }
+            if (Burns.Count > 0 && slot >= Burns[0].Start)
+            {
+                return TranslateRef(slot);
+            }
+            return slot;
+        }
+
         private (int?, string?, object?) Backref(int slot, LR r)
         {
             if (Burns.Count > 0 && slot >= Burns[0].Start)
@@ -632,6 +687,7 @@ namespace OpenSkp
         public double TexH;
         public string TexFile = "";
         public bool Colorized;
+        public int ColorizeType;
     }
     internal sealed class MaterialRec
     {
@@ -645,6 +701,7 @@ namespace OpenSkp
         public double TexH;
         public string TexFile = "";
         public bool Colorized;
+        public int ColorizeType;
         public bool HasTexture;
     }
     internal sealed class DibRec { public uint Subtype; public byte[] Data = Array.Empty<byte>(); }
@@ -1123,18 +1180,21 @@ namespace OpenSkp
             double w = r.F64();
             double h = r.F64();
             string fname = r.Utf16();
-            var avg = r.Raw(9);              // RGBA + 00 + RGBA (colour stored twice)
+            var avg = r.Raw(9);              // image average RGBA + 00 + the material's paint RGBA
             r.Utf16();
-            var blob = r.Raw(8);             // u32 + u32 colorized flag
+            var blob = r.Raw(8);             // u32 material type (1 textured, 2 colorized) + u32 colorize mode
             double opacity = r.F64();
             byte useOp = r.U8();
-            // A colourized (re-tinted) texture stores the ORIGINAL image
-            // plus the tint as the average colour; flagged by the second
-            // blob u32 or by alpha 0xFF on the stored colour.
-            bool colorized = blob[4] != 0 || avg[3] == 0xFF;
+            // Checked against materials written by SketchUp's own library:
+            // the first blob u32 is SUMaterialGetType (2 = a colorized
+            // texture, which keeps the ORIGINAL image and stores the tint as
+            // the paint colour) and the second is SUMaterialGetColorizeType
+            // (0 shift, 1 tint). The alpha byte of the image average says
+            // nothing about either - it is 0xFF on plain textures too.
+            bool colorized = blob[0] == 2;
             return new TextureBlockRec
             {
-                Rgba = avg.Take(4).ToArray(),
+                Rgba = new byte[] { avg[5], avg[6], avg[7], 255 },
                 Opacity = opacity,
                 UseOpacity = useOp,
                 TexDib = s,
@@ -1143,6 +1203,7 @@ namespace OpenSkp
                 TexH = h,
                 TexFile = fname,
                 Colorized = colorized,
+                ColorizeType = blob[4] == 1 ? 1 : 0,
             };
         }
 
@@ -1175,6 +1236,7 @@ namespace OpenSkp
                 outRec.TexH = tex.TexH;
                 outRec.TexFile = tex.TexFile;
                 outRec.Colorized = tex.Colorized;
+                outRec.ColorizeType = tex.ColorizeType;
                 outRec.HasTexture = true;
             }
             return outRec;
@@ -1468,11 +1530,11 @@ namespace OpenSkp
             // bytes in front of the first connection block, nor the trailing
             // u32 of the last one.
             r.Raw(ar.Ver >= 6 ? 37 : 32);
-            EntityRef(ar, r);                // connection point 1 (may be null)
-            ConnectionPaths(rr => ar.ReadObject(rr).Slot, r);
+            PathRef(rr => ar.ReadObject(rr).Slot, r);   // connection point 1 (may be null; may be written in full)
+            ConnectionPaths(rr => ar.ReadObject(rr).Slot, r, ar);
             r.Raw(32);
-            EntityRef(ar, r);                // connection point 2 (may be null)
-            ConnectionPaths(rr => ar.ReadObject(rr).Slot, r);
+            PathRef(rr => ar.ReadObject(rr).Slot, r);   // connection point 2 (may be null; may be written in full)
+            ConnectionPaths(rr => ar.ReadObject(rr).Slot, r, ar);
             r.Raw(ar.Ver >= 6 ? 72 : 68);
             return new DimLinearRec { Db = db, Text = text };
         }
@@ -1481,9 +1543,10 @@ namespace OpenSkp
         /// <see cref="ReadDimLinear"/>): [entity ref][u32 n1][n1 refs][u32 n2]
         /// [n2 refs]. <paramref name="readNewObject"/> reads a path entry that
         /// MFC wrote in full (the first time anything pointed at it) and
-        /// returns its slot.</summary>
+        /// returns its slot; <paramref name="ar"/>, when given, notes such an
+        /// entry for the entity list being read (see PathRef).</summary>
         internal static (int? Extra, List<int?> First, List<int?> Second) ConnectionPaths(
-            Func<LR, int?> readNewObject, LR r)
+            Func<LR, int?> readNewObject, LR r, Archive? ar = null)
         {
             int? extra = EntityRef(null, r);
             var lists = new List<int?>[2];
@@ -1497,7 +1560,7 @@ namespace OpenSkp
                 var refs = new List<int?>();
                 for (uint i = 0; i < count; i++)
                 {
-                    refs.Add(PathRef(readNewObject, r));
+                    refs.Add(PathRef(readNewObject, r, i == 0 ? ar : null));
                 }
                 lists[k] = refs;
             }
@@ -1509,8 +1572,12 @@ namespace OpenSkp
         /// it - and a dimension serialized before the group it is anchored in
         /// carries that whole group right here (the root list later holds a
         /// back-reference). Read it like any object then, so it is registered
-        /// and the stream stays aligned; return its slot either way.</summary>
-        private static int? PathRef(Func<LR, int?> readNewObject, LR r)
+        /// and the stream stays aligned; return its slot either way. A path
+        /// runs from the outermost instance in, so its first one is an entity
+        /// of the list the annotation is in: <paramref name="member"/> is
+        /// given for it, and one written here in full is noted for that list
+        /// (see ReadEntityList).</summary>
+        private static int? PathRef(Func<LR, int?> readNewObject, LR r, Archive? member = null)
         {
             ushort tag = r.PeekU16();
             bool isNew = tag == 0xFFFF || (tag != 0x7FFF && (tag & 0x8000) != 0);
@@ -1518,19 +1585,24 @@ namespace OpenSkp
             {
                 isNew = (Tlv.ReadU32(r.Data, r.Pos + 2) & 0x80000000) != 0;
             }
-            return isNew ? readNewObject(r) : EntityRef(null, r);
+            if (!isNew) return EntityRef(null, r);
+            int? slot = readNewObject(r);
+            if (member != null && slot != null && member.InlineStack.Count > 0)
+            {
+                member.InlineStack[member.InlineStack.Count - 1].Add(slot.Value);
+            }
+            return slot;
         }
 
-        public static object ReadText(Archive ar, LR r)
+        /// <summary>The text's string start: the variable-length variant
+        /// middle ends in an 11-byte block `01 00 00 00 ?? 00 &lt;arrow type&gt;
+        /// 00 00 00 01` right before it.</summary>
+        private static int TextDelimiter(LR r)
         {
-            Preamble(ar, r);
-            var db = Drawbase(ar, r);
-            ar.ReadObject(r, "CSkFont");
             int p = r.Pos;
-            int idx;
             while (true)
             {
-                idx = LegacyBytes.FindBytes(r.Data, LegacyBytes.StrMarker, p, r.Pos + 512);
+                int idx = LegacyBytes.FindBytes(r.Data, LegacyBytes.StrMarker, p, r.Pos + 512);
                 if (idx < 0)
                 {
                     throw new LegacyParseError($"text delimiter not found {r.Ctx()}");
@@ -1541,10 +1613,46 @@ namespace OpenSkp
                     && blk[6] <= 8 && blk[7] == 0x00 && blk[8] == 0x00 && blk[9] == 0x00
                     && blk[10] == 1)
                 {
-                    break;
+                    return idx;
                 }
                 p = idx + 3;
             }
+        }
+
+        /// <summary>Whether the text whose font ends at <paramref name="pos"/>
+        /// is anchored to an entity: after the two screen-fraction f64s comes
+        /// the connection block, [u32 type][u32 4][point3d], and a type other
+        /// than 0 or 1 (2, 4, 5 and 7 seen; see
+        /// docs/dimension-record-notes.md) anchors the label.</summary>
+        private static bool AnchoredConnection(byte[] data, int pos)
+        {
+            if (pos + 24 > data.Length) return false;
+            if (Tlv.ReadU32(data, pos + 20) != 4) return false;
+            uint kind = Tlv.ReadU32(data, pos + 16);
+            return kind >= 2 && kind <= 15;
+        }
+
+        public static object ReadText(Archive ar, LR r)
+        {
+            Preamble(ar, r);
+            var db = Drawbase(ar, r);
+            ar.ReadObject(r, "CSkFont");
+            if (AnchoredConnection(r.Data, r.Pos))
+            {
+                // An anchored connection block is followed, as a dimension's
+                // is (see ReadDimLinear), by the anchored entity's ref and
+                // its instance paths - and MFC writes a path instance IN FULL
+                // there when nothing has pointed at it before (a label
+                // anchored to a component instance serialized after it, its
+                // class declaration included when it is the file's first
+                // instance). Skipped as bytes, that instance never gets its
+                // store-map slots and every later reference is off by them
+                // ("class-ref to non-class slot"); read it instead.
+                r.Raw(16 + 32);
+                EntityRef(ar, r);
+                ConnectionPaths(rr => ar.ReadObject(rr).Slot, r, ar);
+            }
+            int idx = TextDelimiter(r);
             r.Raw(idx - r.Pos);
             string text = r.Utf16();
             r.Raw(5);
@@ -1568,22 +1676,50 @@ namespace OpenSkp
         public static List<(int Slot, string? Name, object? Value)> ReadEntityList(Archive ar, LR r, long count, string owner)
         {
             ar.BurnStack.Add(0);
+            ar.InlineStack.Add(new List<int>());
             try
             {
-                return ReadEntityListInner(ar, r, count, owner);
+                var ents = ReadEntityListInner(ar, r, count, owner);
+                // An instance an annotation wrote in full (see PathRef) is one
+                // of this list's items, and the declared count holds it - but
+                // SketchUp does not always list it again with a back-reference
+                // (labels anchored to the loudspeakers of an auditorium: of
+                // five instances written in a definition's labels, three were
+                // listed again, two not). Keep the ones never listed, as the
+                // list's own entities.
+                foreach (int slot in ar.InlineStack[ar.InlineStack.Count - 1])
+                {
+                    if (ents.Count >= count) break;
+                    ar.Slots.TryGetValue(slot, out var ent);
+                    ents.Add((slot, ent?.Name, ent?.Value));
+                }
+                return ents;
             }
             finally
             {
                 ar.BurnStack.RemoveAt(ar.BurnStack.Count - 1);
+                ar.InlineStack.RemoveAt(ar.InlineStack.Count - 1);
             }
         }
 
         private static List<(int Slot, string? Name, object? Value)> ReadEntityListInner(Archive ar, LR r, long count, string owner)
         {
             var ents = new List<(int, string?, object?)>();
+            var inline = ar.InlineStack.Count > 0 ? ar.InlineStack[ar.InlineStack.Count - 1] : null;
             while (ents.Count < count)
             {
                 int p = r.Pos;
+                if (inline != null && inline.Count > 0 && ents.Count + inline.Count >= count)
+                {
+                    int? next = ar.PeekBackref(r);
+                    if (next == null || !inline.Contains(next.Value))
+                    {
+                        // every item left is an instance an annotation already
+                        // wrote in full and the list does not list again (see
+                        // ReadEntityList)
+                        break;
+                    }
+                }
                 bool hasBurnCredit = owner == "def" && ar.BurnStack.Count > 0 && ar.BurnStack[ar.BurnStack.Count - 1] > 0;
                 if (hasBurnCredit
                     && p + 25 <= r.Data.Length
@@ -1632,6 +1768,7 @@ namespace OpenSkp
                     r.Pos = p;
                     break;
                 }
+                inline?.Remove(s!.Value);
                 ents.Add((s!.Value, n, v));
             }
             return ents;
@@ -2201,6 +2338,17 @@ namespace OpenSkp
                         r.Pos -= 4;
                     }
                 }
+                else
+                {
+                    // No count behind the filler at all: an entirely empty model, whose root count is 0 (the retry
+                    // only accepts counts > 0).
+                    var rootCountAt = LegacyBytes.FindEmptyRootAfterV20Filler(r.Data, r.Pos - 4);
+                    if (rootCountAt.HasValue)
+                    {
+                        defCount = 0;
+                        r.Pos = rootCountAt.Value;
+                    }
+                }
             }
             if (defCount > 1_000_000)
             {
@@ -2512,10 +2660,7 @@ namespace OpenSkp
                     A = rgba.Length > 3 ? rgba[3] : 255,
                     Transparency = trans,
                     Colorized = colorized,
-                    // colourize type is not decoded in the legacy record;
-                    // tint (1) is the correct rendering for the grey base
-                    // textures observed.
-                    ColorizeType = colorized ? 1 : 0,
+                    ColorizeType = v.ColorizeType,
                     Texture = texture,
                 };
                 materialsMap[v.Name] = matObj;

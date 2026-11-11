@@ -4,7 +4,10 @@ add_executable(
   openskp_tests
   codegen_test.cpp
   create_test.cpp
+  io_fidelity_test.cpp
+  native_compatibility_test.cpp
   dxf_export_test.cpp
+  dxf_unicode_safety_test.cpp
   edit_test.cpp
   face_instance_hidden_test.cpp
   fragments_export_test.cpp
@@ -18,11 +21,15 @@ add_executable(
   instance_scale_term_test.cpp
   legacy_scenes_test.cpp
   legacy_text_arrows_test.cpp
+  legacy_textured_colorize_test.cpp
+  legacy_empty_model_test.cpp
   scene_without_camera_test.cpp
   instanced_scene_test.cpp
   json_export_test.cpp
   layer_hidden_test.cpp
+  legacy_anchored_texts_test.cpp
   legacy_dimension_paths_test.cpp
+  legacy_dimension_geometry_test.cpp
   legacy_single_material_test.cpp
   legacy_zero_material_custom_layer_test.cpp
   legacy_v20_filler_test.cpp
@@ -36,6 +43,7 @@ add_executable(
   obj_material_names_test.cpp
   observability_test.cpp
   pages_dimensions_test.cpp
+  parser_limits_test.cpp
   parser_test.cpp
   ply_export_test.cpp
   scene_test.cpp

@@ -63,7 +63,9 @@ Each TLV element:
 
 ### 2.2 Container Tags
 
-These tags contain nested child TLV elements:
+These tags contain nested child TLV elements. Real files nest them about a dozen levels deep
+(the deepest of the files checked reaches 11); the readers stop at 64 levels and raise a parse
+error, so a hostile file cannot exhaust the stack:
 
 ```
 F401  F701  D430  D530  C832
@@ -84,6 +86,12 @@ stays buried in an opaque payload and the image looks never placed.
 (`6942`) and points (`6C42`). `6842` is the drawbase wrapper those
 entities share (`D007` / entity id / `D307` flags). `6A42` (8×f64 line
 body) and `6D42` (3×f64 point) are leaves, not containers.
+
+A guide's own Hide and tag live in that `6842` → `D007` container, the
+same leaves edges, faces and instances use: `D307` display flags (base
+`0x06`, `+0x01` = hidden) and `D207` (layer entity id). Large models can
+carry tens of thousands of hidden guide points; reading `6D42` alone
+draws every one of them.
 
 ## 3. Tag Reference
 
@@ -110,10 +118,15 @@ body) and `6D42` (3×f64 point) are leaves, not containers.
 
 | Tag | Name | Payload | Description |
 |-----|------|---------|-------------|
-| `9411` | **Loop** | Container | Ordered sequence of coedges |
+| `9411` | **Loop** | Container | One loop of the face (first = outer, rest = holes) |
+| `9511` | Loop CoEdges | Container | Ordered sequence of coedges |
 | `A00F` | CoEdge | Inline TLV | Edge reference + orientation |
 | `A10F` | Edge Ref | var_int | Referenced edge entity ID |
-| `A20F` | Orientation | var_int | `1` = forward, `0` = reversed |
+| `A20F` | Orientation | var_int | `0` = along the edge (start → end), `1` = against it |
+
+A face's coedges sit one level below its loop: `AC0D` → `AE0D` → `9411` →
+`9511` → `A00F`. The readers map `A20F` to `CoEdge.orientation` as `0` → `+1`
+and `1` → `-1`.
 
 ### 3.3 Component Tags
 

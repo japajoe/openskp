@@ -147,6 +147,8 @@ struct Vertex {
   double y{};
   /// Z coordinate in raw model space (Z-up, inches).
   double z{};
+  /// Native persistent ID; zero when absent. Legacy archive slots are not persistent IDs.
+  std::uint64_t persistent_id{};
 };
 
 /// Straight line segment connecting two vertices.
@@ -167,6 +169,12 @@ struct Edge {
   /// it belongs to none. Edges sharing a curve_id were drawn as one continuous multi-segment line
   /// or arc; if the curve is an arc, Definition::arcs has it under the same id.
   std::optional<EntityId> curve_id;
+  /// Native persistent ID; zero when absent. Legacy archive slots are not persistent IDs.
+  std::uint64_t persistent_id{};
+  bool locked{};
+  bool casts_shadows{true};
+  bool receives_shadows{true};
+  ParsedAttrDictionaries attribute_dictionaries;
 };
 
 /// The analytic arc behind a curve: SketchUp's own ArcCurve.
@@ -184,7 +192,7 @@ struct ArcCurve {
   Vec3 normal{};
   /// Vector from the centre to the arc's start (length = radius).
   Vec3 x_axis{};
-  /// normal x x_axis.
+  /// Independent affine y basis (normal x x_axis for an untransformed circle).
   Vec3 y_axis{};
   /// Start parameter in radians.
   double start_angle{};
@@ -194,6 +202,8 @@ struct ArcCurve {
   /// Length of x_axis.
   double radius() const;
   bool is_full_circle() const;
+  /// Native persistent ID; zero when absent. Legacy archive slots are not persistent IDs.
+  std::uint64_t persistent_id{};
 };
 
 /// Oriented edge reference within a face loop.
@@ -229,9 +239,15 @@ struct Face {
   /// not a layer/tag visibility toggle).
   bool hidden{};
   /// Name of the layer (tag) the face is assigned to. "" for faces on the
-  /// default layer (Layer0), which VFF files don't record per face, and for
-  /// every face in legacy (pre-2021 MFC) files.
+  /// default layer (Layer0), and for every face in a VFF file, which does
+  /// not record it per face.
   std::string layer;
+  /// Native persistent ID; zero when absent. Legacy archive slots are not persistent IDs.
+  std::uint64_t persistent_id{};
+  bool locked{};
+  bool casts_shadows{true};
+  bool receives_shadows{true};
+  ParsedAttrDictionaries attribute_dictionaries;
 };
 
 /// Organization layer (tag) for model elements.
@@ -250,6 +266,14 @@ struct Layer {
   /// which has no equivalent slot. Callers own the dictionary names; the reader
   /// does not special-case any of them.
   std::map<std::string, std::map<std::string, std::string>> attribute_dictionaries;
+  /// Native persistent ID; zero when absent. Legacy archive slots are not persistent IDs.
+  std::uint64_t persistent_id{};
+  std::string line_style;
+  ParsedAttrDictionaries parsed_dictionaries;
+  /// Native records coalesced by the name-keyed layer API, in ascending ID order.
+  /// Some files contain multiple Layer0 records. Clients needing native identity
+  /// can resolve these without relying on whichever record supplied display fields.
+  std::vector<std::uint64_t> persistent_id_aliases;
 };
 
 /// Embedded texture image data and metadata.
@@ -282,6 +306,8 @@ struct Material {
   bool colorized{};
   /// Colorize mode enum identifier.
   std::int32_t colorize_type{};
+  /// Native persistent ID; zero when absent. Legacy archive slots are not persistent IDs.
+  std::uint64_t persistent_id{};
 };
 
 /// One `<sty:item>` of a style.xml: the raw `<t:variant>` of a style setting.
@@ -349,7 +375,7 @@ struct Instance {
   std::string name;
   /// Reference index to the target definition.
   std::optional<EntityId> ref_idx;
-  /// GUID string of target definition.
+  /// Canonical instance/reference UUID (uppercase, without hyphens).
   std::string guid;
   /// 4x4 column-major affine transformation matrix (16 floats).
   std::vector<double> matrix;
@@ -380,9 +406,12 @@ struct Instance {
   /// toggle).
   bool hidden{};
   /// Unique TLV entity ID of the placement itself (the ID SketchUp persists
-  /// across sessions, `Sketchup::Entity#persistent_id`). Populated for
-  /// modern (VFF) files; unset for legacy (pre-2021 MFC) files.
+  /// across sessions, `Sketchup::Entity#persistent_id`). Populated when the
+  /// file records one (VFF files and the legacy files that carry one).
   std::optional<EntityId> id;
+  bool locked{};
+  bool casts_shadows{true};
+  bool receives_shadows{true};
 };
 
 /// Section plane entity.
@@ -391,36 +420,59 @@ struct SectionPlane {
   std::string name;
   std::string label;
   bool hidden{false};
+  /// Native persistent ID; zero when absent. Legacy archive slots are not persistent IDs.
+  std::uint64_t persistent_id{};
+  std::string layer;
+  bool active{};
 };
 
 /// Text annotation entity.
 struct TextEntity {
   std::string text;
   bool hidden{false};
+  /// Explicit tag name, or empty for the default tag.
+  std::string layer;
+  /// Anchor and label positions in owner-local inches; unset when unresolved.
+  std::optional<Vec3> point;
+  std::optional<Vec3> label_point;
+  /// Normalized screen fractions (used when leader_type is zero).
+  std::optional<std::array<double, 2>> screen_position;
+  int leader_type{2};
+  int arrow_type{3};
+  bool display_leader{true};
+  /// Native persistent ID; zero when absent. Legacy archive slots are not persistent IDs.
+  std::uint64_t persistent_id{};
 };
 
 /// A linear dimension (SketchUp's Dimension tool).
 ///
-/// The legacy (pre-2021) reader recovers only `text`/`hidden`. The VFF
-/// reader (2021+) recovers the full geometry - see `SkpModel::dimensions`
-/// for the model-level, world-space list.
+/// The legacy reader recovers free endpoints and vertex attachments in the
+/// owning entities. Unresolved attachments remain unset. See `SkpModel::dimensions`
+/// for the VFF model-level, world-space list.
 struct Dimension {
   /// The displayed text. Empty when the dimension shows its auto-computed
   /// measured value (the caller formats |b - a|).
   std::string text;
   bool hidden{false};
-  /// First measured point (x, y, z) in inches (world space), or unset when
-  /// only the text was recovered.
+  /// First measured point (x, y, z) in inches in the owning entities' space
+  /// (definition-local, or world at the model root), or unset when unresolved.
   std::optional<Vec3> a;
   /// Second measured point.
   std::optional<Vec3> b;
   /// Offset distance (inches) - how far the dimension line sits from the
   /// a-b segment, along the in-plane perpendicular.
   double offset{};
-  /// The dimension plane's x-axis, or unset.
+  /// Historical frame field: VFF 5BCF (plane normal), legacy X axis, or unset.
   std::optional<Vec3> plane_x;
-  /// The dimension plane's normal, or unset.
+  /// Historical frame field: VFF 5BD0 (X axis), legacy plane normal, or unset.
   std::optional<Vec3> normal;
+  /// Explicit offset for legacy or VFF dimensions constrained to a plane axis. This
+  /// preserves the side of the line independently of endpoint ordering.
+  std::optional<Vec3> offset_vector;
+  /// Explicit tag name, or empty for the default tag.
+  std::string layer;
+  /// Native persistent ID; zero when absent. Legacy archive slots are not persistent IDs.
+  std::uint64_t persistent_id{};
 };
 
 /// A construction/guide line (SketchUp's Construction Line tool).
@@ -446,6 +498,14 @@ struct ConstructionLine {
   std::optional<Vec3> start;
   /// The bounded segment's end point, or unset if unbounded.
   std::optional<Vec3> end;
+  /// Name of the layer (tag) the guide is assigned to, or "" for the
+  /// default layer (Layer0).
+  std::string layer;
+  /// Whether the guide is hidden (SketchUp's "Hide" on this specific
+  /// guide, not a layer/tag visibility toggle).
+  bool hidden{};
+  /// Native persistent ID; zero when absent. Legacy archive slots are not persistent IDs.
+  std::uint64_t persistent_id{};
 };
 
 /// A construction/guide point (SketchUp's Construction Point tool).
@@ -454,6 +514,14 @@ struct ConstructionLine {
 struct ConstructionPoint {
   /// The point's position, in inches (world space).
   Vec3 position{0.0, 0.0, 0.0};
+  /// Name of the layer (tag) the guide is assigned to, or "" for the
+  /// default layer (Layer0).
+  std::string layer;
+  /// Whether the guide is hidden (SketchUp's "Hide" on this specific
+  /// guide, not a layer/tag visibility toggle).
+  bool hidden{};
+  /// Native persistent ID; zero when absent. Legacy archive slots are not persistent IDs.
+  std::uint64_t persistent_id{};
 };
 
 /// A saved scene (SketchUp's "Scenes" tabs; "pages" in the SDK).
@@ -496,11 +564,22 @@ struct ViewCamera {
   double ortho_height{};
 };
 
+/// Camera behind a definition's thumbnail.
+struct ThumbnailCamera {
+  Vec3 eye{0.0, 0.0, 1.0};
+  Vec3 target{0.0, 0.0, 0.0};
+  Vec3 up{0.0, 1.0, 0.0};
+  double fov_y_deg = 35.0;
+  bool perspective = true;
+  /// Visible height in inches for parallel projection, independent of eye/target.
+  double ortho_height = 1.0;
+};
+
 /// Reusable geometry container (component definition or group).
 struct Definition {
   /// Unique TLV entity ID.
   EntityId id{};
-  /// GUID string identifier.
+  /// Canonical UUID identifier (uppercase, without hyphens) in classic and VFF files.
   std::string guid;
   /// Definition name.
   std::string name;
@@ -538,6 +617,17 @@ struct Definition {
   /// 2021+ file, a flag in the definition record in an older one - not from how often
   /// the definition is placed.
   bool is_group{};
+  /// Native definition attributes from VFF files, preserving booleans, nil and arrays.
+  ParsedAttrDictionaries parsed_dictionaries;
+  /// Native persistent ID; zero when absent. Legacy archive slots are not persistent IDs.
+  std::uint64_t persistent_id{};
+  std::string description;
+  std::string path;
+  std::uint32_t load_time{};
+  bool hidden{};
+  std::optional<ThumbnailCamera> thumbnail_camera;
+  /// Whether the file explicitly supplied component/group type information.
+  bool type_known{};
 };
 
 /// Top-level model container holding all definitions, layers, materials, and styles.
@@ -560,9 +650,9 @@ class OPENSKP_EXPORT SkpModel {
   /// the file at this view whichever scene is selected, even when the scene
   /// was not updated. Unset for classic pre-2021 files.
   std::optional<ViewCamera> camera;
-  /// Model-level linear dimensions with world-space endpoints (VFF
-  /// files). Legacy files surface text-only dimensions per definition
-  /// instead (`Definition::dimensions`).
+  /// All VFF linear dimensions with world-space endpoints (compatibility view).
+  /// Both VFF and legacy also expose owner-local geometry and drawing properties
+  /// through `root().dimensions` and `Definition::dimensions`.
   std::vector<Dimension> dimensions;
   /// Model materials sequence.
   std::deque<Material> materials;
